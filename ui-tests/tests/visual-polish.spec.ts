@@ -78,14 +78,21 @@ test("composer resize target stays functional without drawing a horizontal line"
   await enterApp(page);
   const resizer = page.locator(".composer-resizer");
   await expect(resizer).toHaveCount(1);
+  await expect(resizer).toBeVisible();
   await expect.poll(() => resizer.evaluate((el) => getComputedStyle(el, "::after").content)).toBe("none");
 
   const input = page.locator(".composer-inner textarea").first();
+  // Resolve actionability and place the pointer on the live element before
+  // reading its geometry. The eight-pixel target can move while the landing
+  // transition settles, making a previously captured page coordinate stale.
+  await resizer.hover();
   const box = await resizer.boundingBox();
   expect(box).not.toBeNull();
-  await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
   await page.mouse.down();
-  await page.mouse.move(box!.x + box!.width / 2, box!.y - 40);
+  // mousedown reactively mounts the drag overlay that captures the following
+  // move/up events; wait for it so a slow render cannot swallow the drag.
+  await expect(page.locator(".drag-overlay")).toHaveCount(1);
+  await page.mouse.move(box!.x + box!.width / 2, box!.y - 40, { steps: 4 });
   await page.mouse.up();
 
   await expect.poll(() => input.evaluate((el) => parseFloat(getComputedStyle(el).height))).toBeGreaterThan(220);
@@ -154,6 +161,8 @@ test("generated artifact cards render as compact rows", async ({ page }) => {
   await page.locator(".composer-inner textarea").first().fill("ARTIFACTATTRIBUTION");
   await page.getByRole("button", { name: "Send" }).click();
 
+  await page.locator(".message-artifacts-label").click();
+  await page.locator(".generated-directory > summary").filter({ hasText: "results" }).click();
   const card = page.locator('.message-artifact-card[data-artifact-name="new.png"]');
   await expect(card).toBeVisible({ timeout: 10_000 });
   const metrics = await card.evaluate((el) => {
@@ -162,7 +171,7 @@ test("generated artifact cards render as compact rows", async ({ page }) => {
     const thumbBox = thumb.getBoundingClientRect();
     return { cardHeight: cardBox.height, thumbSize: thumbBox.width };
   });
-  expect(metrics.thumbSize).toBe(40);
+  expect(metrics.thumbSize).toBe(24);
   // Compact row: thumb + one or two text lines, not the old ~140px tile.
   expect(metrics.cardHeight).toBeLessThan(72);
 });

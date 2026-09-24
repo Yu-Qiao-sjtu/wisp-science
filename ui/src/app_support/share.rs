@@ -397,6 +397,22 @@ fn escape_html(text: &str) -> String {
 /// lockstep with `chat.css` / `base.css`; live export overlays harvested rules.
 const SHARE_EXPORT_CSS: &str = include_str!("../styles/share-export.css");
 
+/// Layout invariants that must win over the live stylesheet appended to an
+/// export. The live rules provide the exact chat appearance, but they come
+/// from an application viewport that clips horizontal overflow at `.chat`.
+/// A standalone document instead keeps its content column bounded and wraps
+/// long prose tokens while leaving intrinsically wide blocks scrollable.
+const SHARE_EXPORT_LAYOUT_GUARDS: &str = r#"
+.share-page, .thread, .msg, .user-bubble, .assistant-wrap, .msg .body {
+  min-width: 0; max-width: 100%; box-sizing: border-box;
+}
+.share-page { width: 100%; }
+.md :where(p, li, a, blockquote, h1, h2, h3, h4, h5, th, td) {
+  min-width: 0; max-width: 100%; overflow-wrap: anywhere; word-break: break-word;
+}
+.md :where(pre, table, .math-display) { max-width: 100%; overflow-x: auto; }
+"#;
+
 /// Prevent a harvested rule from closing the inline `<style>` block.
 fn sanitize_css(css: &str) -> String {
     css.replace("</", "<\\/")
@@ -473,14 +489,17 @@ pub(crate) fn share_png_payload(
     .to_string()
 }
 
-/// One selected row for the PNG renderer, with assistant Markdown already
-/// split into canvas blocks.
+/// One selected row for the PNG renderer. Assistant Markdown is sent as the
+/// same HTML chat uses (`md_to_html`) so the canvas can rasterize tables and
+/// KaTeX instead of flattening them. `blocks` stay as a fallback if the HTML
+/// snapshot fails.
 pub(crate) fn share_png_row(role: ShareRole, label: &str, text: &str) -> Value {
     let mut row = json!({
         "kind": role.tag(),
         "label": label,
     });
     if role == ShareRole::Assistant {
+        row["html"] = json!(crate::text::md_to_html(text));
         row["blocks"] = json!(share_markdown_blocks(text));
     } else {
         row["text"] = json!(text);
@@ -527,6 +546,7 @@ pub(crate) fn share_html_document(
         out.push_str(&sanitize_css(theme.harvested_css.trim()));
         out.push('\n');
     }
+    out.push_str(SHARE_EXPORT_LAYOUT_GUARDS);
     let _ = write!(
         out,
         "</style>\n</head>\n<body>\n<main class=\"share-page\">\n\
@@ -601,11 +621,10 @@ struct TableState {
     cell: String,
 }
 
-/// Parse assistant Markdown into the flat block list the JS canvas renderer
-/// draws: headings, paragraphs, list items, quotes, code blocks, tables
-/// (flattened to monospace lines) and horizontal rules, with inline runs
-/// styled bold/italic/code/link. Mirrors the options chat rendering uses so
-/// the exported image matches what the user saw.
+/// Parse assistant Markdown into the flat block list used only when the HTML
+/// snapshot path cannot run. Headings, paragraphs, lists, quotes, code, and
+/// rules are preserved; tables stay flattened to monospace lines. Prefer the
+/// `html` field on the PNG row so the export matches chat (tables + KaTeX).
 pub(crate) fn share_markdown_blocks(text: &str) -> Vec<Value> {
     use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
@@ -998,9 +1017,28 @@ mod share_tests {
     }
 
     #[test]
+    fn png_row_includes_chat_html_for_tables_and_math() {
+        let row = share_png_row(
+            ShareRole::Assistant,
+            "助手",
+            "| 项目 | 数值 |\n| --- | --- |\n| A | 1 |\n| B | 2 |\n\n质能 $E = mc^2$\n\n$$\\int_0^1 x^2 dx$$\n",
+        );
+        let html = row["html"]
+            .as_str()
+            .expect("assistant row should carry chat HTML");
+        assert!(html.contains("<table>"), "{html}");
+        assert!(html.contains("<th>"), "{html}");
+        assert!(html.contains("项目"), "{html}");
+        assert!(html.contains(r#"class="math math-inline""#), "{html}");
+        assert!(html.contains(r#"class="math math-display""#), "{html}");
+        assert!(html.contains("E = mc^2"), "{html}");
+        assert!(row["blocks"].is_array());
+    }
+
+    #[test]
     fn png_payload_carries_the_requested_width() {
         let payload: Value = serde_json::from_str(&share_png_payload(
-            "wisp-science",
+            "wisp-depmap",
             "2026-08-19",
             "footer",
             &[share_png_row(ShareRole::User, "You", "hi")],
@@ -1069,7 +1107,7 @@ mod share_tests {
             },
         ];
         let html = share_html_document(
-            "wisp-science",
+            "wisp-depmap",
             "2026-08-14",
             "Shared",
             &rows,
@@ -1095,7 +1133,7 @@ mod share_tests {
         assert!(!html.contains("class=\"card\""));
         assert!(!html.contains("class=\"bubble\""));
         let themed = share_html_document(
-            "wisp-science",
+            "wisp-depmap",
             "2026-08-14",
             "Shared",
             &rows,
@@ -1108,6 +1146,14 @@ mod share_tests {
         assert!(themed.contains("<html lang=\"zh\">"));
         assert!(themed.contains("--bg-app: rgb(23, 22, 20)"));
         assert!(themed.contains(".thread { gap: 20px; }"));
+        let live_rule = themed.find(".thread { gap: 20px; }").unwrap();
+        let layout_guard = themed.find(".share-page, .thread, .msg").unwrap();
+        assert!(
+            layout_guard > live_rule,
+            "layout guards must win over live CSS"
+        );
+        assert!(themed.contains("overflow-wrap: anywhere"));
+        assert!(themed.contains(".math-display) { max-width: 100%; overflow-x: auto; }"));
     }
 
     #[test]

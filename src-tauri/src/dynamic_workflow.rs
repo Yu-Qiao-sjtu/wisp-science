@@ -253,6 +253,9 @@ pub(crate) struct DynamicAgentTaskProposal {
     pub(crate) executor: Option<AgentExecutorSelection>,
     #[serde(default)]
     pub(crate) budget: Option<AgentBudgetProposal>,
+    /// Omit to inherit policy, use zero for unlimited, or set seconds.
+    #[serde(default)]
+    pub(crate) timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,6 +304,9 @@ pub(crate) struct AgentResultSummary {
     pub(crate) input_tokens: i64,
     pub(crate) output_tokens: i64,
     pub(crate) tool_calls: i64,
+    pub(crate) activity_messages: i64,
+    pub(crate) last_activity_at: Option<i64>,
+    pub(crate) research_progress: Option<crate::research_progress::ResearchProgressSnapshot>,
     pub(crate) cost_microunits: i64,
     pub(crate) duration_secs: Option<i64>,
     pub(crate) full_result_available: bool,
@@ -362,12 +368,7 @@ pub(crate) async fn resolve_proposal(
         match task.task_kind {
             WorkflowTaskKind::Agent => {
                 let specialist = specialist_snapshot(store, task.specialist_id.as_deref()).await?;
-                let skill_bindings = resources
-                    .map(|resources| {
-                        resources.resolve_skill_bindings(&task.skill_ids, specialist.as_ref())
-                    })
-                    .transpose()?
-                    .unwrap_or_default();
+                let skill_bindings = vec![];
                 if let Some(resources) = resources {
                     resources.validate_task(
                         &task.capabilities,
@@ -408,6 +409,7 @@ pub(crate) async fn resolve_proposal(
                                 .map(AgentExecutorSelection::into_ref)
                                 .transpose()?,
                             budget: task.budget.map(AgentBudget::from),
+                            timeout_secs: task.timeout_secs,
                             input: json!({"task_id": display_id}),
                         },
                         host,
@@ -620,6 +622,13 @@ pub(crate) fn summarize(
                     .map(|requested| requested.budget.as_ref().map(AgentBudgetProposal::from))
                     .unwrap_or_else(|| Some(AgentBudgetProposal::from(&step.spec.budget)))
             },
+            timeout_secs: if step.task_kind == WorkflowTaskKind::RunActivity {
+                None
+            } else {
+                requested
+                    .map(|requested| requested.timeout_secs)
+                    .unwrap_or(step.spec.timeout_secs)
+            },
         });
         approval_reasons.extend(step.spec.approval_reasons.iter().map(|message| {
             AgentApprovalReasonSummary {
@@ -691,6 +700,12 @@ pub(crate) fn summarize(
     })
 }
 
+fn attempt_duration_secs(attempt: &AgentWorkflowAttempt, now: i64) -> Option<i64> {
+    attempt
+        .started_at
+        .map(|started| attempt.finished_at.unwrap_or(now).saturating_sub(started))
+}
+
 fn result_summary(attempt: &AgentWorkflowAttempt) -> AgentResultSummary {
     let output = serde_json::from_str::<Value>(&attempt.output_json).ok();
     let summary = output
@@ -711,11 +726,15 @@ fn result_summary(attempt: &AgentWorkflowAttempt) -> AgentResultSummary {
         input_tokens: attempt.input_tokens,
         output_tokens: attempt.output_tokens,
         tool_calls: attempt.tool_calls,
+        activity_messages: 0,
+        // The workflow snapshot enriches this with child-frame message
+        // activity when available. Until the child persists its first
+        // message, the attempt timestamp still lets the UI distinguish a
+        // freshly-started Agent from a card with no observable heartbeat.
+        last_activity_at: Some(attempt.updated_at),
+        research_progress: None,
         cost_microunits: attempt.cost_microunits,
-        duration_secs: attempt
-            .started_at
-            .zip(attempt.finished_at)
-            .map(|(started, finished)| finished.saturating_sub(started)),
+        duration_secs: attempt_duration_secs(attempt, chrono::Utc::now().timestamp()),
         full_result_available: attempt.response_json.is_some(),
     }
 }
@@ -775,6 +794,9 @@ async fn specialist_snapshot(
 }
 
 pub(crate) fn validate_proposal(proposal: &DynamicAgentWorkflowProposal) -> Result<(), String> {
+    if proposal.tasks.iter().any(|task| !task.skill_ids.is_empty()) {
+        return Err(wisp_core::workflow_conversion::LEGACY_WORKFLOW_ERROR.into());
+    }
     let goal = proposal.goal.trim();
     if goal.is_empty() || goal.chars().count() > MAX_GOAL_CHARS {
         return Err(format!(
@@ -833,6 +855,7 @@ pub(crate) fn validate_proposal(proposal: &DynamicAgentWorkflowProposal) -> Resu
                     || task.model_id.is_some()
                     || task.executor.is_some()
                     || task.budget.is_some()
+                    || task.timeout_secs.is_some()
                 {
                     return Err(format!(
                         "Run activity task {} cannot include Agent-only fields",
@@ -974,7 +997,31 @@ mod tests {
             model_id: None,
             executor: None,
             budget: None,
+            timeout_secs: None,
         }
+    }
+
+    #[test]
+    fn running_attempt_summary_exposes_elapsed_time_and_start_heartbeat() {
+        let mut attempt = AgentWorkflowAttempt::queued(
+            "attempt-1",
+            "workflow-1",
+            "workflow-1:search",
+            1,
+            "request-1",
+            "native",
+            "{}",
+        )
+        .unwrap();
+        attempt.status = wisp_store::AgentWorkflowAttemptStatus::Running;
+        attempt.started_at = Some(100);
+        attempt.updated_at = 104;
+
+        assert_eq!(attempt_duration_secs(&attempt, 109), Some(9));
+        let summary = result_summary(&attempt);
+        assert_eq!(summary.status, "running");
+        assert_eq!(summary.last_activity_at, Some(104));
+        assert!(summary.duration_secs.is_some());
     }
 
     #[test]
@@ -1056,6 +1103,7 @@ mod tests {
             model_id: None,
             executor: None,
             budget: None,
+            timeout_secs: None,
         };
         let proposal = DynamicAgentWorkflowProposal {
             goal: "Develop method".into(),

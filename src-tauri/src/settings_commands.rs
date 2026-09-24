@@ -29,9 +29,10 @@ async fn validate_provider_config(
     provider_name: &str,
     mut cfg: wisp_llm::ProviderConfig,
     supports_vision: bool,
+    use_for_image_generation: bool,
 ) -> Result<(), String> {
     let proxy = cfg.proxy.clone();
-    if models::is_image_generation_model(&cfg.model) {
+    if use_for_image_generation || models::is_image_generation_model(&cfg.model) {
         if !models::supports_image_generation(provider_name, &cfg.model) {
             return Err(models::IMAGE_GENERATION_UNSUPPORTED.into());
         }
@@ -41,6 +42,13 @@ async fn validate_provider_config(
             cfg.model,
             cfg.proxy,
         )
+        .with_options(models::ImageGenerationOptions {
+            user_agent: cfg.user_agent,
+            send_user_agent: cfg.send_user_agent,
+            send_session_id: cfg.send_session_id,
+            session_header_name: cfg.session_header_name,
+            ..Default::default()
+        })
         .validate_model_access()
         .await
         .map_err(|error| annotate_provider_error(error, proxy.as_deref()));
@@ -55,6 +63,13 @@ async fn validate_provider_config(
             cfg.model,
             cfg.proxy,
         )
+        .with_options(models::VideoGenerationOptions {
+            user_agent: cfg.user_agent,
+            send_user_agent: cfg.send_user_agent,
+            send_session_id: cfg.send_session_id,
+            session_header_name: cfg.session_header_name,
+            ..Default::default()
+        })
         .validate_model_access()
         .await;
     }
@@ -96,7 +111,15 @@ pub(super) async fn get_settings(state: State<'_, AppState>) -> Result<Settings,
         .and_then(|value| value.parse().ok())
         .filter(|value| *value >= 0)
         .unwrap_or_else(super::default_max_iter_setting);
-    let (max_tokens, reasoning_effort) = models::active_llm_advanced(&state.store).await;
+    let (
+        max_tokens,
+        reasoning_effort,
+        service_tier,
+        user_agent,
+        send_user_agent,
+        send_session_id,
+        session_header_name,
+    ) = models::active_llm_advanced(&state.store).await;
     let has_api_key = models::active_has_key(&state.store).await;
     let supports_vision = models::active_supports_vision(&state.store).await;
     let label = models::active_label(&state.store).await;
@@ -142,6 +165,9 @@ pub(super) async fn get_settings(state: State<'_, AppState>) -> Result<Settings,
         .unwrap_or_default();
     let notifications_enabled = super::load_notifications_enabled(&state.store).await;
     let auto_compact = super::load_auto_compact_enabled(&state.store).await;
+    let semantic_compact_on_model_switch =
+        super::load_semantic_compact_on_model_switch(&state.store).await;
+    let semantic_compact_idle_hours = super::load_semantic_compact_idle_hours(&state.store).await;
     let (auto_continue, auto_continue_limit) =
         super::load_auto_continue_settings(&state.store).await;
     let follow_up_questions = state
@@ -160,13 +186,7 @@ pub(super) async fn get_settings(state: State<'_, AppState>) -> Result<Settings,
         .flatten()
         .map(|value| value == "true")
         .unwrap_or(true);
-    let proxy_url = state
-        .store
-        .get_setting("proxy_url")
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+    let proxy_url = crate::network::load(&state.store).await?.model_proxy_url;
     Ok(Settings {
         provider,
         api_url,
@@ -177,12 +197,19 @@ pub(super) async fn get_settings(state: State<'_, AppState>) -> Result<Settings,
         workspace_dir,
         max_iter,
         auto_compact,
+        semantic_compact_on_model_switch,
+        semantic_compact_idle_hours,
         auto_continue,
         auto_continue_limit: auto_continue_limit as u64,
         follow_up_questions,
         resume_last_session,
         max_tokens,
         reasoning_effort,
+        service_tier,
+        user_agent,
+        send_user_agent,
+        send_session_id,
+        session_header_name,
         proxy_url,
         supports_vision,
         sync_backend,
@@ -240,12 +267,6 @@ pub(super) async fn set_settings(
     let pet_directory = settings.pet_directory.trim();
     if !pet_directory.is_empty() && !Path::new(pet_directory).is_absolute() {
         return Err("Pet directory must be an absolute path.".into());
-    }
-    let proxy_url = settings.proxy_url.trim();
-    if !proxy_url.is_empty() && proxy_url != "none" && reqwest::Proxy::all(proxy_url).is_err() {
-        return Err(
-            "Proxy must be empty, `none`, or a URL like http://127.0.0.1:7890 / socks5://127.0.0.1:1080.".into(),
-        );
     }
     if settings.pet_enabled {
         if pet_directory.is_empty() {
@@ -349,6 +370,22 @@ pub(super) async fn set_settings(
         .map_err(|e| e.to_string())?;
     state
         .store
+        .set_setting(
+            "semantic_compact_on_model_switch",
+            &settings.semantic_compact_on_model_switch.to_string(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    state
+        .store
+        .set_setting(
+            "semantic_compact_idle_hours",
+            &settings.semantic_compact_idle_hours.to_string(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    state
+        .store
         .set_setting("auto_continue", &settings.auto_continue.to_string())
         .await
         .map_err(|e| e.to_string())?;
@@ -376,12 +413,8 @@ pub(super) async fn set_settings(
         )
         .await
         .map_err(|e| e.to_string())?;
-    state
-        .store
-        .set_setting("proxy_url", proxy_url)
-        .await
-        .map_err(|e| e.to_string())?;
-    super::set_llm_proxy(proxy_url);
+    // Network preferences have an independent save path. A stale general/model
+    // settings form must never overwrite the current network configuration.
     desktop_lifecycle::sync_pet_window(&app, settings.pet_enabled)?;
 
     // Workspace directory: persist an absolute, creatable path. Takes effect on
@@ -608,7 +641,7 @@ pub(super) async fn set_credential(
     // standalone probe, so they're stored as-is.
     if id == "openalex_api_key" && !value.is_empty() {
         let resp = reqwest::Client::builder()
-            .user_agent("wisp-science")
+            .user_agent("wisp-depmap")
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .map_err(|e| e.to_string())?
@@ -642,6 +675,7 @@ pub(super) async fn validate_settings(
     settings: Settings,
     key: Option<String>,
     profile_id: Option<String>,
+    use_for_image_generation: Option<bool>,
 ) -> Result<String, String> {
     let provider_name = normalized_provider(&settings.provider);
     let stored_key = match profile_id
@@ -658,18 +692,22 @@ pub(super) async fn validate_settings(
         }
     };
     let api_key = effective_api_key(key, stored_key);
-    let mut cfg = build_provider_config(
+    let cfg = build_provider_config(
         &settings.provider,
         &settings.api_url,
         &api_key,
         &settings.model,
         settings.max_tokens,
         &settings.reasoning_effort,
+        &settings.service_tier,
+        &settings.user_agent,
+        settings.send_user_agent,
+        settings.send_session_id,
+        &settings.session_header_name,
+        None,
     )?;
-    let form_proxy = settings.proxy_url.trim();
-    if !form_proxy.is_empty() {
-        cfg.proxy = Some(form_proxy.to_string());
-    }
+    // Validate through the current Network policy, not a stale model form's
+    // compatibility proxy_url field.
 
     tracing::info!(
         target: "wisp",
@@ -680,7 +718,12 @@ pub(super) async fn validate_settings(
     );
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        validate_provider_config(&provider_name, cfg, settings.supports_vision),
+        validate_provider_config(
+            &provider_name,
+            cfg,
+            settings.supports_vision,
+            use_for_image_generation.unwrap_or(false),
+        ),
     )
     .await
     .map_err(|_| {
@@ -730,6 +773,66 @@ mod tests {
         fs,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[tokio::test]
+    async fn explicit_image_validation_routes_custom_ids_to_metadata_not_chat_or_generation() {
+        for provider in ["openai", "openai_responses"] {
+            let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = calls.clone();
+            let router = axum::Router::new().fallback(move |request: axum::extract::Request| {
+                let recorded = recorded.clone();
+                async move {
+                    let method = request.method().to_string();
+                    let path = request.uri().path().to_string();
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push((method.clone(), path.clone()));
+                    if method == "GET" && path == "/v1/models/gpt-image-2.5" {
+                        (
+                            axum::http::StatusCode::OK,
+                            axum::Json(serde_json::json!({"id":"gpt-image-2.5"})),
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            axum::Json(serde_json::json!({
+                                "error":{"message":"image model must not be probed through chat"}
+                            })),
+                        )
+                    }
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/v1", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let mut cfg = crate::build_provider_config(
+                provider,
+                &url,
+                "fake-key",
+                "gpt-image-2.5",
+                384_000,
+                "",
+                "",
+                "",
+                true,
+                None,
+                "",
+                None,
+            )
+            .unwrap();
+            cfg.proxy = Some("none".into());
+            super::validate_provider_config(provider, cfg, true, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                *calls.lock().unwrap(),
+                vec![("GET".to_string(), "/v1/models/gpt-image-2.5".to_string())]
+            );
+            server.abort();
+            let _ = server.await;
+        }
+    }
 
     #[test]
     fn vision_probe_sends_a_decodable_png_part() {
@@ -844,17 +947,29 @@ mod tests {
 
 use super::*;
 
+/// With `session_id` this is that conversation's own flag; without one it is
+/// the default new conversations inherit (what the settings pane edits).
 #[tauri::command]
-pub(super) async fn get_auto_review_enabled(state: State<'_, AppState>) -> Result<bool, String> {
-    Ok(load_auto_review_enabled(&state.store).await)
+pub(super) async fn get_auto_review_enabled(
+    state: State<'_, AppState>,
+    session_id: Option<String>,
+) -> Result<bool, String> {
+    Ok(match session_id.as_deref() {
+        Some(session_id) => load_auto_review_enabled(&state.store, session_id).await,
+        None => load_default_auto_review_enabled(&state.store).await,
+    })
 }
 
 #[tauri::command]
 pub(super) async fn set_auto_review_enabled(
     state: State<'_, AppState>,
+    session_id: Option<String>,
     enabled: bool,
 ) -> Result<bool, String> {
-    save_auto_review_enabled(&state.store, enabled).await?;
+    match session_id.as_deref() {
+        Some(session_id) => save_auto_review_enabled(&state.store, session_id, enabled).await?,
+        None => save_default_auto_review_enabled(&state.store, enabled).await?,
+    }
     Ok(enabled)
 }
 

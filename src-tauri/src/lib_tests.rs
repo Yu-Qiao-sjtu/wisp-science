@@ -5,19 +5,108 @@ use super::session_commands::transcript_page_items;
 use super::{
     begin_queued_cutin, branch_title, client_turn_error, coalesce_live_agent_events,
     copy_dir_recursive, enable_referenced_contexts, events_to_items, limit_persisted_ui_event,
-    merge_pending_ui_event, message_uses_resource_bindings, messages_to_items, navigation_allowed,
-    parse_disabled_skills, parse_enabled_skill_names, parse_follow_up_questions, parse_skill_tags,
-    persist_ui_events, provenance_ui_file_changes, receive_confirm_decision,
-    reclaim_unconsumed_cutin, resolve_acp_artifact_references, resolve_composer_references,
-    resolve_reader_references, resolve_review_backend, resolve_workspace, session_runtime_status,
-    should_hide_app_on_macos_close, should_persist_ui_event, user_message_start, AgentEvent,
-    ComposerReferenceArg, McpConnection, McpHttpAuth, McpTransport, ProjectActivityLocks,
-    QueuedItem, SessionRuntime, SkillInfo, StartupReport, StartupTimeline,
+    live_agent_event, merge_pending_ui_event, message_uses_resource_bindings,
+    messages_to_context_view_items, messages_to_items, navigation_allowed, parse_disabled_skills,
+    parse_enabled_skill_names, parse_follow_up_questions, parse_skill_tags, persist_ui_events,
+    provenance_ui_file_changes, receive_confirm_decision, resolve_acp_artifact_references,
+    resolve_composer_references, resolve_reader_references, resolve_review_backend,
+    resolve_workspace, session_runtime_status, should_hide_app_on_macos_close,
+    should_persist_ui_event, specialist_skill_index, take_next_queued_turn, user_message_start,
+    AgentEvent, ComposerReferenceArg, McpConnection, McpHttpAuth, McpTransport,
+    ProjectActivityLocks, QueuedItem, SessionRuntime, SkillInfo, StartupReport, StartupTimeline,
     MAX_PENDING_UI_EVENT_BYTES, UI_STREAM_OUTPUT_MAX_BYTES, UI_TOOL_RESULT_MAX_CHARS,
 };
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{atomic::AtomicBool, Arc};
+
+#[test]
+fn model_request_scope_survives_rebuilds_and_standalone_calls_are_isolated() {
+    let config = |session_id| {
+        super::build_provider_config(
+            "openai",
+            "https://opencode.ai/zen/go/v1",
+            "fake-key",
+            "kimi-k3",
+            1024,
+            "",
+            "",
+            "",
+            true,
+            None,
+            "",
+            session_id,
+        )
+        .unwrap()
+    };
+    assert_eq!(config(Some("frame-a")).session_id, "frame-a");
+    assert_eq!(
+        config(Some("frame-a")).session_id,
+        config(Some("frame-a")).session_id
+    );
+    assert_ne!(
+        config(Some("frame-a")).session_id,
+        config(Some("frame-b")).session_id
+    );
+    assert_ne!(config(None).session_id, config(None).session_id);
+}
+
+#[test]
+fn model_identity_policy_is_preserved_and_header_names_are_validated() {
+    let config = |name| {
+        super::build_provider_config(
+            "openai",
+            "https://gateway.example/v1",
+            "fake-key",
+            "model",
+            1024,
+            "",
+            "",
+            "retained-client/1.0",
+            false,
+            Some(true),
+            name,
+            Some("frame-test"),
+        )
+    };
+    let cfg = config("X-Custom-Session").unwrap();
+    assert!(!cfg.send_user_agent);
+    assert_eq!(cfg.send_session_id, Some(true));
+    assert_eq!(cfg.session_header_name, "x-custom-session");
+    assert_eq!(cfg.user_agent, "retained-client/1.0");
+    assert_eq!(cfg.session_id, "frame-test");
+    assert!(config("Authorization").is_err());
+    assert!(config("x-session\r\nx-injected").is_err());
+}
+
+#[test]
+fn model_user_agent_is_validated_before_building_a_provider() {
+    let config = |value| {
+        super::build_provider_config(
+            "openai",
+            "https://example.test/v1",
+            "test-key",
+            "test-model",
+            1024,
+            "",
+            "",
+            value,
+            true,
+            None,
+            "",
+            None,
+        )
+    };
+    assert_eq!(
+        config("  research-client/1.0  ").unwrap().user_agent,
+        "research-client/1.0"
+    );
+    assert_eq!(config("").unwrap().user_agent, "");
+    assert!(config("client\r\nX-Injected: value")
+        .unwrap_err()
+        .contains("User-Agent"));
+}
 
 #[tokio::test]
 async fn exploration_creation_shares_project_activity_but_serializes_round_initialization() {
@@ -53,6 +142,63 @@ async fn exploration_creation_shares_project_activity_but_serializes_round_initi
     );
     drop(running_candidate);
     assert!(locks.project("project").try_write_owned().is_ok());
+}
+
+#[tokio::test]
+async fn depmap_specialist_keeps_required_skills_when_project_subset_is_empty() {
+    let root = std::env::temp_dir().join(format!("wisp_depmap_skills_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join("store.sqlite");
+    let store = wisp_store::Store::open(&db).await.unwrap();
+    store
+        .create_project("p1", "DepMap", &root.to_string_lossy())
+        .await
+        .unwrap();
+    store
+        .create_frame("f1", "p1", "OPERON", "wisp")
+        .await
+        .unwrap();
+    store
+        .set_setting("project_enabled_skills:p1", "[]")
+        .await
+        .unwrap();
+    let project = super::ActiveProject {
+        id: "p1".into(),
+        root: root.clone(),
+        skills: Arc::new(super::load_skill_index(&root)),
+        memory: Arc::new(wisp_core::MemoryManager::new(&root)),
+    };
+    let specialist = super::specialists::builtin_depmap_r_agent();
+    let skills = specialist_skill_index(&store, &project, Some(&specialist)).await;
+    assert!(skills.get("depmap-knowledge-query").is_some());
+    assert!(skills.get("depmap-coding-agent").is_some());
+    super::specialists::set_frame_specialist(
+        &store,
+        "f1",
+        super::specialists::DEPMAP_SPECIALIST_ID,
+    )
+    .await
+    .unwrap();
+    let resources = super::delegation_resources::ScientificResourceCatalog::discover(
+        &store,
+        &project,
+        Some("f1"),
+        &root.join("app-data"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        resources.has_depmap(),
+        "the DepMap specialist's required Skill must enable depmap_read for registered Workflows"
+    );
+    assert!(resources
+        .capability_registry()
+        .unwrap()
+        .get("depmap_read")
+        .is_some());
+
+    drop(store);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -99,10 +245,10 @@ fn mcp_app_tool_confirm_payload_parses_and_keys_a_grant() {
     let (tool, preview) = super::parse_confirm_payload(message);
     assert_eq!(tool, "figure_preview_exact");
     assert_eq!(preview, "");
-    let key = super::mcp_app_approval_grant_key("figure-library", "figure_preview_exact");
+    let key = super::mcp_app_approval_grant_key("figure-library", "figure_preview_exact").unwrap();
     assert_eq!(key.kind, "mcp_app_tool");
     assert_eq!(key.target, "figure-library:figure_preview_exact");
-    let other = super::mcp_app_approval_grant_key("other-server", "figure_preview_exact");
+    let other = super::mcp_app_approval_grant_key("other-server", "figure_preview_exact").unwrap();
     assert_ne!(key, other);
     // Agent Always-allow grants stay tool-name scoped and do not match App grants.
     let agent = super::approval_grant_key("Run tool 'figure_preview_exact'?").unwrap();
@@ -112,11 +258,26 @@ fn mcp_app_tool_confirm_payload_parses_and_keys_a_grant() {
     assert_eq!(tool, "python");
 }
 
+#[test]
+fn mcp_app_approval_grant_key_separates_bundled_connectors() {
+    assert!(super::mcp_app_approval_grant_key("", "echo").is_none());
+    assert!(super::mcp_app_approval_grant_key("   ", "echo").is_none());
+    let dev =
+        super::mcp_app_approval_grant_key(super::BUNDLED_DEV_MCP_CONNECTOR_ID, "echo").unwrap();
+    let bio = super::mcp_app_approval_grant_key("mcp_bio", "echo").unwrap();
+    assert_eq!(dev.target, "dev-mcp:echo");
+    assert_eq!(bio.target, "mcp_bio:echo");
+    assert_ne!(dev, bio);
+    assert_ne!(dev.target, "_:echo");
+    assert_ne!(bio.target, "_:echo");
+}
+
 /// One MCP server behind an App bridge: answers only its own tool and reports
 /// which connector served the call, so a crossed route is visible in the result.
 struct FakeAppServer {
     connector_id: String,
     tool: String,
+    delay: Option<std::time::Duration>,
 }
 
 #[async_trait::async_trait]
@@ -147,6 +308,9 @@ impl wisp_tools::McpAppServer for FakeAppServer {
         if name != self.tool {
             return Err(format!("tool '{name}' is not on this server"));
         }
+        if let Some(delay) = self.delay {
+            tokio::time::sleep(delay).await;
+        }
         Ok(serde_json::json!({
             "content": [],
             "structuredContent": { "servedBy": self.connector_id },
@@ -157,10 +321,12 @@ impl wisp_tools::McpAppServer for FakeAppServer {
 
 fn fake_app_bridge(frame_id: &str, connector_id: &str, tool: &str) -> super::McpAppToolBridge {
     super::McpAppToolBridge {
+        generation: 0,
         frame_id: frame_id.into(),
         server: Arc::new(FakeAppServer {
             connector_id: connector_id.into(),
             tool: tool.into(),
+            delay: None,
         }),
         limiter: super::McpAppCallLimiter::with_limits(1, 8, std::time::Duration::from_secs(10)),
     }
@@ -215,6 +381,58 @@ async fn parallel_mcp_app_instances_keep_separate_bridges() {
     assert!(bridges.get(motif).is_some());
     bridges.remove_for_frame("session-b");
     assert!(bridges.get(motif).is_none());
+}
+
+#[test]
+fn mcp_app_stale_cleanup_cannot_remove_replacement_generation() {
+    let bridges = super::McpAppBridges::default();
+    let id = "mcp-app:session-a:figures";
+    bridges.register(
+        id.into(),
+        fake_app_bridge("session-a", "figure-library", "preview"),
+    );
+    let old = bridges.get(id).unwrap().generation;
+    bridges.register(
+        id.into(),
+        fake_app_bridge("session-a", "figure-library", "preview"),
+    );
+    let new = bridges.get(id).unwrap().generation;
+    assert_ne!(old, new);
+    assert!(!bridges.close_generation(id, Some(old)));
+    assert!(bridges.close_generation(id, Some(new)));
+}
+
+#[tokio::test]
+async fn mcp_app_host_timeout_fails_only_the_call() {
+    let server = FakeAppServer {
+        connector_id: "figure-library".into(),
+        tool: "figure_preview_exact".into(),
+        delay: Some(std::time::Duration::from_millis(80)),
+    };
+    let error = super::invoke_mcp_app_server_tool(
+        &server,
+        "figure_preview_exact",
+        &serde_json::json!({}),
+        Some(std::time::Duration::from_millis(15)),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("timed out after"));
+
+    let fast = FakeAppServer {
+        connector_id: "figure-library".into(),
+        tool: "figure_preview_exact".into(),
+        delay: None,
+    };
+    let result = super::invoke_mcp_app_server_tool(
+        &fast,
+        "figure_preview_exact",
+        &serde_json::json!({}),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["structuredContent"]["servedBy"], "figure-library");
 }
 
 #[test]
@@ -274,6 +492,56 @@ fn mcp_app_context_is_latest_only_and_session_scoped() {
 }
 
 #[test]
+fn mcp_app_context_notice_projects_text_and_structured_preview() {
+    let context = super::normalize_mcp_app_context(
+        "  Motif   for   Claude  ",
+        serde_json::json!({
+            "content": [
+                {"type": "text", "text": "  Active record: pET-28a(+)  "},
+                {"type": "text", "text": "Use it for the next figure."}
+            ],
+            "structuredContent": {"recordId": "pet-28a", "length": 5369}
+        }),
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(context.app_name, "Motif for Claude");
+    assert_eq!(
+        context.summary,
+        "Active record: pET-28a(+)\n\nUse it for the next figure."
+    );
+    let preview: serde_json::Value =
+        serde_json::from_str(context.structured_preview.as_deref().unwrap()).unwrap();
+    assert_eq!(preview["recordId"], "pet-28a");
+    assert_eq!(preview["length"], 5369);
+    assert!(context.body.contains("Structured state:"));
+}
+
+#[test]
+fn mcp_app_context_notice_redacts_generic_sensitive_preview_fields() {
+    let context = super::normalize_mcp_app_context(
+        "Motif",
+        serde_json::json!({
+            "content": [{"type": "text", "text": "safe"}],
+            "structuredContent": {
+                "recordId": "pet-28a",
+                "apiKey": "do-not-display",
+                "nested": {"access_token": "also-hidden", "label": "visible"}
+            }
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    let preview = context.structured_preview.unwrap();
+    assert!(preview.contains("pet-28a"));
+    assert!(preview.contains("visible"));
+    assert!(!preview.contains("do-not-display"));
+    assert!(!preview.contains("also-hidden"));
+    assert!(context.body.contains("do-not-display"));
+}
+
+#[test]
 fn mcp_app_context_rejects_unsupported_and_oversized_payloads() {
     let unsupported = super::normalize_mcp_app_context(
         "Motif",
@@ -307,17 +575,69 @@ fn mcp_app_instance_id_carries_its_session() {
 }
 
 #[test]
+fn mcp_app_instance_id_reuses_resource_uri_across_presentations() {
+    let open = serde_json::json!({
+        "tool": { "name": "figure_open", "title": "Open Scientific Figure Library" },
+        "resource": { "uri": "ui://figure/library.html" },
+    });
+    let search = serde_json::json!({
+        "tool": { "name": "figure_search", "title": "Search scientific figure templates" },
+        "resource": { "uri": "ui://figure/library.html?q=survival#hits" },
+    });
+    assert_eq!(
+        super::mcp_app_instance_id("session-a", &open),
+        "mcp-app:session-a:ui://figure/library.html"
+    );
+    assert_eq!(
+        super::mcp_app_instance_id("session-a", &search),
+        super::mcp_app_instance_id("session-a", &open)
+    );
+    assert_eq!(
+        super::mcp_app_resource_identity(&serde_json::json!({ "tool": { "name": "open_app" } })),
+        "open_app"
+    );
+}
+
+#[test]
+fn replacing_an_mcp_app_bridge_keeps_one_instance() {
+    let bridges = super::McpAppBridges::default();
+    let instance_id = super::mcp_app_instance_id(
+        "session-a",
+        &serde_json::json!({
+            "resource": { "uri": "ui://figure/library.html" },
+            "tool": { "name": "figure_open" },
+        }),
+    );
+    bridges.register(
+        instance_id.clone(),
+        fake_app_bridge("session-a", "figure-library", "figure_open"),
+    );
+    bridges.register(
+        instance_id.clone(),
+        fake_app_bridge("session-a", "figure-library", "figure_search"),
+    );
+    let bridge = bridges.get(&instance_id).unwrap();
+    assert_eq!(bridge.server.connector_id(), "figure-library");
+    assert!(bridge.server.visible_to_app("figure_search"));
+    assert!(!bridge.server.visible_to_app("figure_open"));
+}
+
+#[test]
 fn image_helper_loads_supported_extension_for_model_input() {
     let root = std::env::temp_dir().join(format!("wisp_message_images_{}", uuid::Uuid::new_v4()));
     let uploads = root.join("uploads");
     std::fs::create_dir_all(&uploads).unwrap();
-    std::fs::write(uploads.join("plot.PNG"), b"image bytes").unwrap();
+    std::fs::write(
+        uploads.join("plot.PNG"),
+        include_bytes!("../../crates/wisp-core/tests/fixtures/1x1.png"),
+    )
+    .unwrap();
     std::fs::write(uploads.join("notes.txt"), b"notes").unwrap();
 
     // Small images do not need the UI confirmation path; exercise the shared
     // loader directly through its image helper here.
     let result = wisp_tools::image::view_image(&uploads.join("plot.PNG").to_string_lossy());
-    let images = vec![result.image.unwrap()];
+    let images = result.images;
 
     assert_eq!(images.len(), 1);
     assert!(images[0].data_url.starts_with("data:image/png;base64,"));
@@ -362,6 +682,7 @@ fn configured_image_generation_tool_is_available_without_a_specialist() {
             super::models::ImageGenerationOptions::default(),
         )),
         Some("none".into()),
+        "frame-test",
     );
 
     assert!(agent.tools.get("generate_image").is_some());
@@ -447,9 +768,28 @@ async fn auto_review_is_off_by_default_and_persists_changes() {
         .await
         .unwrap();
 
-    assert!(!super::load_auto_review_enabled(&store).await);
-    super::save_auto_review_enabled(&store, true).await.unwrap();
-    assert!(super::load_auto_review_enabled(&store).await);
+    // The pre-#1293 global flag the composer used to write must not leak into
+    // new sessions as their default.
+    store
+        .set_setting("auto_review_enabled", "true")
+        .await
+        .unwrap();
+    assert!(!super::load_auto_review_enabled(&store, "a").await);
+    super::save_auto_review_enabled(&store, "a", true)
+        .await
+        .unwrap();
+    assert!(super::load_auto_review_enabled(&store, "a").await);
+    // The whole point: session "a" stays on its own.
+    assert!(!super::load_auto_review_enabled(&store, "b").await);
+    // The settings-pane default only applies to sessions without their own flag.
+    super::save_default_auto_review_enabled(&store, true)
+        .await
+        .unwrap();
+    assert!(super::load_auto_review_enabled(&store, "b").await);
+    super::save_auto_review_enabled(&store, "b", false)
+        .await
+        .unwrap();
+    assert!(!super::load_auto_review_enabled(&store, "b").await);
     drop(store);
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -510,16 +850,28 @@ fn mac_menu_locale_includes_english_edit_labels() {
     assert_eq!(labels.select_all, "Select All");
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn mac_menu_action_maps_update_and_settings_ids() {
+    assert_eq!(super::mac_menu_action("action.new-window", false), None);
+    assert_eq!(super::mac_menu_action("action.new", false), None);
+    assert_eq!(super::mac_menu_action("action.projects", false), None);
     assert_eq!(
-        super::mac_menu_action("action.check-updates"),
+        super::mac_menu_action("action.check-updates", true),
         Some("check-updates")
     );
-    assert_eq!(super::mac_menu_action("action.star-us"), Some("star-us"));
-    assert_eq!(super::mac_menu_action("action.settings"), Some("settings"));
-    assert_eq!(super::mac_menu_action("action.unknown"), None);
+    assert_eq!(
+        super::mac_menu_action("action.star-us", true),
+        Some("star-us")
+    );
+    assert_eq!(
+        super::mac_menu_action("action.settings", true),
+        Some("settings")
+    );
+    assert_eq!(
+        super::mac_menu_action("action.new-window", true),
+        Some("new-window")
+    );
+    assert_eq!(super::mac_menu_action("action.unknown", true), None);
 }
 
 #[test]
@@ -629,6 +981,69 @@ fn reloaded_background_completion_keeps_terminal_status() {
 }
 
 #[test]
+fn context_view_keeps_system_and_checkpoint_rows() {
+    let items = messages_to_context_view_items(&[
+        wisp_llm::Message::system("sys"),
+        wisp_llm::Message::user("[context summary checkpoint]\n\nfolded"),
+        wisp_llm::Message::user("keep"),
+        wisp_llm::Message::assistant("answer"),
+    ]);
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item.role.as_str())
+            .collect::<Vec<_>>(),
+        ["system", "checkpoint", "user", "assistant"]
+    );
+    assert_eq!(items[0].kind.as_deref(), Some("system"));
+    assert_eq!(items[1].kind.as_deref(), Some("checkpoint"));
+}
+
+#[test]
+fn context_view_does_not_promote_tombstoned_completions_to_assistant() {
+    let tombstone = "[compacted; full content archived at wisp-history:abc — retrieve only narrow ranges with read/grep; do not load the whole archive back into context]";
+    let items = messages_to_context_view_items(&[
+        wisp_llm::Message::system("sys"),
+        wisp_llm::Message::user("plan the preprint"),
+        wisp_llm::Message::assistant("outline"),
+        wisp_llm::Message::tool("call-1", "attempt_completion", tombstone),
+        wisp_llm::Message::user("later"),
+        wisp_llm::Message::tool("call-2", "read", tombstone),
+        wisp_llm::Message::assistant("tail"),
+    ]);
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| (
+                item.role.as_str(),
+                item.kind.as_deref(),
+                item.tool_name.as_deref()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("system", Some("system"), None),
+            ("user", None, None),
+            ("assistant", None, None),
+            ("tool", Some("tombstone"), Some("attempt_completion")),
+            ("user", None, None),
+            ("tool", Some("tombstone"), Some("read")),
+            ("assistant", None, None),
+        ]
+    );
+    assert!(items
+        .iter()
+        .all(|item| item.role != "assistant" || item.text != tombstone));
+    let transcript = messages_to_items(&[wisp_llm::Message::tool(
+        "call-1",
+        "attempt_completion",
+        tombstone,
+    )]);
+    assert_eq!(transcript.len(), 1);
+    assert_eq!(transcript[0].role, "assistant");
+    assert_eq!(transcript[0].text, tombstone);
+}
+
+#[test]
 fn ssh_artifact_uri_maps_to_execution_context_and_remote_path() {
     assert_eq!(
         parse_ssh_artifact_uri("ssh://CPU/home/xzg/results.tar.gz"),
@@ -648,6 +1063,7 @@ fn persisted_ui_events_keep_live_step_order_and_boundaries() {
         AgentEvent::User {
             frame_id: frame_id.clone(),
             text: "question".into(),
+            queue_id: None,
         },
         AgentEvent::MessageBoundary {
             frame_id: frame_id.clone(),
@@ -675,6 +1091,7 @@ fn persisted_ui_events_keep_live_step_order_and_boundaries() {
             name: "shell".into(),
             ok: true,
             content: "/tmp".into(),
+            structured_content: None,
             duration_ms: 12,
         },
         AgentEvent::MessageBoundary { frame_id, seq: 3 },
@@ -776,6 +1193,7 @@ fn persisted_stdout_budget_caps_each_tool_and_resets_at_boundaries() {
             name: "shell".into(),
             ok: true,
             content: "done".into(),
+            structured_content: None,
             duration_ms: 1,
         },
         &mut bytes,
@@ -794,6 +1212,28 @@ fn persisted_stdout_budget_caps_each_tool_and_resets_at_boundaries() {
 }
 
 #[test]
+fn live_tool_result_omits_lossless_structured_evidence() {
+    let event = AgentEvent::ToolResult {
+        frame_id: "f".into(),
+        name: "mcp:depmap_query".into(),
+        ok: true,
+        content: "bounded display".into(),
+        structured_content: Some(serde_json::json!({"rows":[1,2,3]})),
+        duration_ms: 1,
+    };
+    let AgentEvent::ToolResult {
+        content,
+        structured_content,
+        ..
+    } = live_agent_event(event)
+    else {
+        panic!("expected tool result")
+    };
+    assert_eq!(content, "bounded display");
+    assert!(structured_content.is_none());
+}
+
+#[test]
 fn persisted_ui_events_restore_native_plan_and_question_cards() {
     let frame_id = "f".to_string();
     let events = vec![
@@ -807,6 +1247,7 @@ fn persisted_ui_events_restore_native_plan_and_question_cards() {
             name: wisp_tools::plan::PROPOSE_PLAN.into(),
             ok: true,
             content: r#"{"v":1,"source":"native","entries":[{"content":"Fix replay","status":"pending","priority":"high"}]}"#.into(),
+            structured_content: None,
             duration_ms: 1,
         },
         AgentEvent::ToolCall {
@@ -819,6 +1260,7 @@ fn persisted_ui_events_restore_native_plan_and_question_cards() {
             name: wisp_tools::ask_user::ASK_USER.into(),
             ok: true,
             content: r#"{"v":1,"source":"native","question":"Which option?","options":[]}"#.into(),
+            structured_content: None,
             duration_ms: 1,
         },
     ];
@@ -859,6 +1301,7 @@ fn persisted_usage_folds_per_turn_and_floats_to_tail() {
         AgentEvent::User {
             frame_id: frame_id.clone(),
             text: "q1".into(),
+            queue_id: None,
         },
         AgentEvent::Text {
             frame_id: frame_id.clone(),
@@ -869,6 +1312,7 @@ fn persisted_usage_folds_per_turn_and_floats_to_tail() {
         AgentEvent::User {
             frame_id: frame_id.clone(),
             text: "q2".into(),
+            queue_id: None,
         },
         AgentEvent::Text {
             frame_id: frame_id.clone(),
@@ -921,6 +1365,7 @@ fn persisted_ui_events_restore_context_compaction_flags() {
         before: 812_000,
         after: 236_000,
         strategy: "auto".into(),
+        epoch: None,
     };
     assert!(should_persist_ui_event(&event));
     let events = vec![event];
@@ -932,6 +1377,84 @@ fn persisted_ui_events_restore_context_compaction_flags() {
     assert_eq!(payload["before"], 812_000);
     assert_eq!(payload["after"], 236_000);
     assert_eq!(payload["strategy"], "auto");
+    assert!(payload["epoch"].is_null());
+
+    let (linked, _) = events_to_items(&[AgentEvent::Compaction {
+        frame_id: "f".into(),
+        before: 100,
+        after: 40,
+        strategy: "manual".into(),
+        epoch: Some(2),
+    }]);
+    let linked_payload: serde_json::Value = serde_json::from_str(&linked[0].text).unwrap();
+    assert_eq!(linked_payload["epoch"], 2);
+}
+
+#[test]
+fn persisted_compaction_updates_floated_usage_without_changing_billing() {
+    let usage = |tokens| AgentEvent::Usage {
+        frame_id: "f".into(),
+        round: 1,
+        model: "m".into(),
+        created_at: 1,
+        input: 5_350_300,
+        output: 1500,
+        reasoning: 0,
+        cached: 0,
+        ctx_tokens: tokens,
+        max_context: 1_048_576,
+        context_usage: wisp_core::ContextUsage {
+            conversation: tokens,
+            ..Default::default()
+        },
+    };
+    let mut events = vec![
+        usage(752_000),
+        AgentEvent::Compaction {
+            frame_id: "f".into(),
+            before: 569_400,
+            after: 245_500,
+            strategy: "manual".into(),
+            epoch: Some(1),
+        },
+    ];
+    let (rows, _) = events_to_items(&events);
+    let snapshot: serde_json::Value = serde_json::from_str(&rows.last().unwrap().text).unwrap();
+    assert_eq!(snapshot["ctx_tokens"], 245_500);
+    assert_eq!(snapshot["context_usage"]["conversation"], 245_500);
+    assert_eq!(snapshot["input"], 5_350_300);
+    assert_eq!(snapshot["output"], 1500);
+    events.push(usage(260_000));
+    let (rows, _) = events_to_items(&events);
+    let snapshot: serde_json::Value = serde_json::from_str(&rows.last().unwrap().text).unwrap();
+    assert_eq!(snapshot["ctx_tokens"], 260_000);
+    events.truncate(2);
+    events.push(AgentEvent::CompactionUndone {
+        frame_id: "f".into(),
+        epoch: 1,
+    });
+    let (rows, _) = events_to_items(&events);
+    let snapshot: serde_json::Value = serde_json::from_str(&rows.last().unwrap().text).unwrap();
+    assert_eq!(snapshot["ctx_tokens"], 569_400);
+    assert_eq!(snapshot["input"], 5_350_300);
+    // Automatic flags have no epoch until the turn is persisted; two flags
+    // in a turn still undo back to the first pre-compaction context.
+    if let AgentEvent::Compaction { epoch, .. } = &mut events[1] {
+        *epoch = None;
+    }
+    events.insert(
+        2,
+        AgentEvent::Compaction {
+            frame_id: "f".into(),
+            before: 245_500,
+            after: 120_000,
+            strategy: "auto".into(),
+            epoch: None,
+        },
+    );
+    let (rows, _) = events_to_items(&events);
+    let snapshot: serde_json::Value = serde_json::from_str(&rows.last().unwrap().text).unwrap();
+    assert_eq!(snapshot["ctx_tokens"], 569_400);
 }
 
 #[test]
@@ -947,6 +1470,101 @@ fn mcp_app_presentations_are_persisted_for_session_restore() {
         frame_id: "f".into(),
         path: "temporary.txt".into(),
     }));
+}
+
+#[test]
+fn mcp_app_snapshot_restores_the_saved_result_without_changing_host_resource() {
+    let mut payload = serde_json::json!({
+        "tool": { "name": "motif_open_workbench" },
+        "result": { "structuredContent": { "payload": { "records": [{ "name": "old" }] } } },
+        "resource": { "uri": "ui://motif/workbench.html", "text": "<html>Motif</html>" }
+    });
+    let snapshot = serde_json::json!({
+        "schema": super::MCP_APP_SNAPSHOT_SCHEMA,
+        "result": { "structuredContent": { "payload": { "records": [{ "name": "saved" }] } } }
+    });
+    super::apply_mcp_app_snapshot(&mut payload, "motif_open_workbench", &snapshot).unwrap();
+    assert_eq!(
+        payload.pointer("/result/structuredContent/payload/records/0/name"),
+        Some(&serde_json::json!("saved"))
+    );
+    assert_eq!(
+        payload.pointer("/resource/text"),
+        Some(&serde_json::json!("<html>Motif</html>"))
+    );
+}
+
+#[test]
+fn mcp_app_snapshot_rejects_a_different_app_kind() {
+    let mut payload = serde_json::json!({ "tool": { "name": "figure_search" } });
+    let snapshot = serde_json::json!({
+        "schema": super::MCP_APP_SNAPSHOT_SCHEMA,
+        "result": {}
+    });
+    assert!(
+        super::apply_mcp_app_snapshot(&mut payload, "motif_open_workbench", &snapshot,).is_err()
+    );
+}
+
+#[tokio::test]
+async fn persisted_mcp_app_snapshot_restores_without_a_live_bridge() {
+    let path = std::env::temp_dir().join(format!(
+        "wisp-motif-restore-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let store = wisp_store::Store::open(&path).await.unwrap();
+    store.create_project("p", "P", "").await.unwrap();
+    store.create_frame("f", "p", "OPERON", "m").await.unwrap();
+    store
+        .save_mcp_app_snapshot(
+            "f",
+            "motif-1",
+            "motif_open_workbench",
+            &serde_json::json!({
+                "schema": super::MCP_APP_SNAPSHOT_SCHEMA,
+                "result": {
+                    "structuredContent": {
+                        "payload": {
+                            "records": [{ "name": "pET-28a", "sequence": "ACGT" }]
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    let mut payload = serde_json::json!({
+        "tool": { "name": "motif_open_workbench" },
+        "result": { "structuredContent": { "payload": { "records": [] } } },
+        "resource": { "text": "<html>Motif</html>" }
+    });
+
+    super::restore_mcp_app_snapshot(&store, "f", "motif-1", &mut payload).await;
+
+    assert_eq!(
+        payload.pointer("/result/structuredContent/payload/records/0/name"),
+        Some(&serde_json::json!("pET-28a"))
+    );
+    store.close().await;
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn mcp_app_context_updates_are_persisted_but_not_embedded_in_chat_items() {
+    let event = AgentEvent::AppContextUpdate {
+        frame_id: "frame-1".into(),
+        context_id: "mcp-app:session-1:ui://motif/workbench.html".into(),
+        instance_id: "mcp-app:session-1:ui://motif/workbench.html".into(),
+        app_name: "Motif".into(),
+        update_mode: "replace".into(),
+        state: "active".into(),
+        summary: "Active record: pET-28a(+)".into(),
+        structured_preview: Some(r#"{"recordId":"pet-28a"}"#.into()),
+    };
+    assert!(should_persist_ui_event(&event));
+    let (items, _) = events_to_items(&[event]);
+    assert!(items.is_empty());
 }
 
 #[test]
@@ -1057,24 +1675,24 @@ async fn live_agent_events_merge_deltas_and_preserve_order() {
 
     let frame_id = "f".to_string();
     for delta in ["a", "b", "c"] {
-        tx.send(AgentEvent::Text {
+        tx.send(super::SessionUiMessage::Event(AgentEvent::Text {
             frame_id: frame_id.clone(),
             delta: delta.into(),
-        })
+        }))
         .unwrap();
     }
-    tx.send(AgentEvent::Stdout {
+    tx.send(super::SessionUiMessage::Event(AgentEvent::Stdout {
         frame_id: frame_id.clone(),
         chunk: "out".into(),
-    })
+    }))
     .unwrap();
     // A non-delta event must flush pending output before itself, keeping
     // the tool boundary behind the stream it terminates.
-    tx.send(AgentEvent::Done {
+    tx.send(super::SessionUiMessage::Event(AgentEvent::Done {
         frame_id,
         stop_reason: None,
         effective_max_iter: None,
-    })
+    }))
     .unwrap();
     drop(tx);
     handle.await.unwrap();
@@ -1108,10 +1726,10 @@ async fn ui_events_are_persisted_before_the_turn_ends() {
         rx,
         std::time::Duration::from_millis(5),
     ));
-    tx.send(AgentEvent::Text {
+    tx.send(super::SessionUiMessage::Event(AgentEvent::Text {
         frame_id: "f".into(),
         delta: "still running".into(),
-    })
+    }))
     .unwrap();
 
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -1332,6 +1950,55 @@ async fn at_mentioning_a_server_turns_it_on_for_the_session() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+#[tokio::test]
+async fn create_session_frame_snapshots_the_global_default() {
+    let base = std::env::temp_dir().join(format!("wisp_session_snap_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&base).unwrap();
+    let store = wisp_store::Store::open(&base.join("wisp.sqlite"))
+        .await
+        .unwrap();
+    store
+        .create_project("p", "P", &base.to_string_lossy())
+        .await
+        .unwrap();
+    store
+        .upsert_execution_context(&wisp_store::ExecutionContext::new("ssh:gpu", "GPU").unwrap())
+        .await
+        .unwrap();
+    store
+        .set_setting(super::ssh_hosts::DEFAULT_EXECUTION_CONTEXT_KEY, "ssh:gpu")
+        .await
+        .unwrap();
+
+    let id = super::create_session_frame(&store, "p").await.unwrap();
+    assert_eq!(
+        super::ssh_hosts::stored_session_default_execution_context(&store, &id).await,
+        super::ssh_hosts::SessionDefaultExecutionContext::Remote("ssh:gpu".into())
+    );
+    assert!(store
+        .session_execution_context_enabled(&id, "ssh:gpu")
+        .await
+        .unwrap());
+
+    store
+        .set_setting(super::ssh_hosts::DEFAULT_EXECUTION_CONTEXT_KEY, "")
+        .await
+        .unwrap();
+    let local = super::create_session_frame(&store, "p").await.unwrap();
+    assert_eq!(
+        super::ssh_hosts::stored_session_default_execution_context(&store, &local).await,
+        super::ssh_hosts::SessionDefaultExecutionContext::Local
+    );
+    assert_eq!(
+        super::ssh_hosts::resolved_session_execution_context_id(&store, &id)
+            .await
+            .as_deref(),
+        Some("ssh:gpu")
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn session_runtime_status_labels() {
     let mut running = HashSet::new();
@@ -1412,6 +2079,7 @@ fn transcript_page_reconstructs_legacy_prefix_before_persisted_events() {
         },
     ];
     let page = wisp_store::SessionTranscriptPage {
+        event_message_prefix_len: None,
         messages: vec![
             (1, wisp_llm::Message::user("legacy question")),
             (2, wisp_llm::Message::assistant("fallback answer")),
@@ -1439,6 +2107,7 @@ fn transcript_page_reconstructs_legacy_prefix_before_persisted_events() {
 #[test]
 fn persisted_ui_events_from_older_builds_keep_the_transcript() {
     let page = wisp_store::SessionTranscriptPage {
+        event_message_prefix_len: None,
         messages: vec![(1, wisp_llm::Message::user("hello"))],
         branch_merges: vec![],
         reviews: vec![],
@@ -1474,8 +2143,37 @@ fn persisted_ui_events_from_older_builds_keep_the_transcript() {
 }
 
 #[test]
+fn compacted_model_prefix_and_checkpoint_never_duplicate_visual_questions() {
+    let page = wisp_store::SessionTranscriptPage {
+        event_message_prefix_len: Some(0),
+        messages: vec![(3, wisp_llm::Message::user("question 41"))],
+        branch_merges: vec![],
+        reviews: vec![],
+        resources: vec![],
+        ui_events: vec![
+            r#"{"kind":"User","frame_id":"f","text":"question 2"}"#.into(),
+            r#"{"kind":"MessageBoundary","frame_id":"f","seq":4}"#.into(),
+        ],
+        next_before_seq: Some(3),
+        user_offset: 1,
+        latest_seq: 81,
+    };
+    let items = transcript_page_items(&page).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].text, "question 2");
+    let fallback = messages_to_items(&[
+        wisp_llm::Message::user("[context summary checkpoint] summary"),
+        wisp_llm::Message::user("[compacted; summary]"),
+        wisp_llm::Message::user("real question"),
+    ]);
+    assert_eq!(fallback.len(), 1);
+    assert_eq!(fallback[0].text, "real question");
+}
+
+#[test]
 fn branch_merge_projection_never_relabels_the_previous_answer() {
     let page = wisp_store::SessionTranscriptPage {
+        event_message_prefix_len: None,
         messages: vec![
             (1, wisp_llm::Message::user("question")),
             (2, wisp_llm::Message::assistant("original answer")),
@@ -1551,6 +2249,17 @@ fn scope_gates_per_tool_modes() {
     assert_eq!(full.mode_for("asker"), Approval::Allow);
     assert_eq!(full.mode_for("blocked"), Approval::Deny);
     assert!(full.full());
+}
+
+#[test]
+fn live_approvals_fall_back_to_the_process_default() {
+    let mut live = super::LiveApprovals::default();
+    live.default.scope = super::Scope::Ask;
+    let mut overlay = super::ApprovalPolicy::default();
+    overlay.scope = super::Scope::Full;
+    live.by_project.insert("proj-a".into(), overlay);
+    assert!(live.for_project("proj-a").full());
+    assert!(!live.for_project("proj-b").full());
 }
 
 #[test]
@@ -1735,7 +2444,7 @@ fn mcp_connection_serde_roundtrip() {
         transport: McpTransport::Stdio {
             command: "python".into(),
             args: vec!["s.py".into()],
-            env: vec![("K".into(), "V".into())],
+            env: vec![wisp_dto::McpSecretEntry::plaintext("K", "secret-value")],
             cwd: None,
         },
     };
@@ -1745,14 +2454,30 @@ fn mcp_connection_serde_roundtrip() {
         enabled: false,
         transport: McpTransport::Http {
             url: "https://x/mcp".into(),
-            headers: vec![("Authorization".into(), "Bearer t".into())],
+            headers: vec![wisp_dto::McpSecretEntry::plaintext(
+                "Authorization",
+                "secret-value",
+            )],
             auth: McpHttpAuth::OAuth,
         },
     };
     for c in [stdio, http] {
         let json = serde_json::to_string(&c).unwrap();
+        assert!(
+            !json.contains("secret-value"),
+            "stored MCP JSON must not contain secret values: {json}"
+        );
         let back: McpConnection = serde_json::from_str(&json).unwrap();
         assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+    let legacy = r#"{"id":"1","name":"local","enabled":true,"transport":{"kind":"stdio","command":"python","args":["s.py"],"env":[["K","secret-value"]]}}"#;
+    let migrated: McpConnection = serde_json::from_str(legacy).unwrap();
+    match &migrated.transport {
+        McpTransport::Stdio { env, .. } => {
+            assert_eq!(env[0].name, "K");
+            assert_eq!(env[0].value.as_deref(), Some("secret-value"));
+        }
+        _ => panic!("expected stdio"),
     }
     // tag shape
     let j = serde_json::to_value(&McpConnection {
@@ -1819,31 +2544,105 @@ fn specialist_section_marker_detects_prior_append() {
 }
 
 #[test]
-fn python_bootstrap_success_marks_initialization_complete() {
-    let mut status =
-        crate::app_commands::initial_bootstrap(std::path::Path::new("/tmp/workspace"), 3);
-    assert!(status.python_initializing);
-    assert!(!status.python_ok);
-
-    crate::app_commands::finish_python_bootstrap(&mut status, Ok(()));
-
-    assert!(!status.python_initializing);
-    assert!(status.python_ok);
+fn manual_environment_paths_validate_files_without_executing_them() {
+    let root =
+        std::env::temp_dir().join(format!("wisp-manual-validation-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let executable = root.join("custom python.exe");
+    std::fs::write(&executable, b"not an executable; must never be run").unwrap();
+    let paths = [
+        (
+            "python_executable".into(),
+            format!(" {} ", executable.display()),
+        ),
+        ("npm_executable".into(), String::new()),
+    ]
+    .into();
+    assert!(crate::app_commands::validate_local_environment_paths(&paths).is_ok());
+    for invalid in [&root, &root.join("missing.exe")] {
+        let paths = [(
+            "python_executable".into(),
+            invalid.to_string_lossy().into_owned(),
+        )]
+        .into();
+        assert!(
+            crate::app_commands::validate_local_environment_paths(&paths)
+                .unwrap_err()
+                .contains("file not found")
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
-fn python_bootstrap_failure_is_reported_after_initialization() {
-    let mut status =
-        crate::app_commands::initial_bootstrap(std::path::Path::new("/tmp/workspace"), 3);
-
-    crate::app_commands::finish_python_bootstrap(&mut status, Err("download failed".into()));
-
-    assert!(!status.python_initializing);
+fn missing_optional_environment_does_not_fail_startup() {
+    let root = std::env::temp_dir().join(format!("wisp-no-python-{}", uuid::Uuid::new_v4()));
+    let mut status = crate::app_commands::initial_bootstrap(&root, 3);
+    assert!(status.local_environment.is_none());
+    crate::app_commands::finish_environment_detection(&mut status, Default::default());
+    assert!(status.errors.is_empty());
+    assert!(status.local_environment.is_some());
     assert!(!status.python_ok);
-    assert!(status
-        .errors
-        .iter()
-        .any(|error| error == "Python environment: download failed"));
+    assert!(!root.exists());
+    let payload = serde_json::to_value(status).unwrap();
+    let ui: wisp_dto::BootstrapStatus = serde_json::from_value(payload).unwrap();
+    assert!(ui.local_environment.unwrap().paths.is_empty());
+}
+
+#[test]
+fn environment_detection_failure_is_advisory_and_paths_are_reported() {
+    let mut status = crate::app_commands::initial_bootstrap(std::path::Path::new("unused"), 3);
+    crate::app_commands::finish_environment_detection(
+        &mut status,
+        wisp_dto::LocalEnvironmentStatus {
+            paths: [
+                ("python_executable".into(), "/existing/python".into()),
+                ("rscript_executable".into(), "/existing/Rscript".into()),
+            ]
+            .into(),
+            warning: Some("Could not save detected paths".into()),
+        },
+    );
+    assert!(status.errors.is_empty());
+    assert!(status.python_ok);
+    assert!(!status.uv_ok);
+    assert!(status.local_environment.unwrap().warning.is_some());
+}
+
+#[test]
+fn environment_detection_reports_the_configured_interpreter_instead_of_another_install() {
+    let root = std::env::temp_dir().join(format!("wisp-path-report-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let configured = root.join("custom python");
+    std::fs::write(&configured, b"path-only fixture").unwrap();
+    let config = serde_json::json!({"python_path": configured});
+    let other = Some(root.join("other python"));
+    assert_eq!(
+        crate::app_commands::configured_or_detected_path(
+            &config,
+            "python_executable",
+            other.clone()
+        ),
+        Some(configured.clone())
+    );
+    std::fs::remove_file(&configured).unwrap();
+    assert_eq!(
+        crate::app_commands::configured_or_detected_path(
+            &config,
+            "python_executable",
+            other.clone()
+        ),
+        None
+    );
+    assert_eq!(
+        crate::app_commands::configured_or_detected_path(
+            &serde_json::json!({}),
+            "python_executable",
+            other.clone()
+        ),
+        other
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1878,6 +2677,7 @@ fn capability_skill_counts_use_enabled_bundled_vs_project_added_inventory() {
 fn macos_close_hides_only_main_window_when_not_quitting() {
     assert!(should_hide_app_on_macos_close("main", false));
     assert!(!should_hide_app_on_macos_close("proj-default", false));
+    assert!(!should_hide_app_on_macos_close("home-1", false));
     assert!(!should_hide_app_on_macos_close("main", true));
 }
 
@@ -1885,6 +2685,7 @@ fn macos_close_hides_only_main_window_when_not_quitting() {
 fn windows_close_to_tray_applies_only_to_the_main_window() {
     assert!(should_hide_workspace_on_close("main"));
     assert!(!should_hide_workspace_on_close("proj-default"));
+    assert!(!should_hide_workspace_on_close("home-1"));
     assert!(!should_hide_workspace_on_close("pet"));
 }
 
@@ -1909,6 +2710,38 @@ fn project_window_url_carries_the_target_session() {
         super::project_commands::project_window_url("abc", Some("s1")),
         "index.html?project=abc&session=s1"
     );
+    assert_eq!(super::project_commands::blank_window_url(), "index.html");
+}
+
+#[test]
+fn default_capability_grants_ipc_to_blank_windows() {
+    let spec: serde_json::Value =
+        serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+    assert!(
+        spec.get("windows").is_none(),
+        "window-scoped grants would leak to MCP child WebViews"
+    );
+    let windows: Vec<&str> = spec["webviews"]
+        .as_array()
+        .expect("default capability lists primary WebViews")
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    assert!(
+        windows.contains(&"home-*"),
+        "File → New Window labels home-* must be allowed to close themselves: {windows:?}"
+    );
+    assert!(windows.contains(&"main"));
+    assert!(windows.contains(&"proj-*"));
+    let permissions: Vec<&str> = spec["permissions"]
+        .as_array()
+        .expect("default capability lists permissions")
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    assert!(permissions.contains(&"core:window:allow-close"));
+    assert!(permissions.contains(&"core:window:allow-minimize"));
+    assert!(permissions.contains(&"core:window:allow-toggle-maximize"));
 }
 
 #[test]
@@ -2082,6 +2915,84 @@ fn foreign_project_notification_fallback_never_arms_focus_navigation() {
     );
 }
 
+#[test]
+fn session_surfaces_include_every_window_of_the_owning_project() {
+    let mut active_projects = HashMap::from([
+        ("main".to_string(), "workspace".to_string()),
+        ("proj-workspace".to_string(), "workspace".to_string()),
+        ("proj-other".to_string(), "other".to_string()),
+        ("pet".to_string(), "workspace".to_string()),
+    ]);
+    let active_frames = HashMap::from([
+        ("main".to_string(), "session-a".to_string()),
+        ("proj-workspace".to_string(), "session-b".to_string()),
+        ("proj-other".to_string(), "session-c".to_string()),
+    ]);
+
+    assert_eq!(
+        super::session_surface_window_labels(
+            Some("main"),
+            "session-a",
+            Some("workspace"),
+            &active_projects,
+            &active_frames,
+        ),
+        vec!["main".to_string(), "proj-workspace".to_string()],
+    );
+    // Window labels survive project switches. Routing, focusing and title
+    // updates must use the current binding even without a viewed session.
+    active_projects.insert("proj-workspace".into(), "other".into());
+    active_projects.insert("proj-other".into(), "workspace".into());
+    assert_eq!(
+        super::session_surface_window_labels(
+            None,
+            "",
+            Some("workspace"),
+            &active_projects,
+            &active_frames
+        ),
+        vec!["main".to_string(), "proj-other".to_string()],
+    );
+}
+
+#[test]
+fn session_surfaces_never_fall_back_onto_a_foreign_project() {
+    let active_projects = HashMap::from([("main".to_string(), "project-b".to_string())]);
+    let active_frames = HashMap::from([("main".to_string(), "session-b".to_string())]);
+
+    assert!(super::session_surface_window_labels(
+        Some("main"),
+        "session-a",
+        Some("project-a"),
+        &active_projects,
+        &active_frames,
+    )
+    .is_empty());
+}
+
+#[test]
+fn session_surfaces_without_project_id_only_hit_windows_viewing_the_session() {
+    let active_projects = HashMap::from([
+        ("main".to_string(), "workspace".to_string()),
+        ("proj-workspace".to_string(), "workspace".to_string()),
+    ]);
+    let active_frames = HashMap::from([
+        ("main".to_string(), "session-a".to_string()),
+        ("proj-workspace".to_string(), "session-b".to_string()),
+    ]);
+
+    assert_eq!(
+        super::session_surface_window_labels(
+            Some("proj-workspace"),
+            "session-b",
+            None,
+            &active_projects,
+            &active_frames,
+        ),
+        vec!["proj-workspace".to_string()],
+    );
+}
+
 // Queue (#433): the enqueue/driver protocol must (a) claim exactly one driver,
 // (b) drain FIFO, and (c) let a later enqueue re-claim after the queue empties —
 // otherwise an item enqueued just as the driver exits would strand with no runner.
@@ -2137,11 +3048,11 @@ fn unconsumed_cutin_returns_to_the_front_of_the_queue() {
         references: vec![],
     });
 
-    let (guidance_id, item) = begin_queued_cutin(&rt, 7).unwrap();
+    begin_queued_cutin(&rt, 7).unwrap();
     assert!(rt.queued.lock().unwrap().is_empty());
-    assert!(reclaim_unconsumed_cutin(&rt, guidance_id, item));
-    assert_eq!(rt.queued.lock().unwrap()[0].message, "close tabs");
+    assert_eq!(take_next_queued_turn(&rt).unwrap().message, "close tabs");
     assert!(rt.pending_guidance.lock().unwrap().is_empty());
+    assert!(take_next_queued_turn(&rt).is_none());
 }
 
 #[test]
@@ -2154,10 +3065,87 @@ fn consumed_cutin_is_not_queued_again() {
         references: vec![],
     });
 
-    let (guidance_id, item) = begin_queued_cutin(&rt, 8).unwrap();
+    begin_queued_cutin(&rt, 8).unwrap();
     rt.pending_guidance.lock().unwrap().clear();
-    assert!(!reclaim_unconsumed_cutin(&rt, guidance_id, item));
+    assert!(take_next_queued_turn(&rt).is_none());
     assert!(rt.queued.lock().unwrap().is_empty());
+    assert!(rt.queued_cutins.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn queued_cutin_precedes_the_fifo_driver_already_waiting_for_the_turn() {
+    let rt = Arc::new(SessionRuntime::new());
+    for id in [1, 2, 3] {
+        rt.queued.lock().unwrap().push(QueuedItem {
+            id,
+            message: format!("message {id}"),
+            attachments: vec![format!("file-{id}.png")],
+            references: vec![],
+        });
+    }
+    rt.draining.store(true, std::sync::atomic::Ordering::SeqCst);
+    let current = rt.workflow.clone().lock_owned().await;
+    let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+    let driver_rt = rt.clone();
+    let driver = tokio::spawn(async move {
+        let lock = driver_rt.workflow.clone().lock_owned();
+        tokio::pin!(lock);
+        // Poll the lock once so this driver is ahead of any later waiter.
+        assert!(futures_util::poll!(&mut lock).is_pending());
+        waiting_tx.send(()).unwrap();
+        let _guard = lock.await;
+        take_next_queued_turn(&driver_rt).unwrap()
+    });
+    waiting_rx.await.unwrap();
+    begin_queued_cutin(&rt, 3).unwrap();
+    drop(current);
+    let first = driver.await.unwrap();
+    assert_eq!(
+        first.id, 3,
+        "a pending cut-in must precede normal queued messages"
+    );
+    assert_eq!(first.attachments, ["file-3.png"]);
+    assert!(rt.pending_guidance.lock().unwrap().is_empty());
+    let _guard = rt.workflow.lock().await;
+    assert_eq!(take_next_queued_turn(&rt).unwrap().id, 1);
+    assert_eq!(take_next_queued_turn(&rt).unwrap().id, 2);
+    assert!(take_next_queued_turn(&rt).is_none());
+    assert!(!rt.draining.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[test]
+fn queued_cutin_handoff_preserves_arrival_order_and_does_not_steal_direct_guidance() {
+    let rt = SessionRuntime::new();
+    for id in [1, 2, 3] {
+        rt.queued.lock().unwrap().push(QueuedItem {
+            id,
+            message: format!("message {id}"),
+            attachments: vec![],
+            references: vec![],
+        });
+    }
+    let consumed = begin_queued_cutin(&rt, 2).unwrap();
+    assert!(
+        begin_queued_cutin(&rt, 2).is_none(),
+        "repeated clicks must not duplicate an offer"
+    );
+    rt.pending_guidance
+        .lock()
+        .unwrap()
+        .retain(|(id, _)| *id != consumed);
+    begin_queued_cutin(&rt, 3).unwrap();
+    begin_queued_cutin(&rt, 1).unwrap();
+    rt.pending_guidance
+        .lock()
+        .unwrap()
+        .push((999, "direct guide".into()));
+    assert_eq!(take_next_queued_turn(&rt).unwrap().id, 3);
+    assert_eq!(take_next_queued_turn(&rt).unwrap().id, 1);
+    assert!(take_next_queued_turn(&rt).is_none());
+    assert_eq!(
+        *rt.pending_guidance.lock().unwrap(),
+        [(999, "direct guide".into())]
+    );
 }
 
 // Reorder (#433): move swaps with the neighbour and clamps at both ends, so the
@@ -2192,6 +3180,27 @@ fn follow_up_questions_parse_exactly_three_distinct_options() {
         ["One?", "Two?", "Three?"]
     );
     assert!(parse_follow_up_questions("[\"Same?\", \"Same?\", \"Third?\"]").is_err());
+}
+
+#[test]
+fn follow_up_questions_preserve_analysis_scope_without_executing() {
+    let prompt = crate::FOLLOW_UP_SUGGESTION_PROMPT;
+    for rule in [
+        "clicking one only fills the composer",
+        "measurement roles",
+        "Never invent missing genes or cohorts",
+        "if enrichment is already complete",
+        "rank-sum enrichment",
+        "For other topics",
+    ] {
+        assert!(prompt.contains(rule), "missing suggestion rule: {rule}");
+    }
+    let suggestions = parse_follow_up_questions(
+        r#"["看看全局 ESR1 表达相关的依赖通路", "解释全局 ESR1 的主要依赖靶点", "选择一个癌种继续分析 ESR1"]"#,
+    )
+    .unwrap();
+    assert_eq!(suggestions.len(), 3);
+    assert!(suggestions.iter().all(|text| text.contains("ESR1")));
 }
 
 #[test]
@@ -2278,43 +3287,463 @@ fn navigation_guard_allows_only_app_origins() {
 }
 
 #[test]
-fn desktop_app_icon_is_full_bleed_with_an_inset_mark() {
+fn desktop_app_icon_preserves_the_three_wisp_design_across_platforms() {
     let svg = include_str!("../icons/app-icon.svg");
     let rounded = include_str!("../icons/app-icon-rounded.svg");
+    let macos = include_str!("../icons/app-icon-macos.svg");
+    let dark = include_str!("../icons/app-icon-dark.svg");
     let script = include_str!("../gen-icons.ps1");
+    let symbol = |source: &str| {
+        source[source.find("<g ").unwrap()..source.find("</g>").unwrap()].to_string()
+    };
+    for variant in [rounded, macos, dark] {
+        assert_eq!(symbol(svg), symbol(variant), "preserve the original arcs");
+    }
+    assert_eq!(svg.matches("<path ").count(), 3);
     assert!(
-        !svg.contains("<clipPath"),
-        "macOS master must be full-bleed; Dock applies the squircle mask"
+        svg.contains("translate(60.93466123858796 64) scale(1.04)"),
+        "preserve the standalone symbol's optical centering and proportions"
     );
-    assert!(
-        svg.contains("scale(0.60)"),
-        "keep the DNA mark inset so Dock/Launchpad does not fill the tile"
-    );
-    assert!(
-        rounded.contains("<clipPath") && rounded.contains("rx=\"58\""),
-        "Windows/Linux launchers draw the bitmap as-is and need baked rounding"
-    );
-    assert!(
-        rounded.contains("scale(0.60)"),
-        "rounded launcher icon must keep the same inset mark"
-    );
-    assert!(
-        script
+    assert!(!svg.contains("rx="), "store/mobile master stays square");
+    assert!(rounded.contains("rx=\"26\""));
+    assert!(macos.contains("rx=\"26\"") && macos.contains("viewBox=\"-16 -16 160 160\""));
+    for source in [svg, rounded, macos] {
+        assert!(source.contains("#0D9488") && source.contains("#FAF9F6"));
+    }
+    assert!(dark.contains("#2DA898") && dark.contains("#171614"));
+    for master in ["app-icon.svg", "app-icon-rounded.svg", "app-icon-macos.svg"] {
+        assert!(script
             .lines()
-            .any(|line| line.contains("Resolve-Path") && line.contains("icons/app-icon.svg")),
-        "icon generation must use the desktop master, not the in-app logo"
+            .any(|line| line.contains("Resolve-Path") && line.contains(master)));
+    }
+    assert!(script.contains("(Join-Path $macOut \"icon.icns\") \"icons/icon.icns\""));
+}
+
+#[test]
+fn desktop_app_icon_packaged_bitmaps_have_the_new_mark_and_platform_margins() {
+    // Inspect the shipped images, so replacing only the SVG while leaving old
+    // DNA bitmaps in the installer cannot pass this regression check.
+    let check_badge = |png: &[u8], size: u32, macos: bool| {
+        let bitmap = image::load_from_memory(png).unwrap().to_rgba8();
+        assert_eq!(bitmap.dimensions(), (size, size));
+        let off_white = image::Rgba([250, 249, 246, 255]);
+        let teal = image::Rgba([13, 148, 136, 255]);
+        assert_eq!(bitmap.get_pixel(0, 0)[3], 0, "transparent corners");
+        assert_eq!(*bitmap.get_pixel(size / 2, size / 2), off_white);
+        assert_eq!(
+            *bitmap.get_pixel(if macos { size * 3 / 4 } else { size * 4 / 5 }, size / 2),
+            teal,
+            "the outer wisp must remain visible"
+        );
+        assert_eq!(
+            bitmap.get_pixel(size / 2, size / 20)[3],
+            if macos { 0 } else { 255 },
+            "only the macOS ICNS has a transparent outer margin"
+        );
+    };
+    for (png, size) in [
+        (include_bytes!("../icons/32x32.png").as_slice(), 32),
+        (include_bytes!("../icons/64x64.png").as_slice(), 64),
+        (include_bytes!("../icons/128x128.png").as_slice(), 128),
+        (include_bytes!("../icons/128x128@2x.png").as_slice(), 256),
+        (include_bytes!("../icons/icon.png").as_slice(), 512),
+    ] {
+        check_badge(png, size, false);
+    }
+
+    // The ICO's 256px entry is PNG encoded; inspect it without a new decoder
+    // dependency. Smaller entries use the ICO bitmap format.
+    let ico = include_bytes!("../icons/icon.ico");
+    assert_eq!(&ico[..4], &[0, 0, 1, 0]);
+    let count = u16::from_le_bytes(ico[4..6].try_into().unwrap()) as usize;
+    let entry = ico[6..6 + 16 * count]
+        .chunks_exact(16)
+        .find(|entry| entry[0] == 0 && entry[1] == 0)
+        .expect("ICO must contain a 256px layer");
+    let length = u32::from_le_bytes(entry[8..12].try_into().unwrap()) as usize;
+    let offset = u32::from_le_bytes(entry[12..16].try_into().unwrap()) as usize;
+    check_badge(&ico[offset..offset + length], 256, false);
+
+    // ICNS chunks include PNG layers; check the largest Retina layer to catch
+    // accidentally packaging the full square or Windows variant on macOS.
+    let icns = include_bytes!("../icons/icon.icns");
+    assert_eq!(&icns[..4], b"icns");
+    let mut offset = 8;
+    let mut found_retina = false;
+    while offset < icns.len() {
+        let length = u32::from_be_bytes(icns[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        assert!(length >= 8 && offset + length <= icns.len());
+        if &icns[offset..offset + 4] == b"ic10" {
+            check_badge(&icns[offset + 8..offset + length], 1024, true);
+            found_retina = true;
+        }
+        offset += length;
+    }
+    assert!(found_retina, "ICNS must contain the 1024px Retina layer");
+}
+
+#[test]
+fn desktop_app_icon_native_catalog_matches_its_sources_and_bundle_config() {
+    use sha2::{Digest, Sha256};
+
+    // This portable check needs neither Xcode nor a live macOS desktop. The
+    // generation script verifies the compiled catalog with Apple's assetutil.
+    let provenance: serde_json::Value =
+        serde_json::from_str(include_str!("../icons/macos-icon-build.json")).unwrap();
+    for appearance in ["NSAppearanceNameAqua", "NSAppearanceNameDarkAqua"] {
+        assert!(provenance["appearances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == appearance));
+    }
+    for (path, expected) in provenance["sha256"].as_object().unwrap() {
+        let bytes = std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap();
+        assert_eq!(
+            hex::encode(Sha256::digest(bytes)),
+            expected.as_str().unwrap(),
+            "{path} changed; regenerate with python3 src-tauri/gen-icons-macos.py"
+        );
+    }
+    let macos: serde_json::Value =
+        serde_json::from_str(include_str!("../tauri.macos.conf.json")).unwrap();
+    assert_eq!(
+        macos["bundle"]["macOS"]["files"]["Resources/Assets.car"],
+        "icons/Assets.car"
+    );
+    assert!(include_str!("../Info.plist").contains("<string>Wisp</string>"));
+    let native: serde_json::Value =
+        serde_json::from_str(include_str!("../icons/Wisp.icon/icon.json")).unwrap();
+    let images = &native["groups"][0]["layers"][0]["image-name-specializations"];
+    assert_eq!(images[0]["value"], "wisp-light.svg");
+    assert_eq!(images[1]["appearance"], "dark");
+    assert_eq!(images[1]["value"], "wisp-dark.svg");
+}
+
+async fn open_temp_store(prefix: &str) -> (wisp_store::Store, PathBuf) {
+    let path = std::env::temp_dir().join(format!("{prefix}_{}.sqlite", uuid::Uuid::new_v4()));
+    let store = wisp_store::Store::open(&path).await.unwrap();
+    (store, path)
+}
+
+fn cleanup_temp_store(store: wisp_store::Store, path: PathBuf) {
+    drop(store);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+#[tokio::test]
+async fn project_approval_overlay_does_not_change_the_global_policy() {
+    let (store, path) = open_temp_store("wisp_approval_overlay").await;
+    super::save_json_setting(&store, "approval_scope", &"ask")
+        .await
+        .unwrap();
+    super::save_json_setting(
+        &store,
+        "tool_approvals",
+        &HashMap::<String, String>::from([("shell".into(), "ask".into())]),
+    )
+    .await
+    .unwrap();
+
+    let written = super::persist_approval_scope_overlay(&store, Ok("proj-a".into()), "full")
+        .await
+        .unwrap();
+    assert_eq!(written, "proj-a");
+    super::persist_tool_approval_overlay(
+        &store,
+        Ok("proj-a".into()),
+        "shell".into(),
+        "allow".into(),
+    )
+    .await
+    .unwrap();
+    super::persist_skip_connectors_overlay(&store, Ok("proj-a".into()), "mcp_bio".into(), true)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        super::load_approval_scope_for(&store, None).await.as_str(),
+        "ask"
+    );
+    assert_eq!(
+        super::load_approval_scope_for(&store, Some("proj-a"))
+            .await
+            .as_str(),
+        "full"
+    );
+    assert_eq!(
+        super::load_approval_scope_for(&store, Some("proj-b"))
+            .await
+            .as_str(),
+        "ask"
+    );
+    assert_eq!(
+        store.get_setting("approval_scope:proj-a").await.unwrap(),
+        Some(serde_json::to_string("full").unwrap())
+    );
+    assert_eq!(
+        super::load_tool_approvals_for(&store, None)
+            .await
+            .get("shell")
+            .map(String::as_str),
+        Some("ask")
+    );
+    assert_eq!(
+        super::load_tool_approvals_for(&store, Some("proj-a"))
+            .await
+            .get("shell"),
+        None
+    );
+    assert!(super::load_skip_connectors_for(&store, Some("proj-a"))
+        .await
+        .contains("mcp_bio"));
+    assert!(!super::load_skip_connectors_for(&store, Some("proj-b"))
+        .await
+        .contains("mcp_bio"));
+    cleanup_temp_store(store, path);
+}
+
+#[tokio::test]
+async fn unbound_window_approval_overlay_setters_do_not_write_global_keys() {
+    let (store, path) = open_temp_store("wisp_approval_unbound").await;
+    let unbound = Err(super::BLANK_WINDOW_NO_PROJECT.to_string());
+
+    let scope_err = super::persist_approval_scope_overlay(&store, unbound.clone(), "full")
+        .await
+        .unwrap_err();
+    let tool_err =
+        super::persist_tool_approval_overlay(&store, unbound.clone(), "shell".into(), "ask".into())
+            .await
+            .unwrap_err();
+    let skip_err = super::persist_skip_connectors_overlay(&store, unbound, "mcp_bio".into(), true)
+        .await
+        .unwrap_err();
+
+    assert_eq!(scope_err, super::BLANK_WINDOW_NO_PROJECT);
+    assert_eq!(tool_err, super::BLANK_WINDOW_NO_PROJECT);
+    assert_eq!(skip_err, super::BLANK_WINDOW_NO_PROJECT);
+    assert!(store.get_setting("approval_scope").await.unwrap().is_none());
+    assert!(store.get_setting("tool_approvals").await.unwrap().is_none());
+    assert!(store
+        .get_setting("skip_approval_connectors")
+        .await
+        .unwrap()
+        .is_none());
+
+    super::persist_approval_scope_overlay(&store, Ok("proj-a".into()), "full")
+        .await
+        .unwrap();
+    assert!(store.get_setting("approval_scope").await.unwrap().is_none());
+    assert!(store
+        .get_setting("approval_scope:proj-a")
+        .await
+        .unwrap()
+        .is_some());
+    cleanup_temp_store(store, path);
+}
+
+#[test]
+fn project_approval_overlay_clears_idle_agents_only_for_that_project() {
+    use std::sync::atomic::Ordering;
+
+    let owned_runtime = Arc::new(SessionRuntime::new());
+    let other_runtime = Arc::new(SessionRuntime::new());
+    let mut sessions = HashMap::new();
+    sessions.insert("sess-a".into(), owned_runtime.clone());
+    sessions.insert("sess-b".into(), other_runtime.clone());
+    let owned = HashSet::from(["sess-a".to_string()]);
+
+    super::invalidate_idle_agents_owned(&sessions, &owned);
+
+    assert_eq!(
+        owned_runtime.agent_config_generation.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        other_runtime.agent_config_generation.load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[test]
+fn native_connector_inventory_matches_dispatch_without_python_resources() {
+    let catalog = wisp_bio::catalog();
+    let map = super::build_tool_connector_map();
+    assert_eq!(map.len(), catalog.len());
+    for (domain, schema) in catalog {
+        assert_eq!(
+            map.get(&schema.function.name).map(String::as_str),
+            Some(domain)
+        );
+    }
+    let servers = super::list_mcp_servers(std::path::Path::new("nonexistent-wisp-project"));
+    assert!(servers.contains(&"mcp_pubmed".to_string()));
+    assert_eq!(servers.len(), super::bio_domains().len());
+}
+
+#[test]
+fn plugin_mcp_passthrough_allowlist_keeps_user_dirs_and_excludes_github_tokens() {
+    for key in [
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+    ] {
+        assert!(
+            super::PLUGIN_MCP_ENV_PASSTHROUGH.contains(&key),
+            "{key} must stay on the plugin MCP allowlist"
+        );
+    }
+    for key in ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN"] {
+        assert!(
+            !super::PLUGIN_MCP_ENV_PASSTHROUGH.contains(&key),
+            "{key} must not be copied into plugin MCP children"
+        );
+    }
+}
+
+#[test]
+fn plugin_mcp_passthrough_copies_user_dirs_without_github_tokens() {
+    let env = super::plugin_mcp_passthrough_env_from(|key| match key {
+        "USERPROFILE" => Some(OsString::from(r"C:\Users\wisp-plugin-test")),
+        "APPDATA" => Some(OsString::from(r"C:\Users\wisp-plugin-test\AppData\Roaming")),
+        "LOCALAPPDATA" => Some(OsString::from(r"C:\Users\wisp-plugin-test\AppData\Local")),
+        "HOMEDRIVE" => Some(OsString::from("C:")),
+        "HOMEPATH" => Some(OsString::from(r"\Users\wisp-plugin-test")),
+        "HOME" => Some(OsString::from("/home/wisp-plugin-test")),
+        "XDG_CONFIG_HOME" => Some(OsString::from("/home/wisp-plugin-test/.config")),
+        "GH_TOKEN" | "GITHUB_TOKEN" => Some(OsString::from("should-not-leak")),
+        _ => None,
+    });
+    let map = env
+        .into_iter()
+        .map(|(key, value)| (key.into_string().unwrap(), value.into_string().unwrap()))
+        .collect::<HashMap<_, _>>();
+    assert_eq!(map["USERPROFILE"], r"C:\Users\wisp-plugin-test");
+    assert_eq!(map["APPDATA"], r"C:\Users\wisp-plugin-test\AppData\Roaming");
+    assert_eq!(
+        map["LOCALAPPDATA"],
+        r"C:\Users\wisp-plugin-test\AppData\Local"
+    );
+    assert_eq!(map["HOME"], "/home/wisp-plugin-test");
+    assert_eq!(map["XDG_CONFIG_HOME"], "/home/wisp-plugin-test/.config");
+    assert!(!map.contains_key("GH_TOKEN"));
+    assert!(!map.contains_key("GITHUB_TOKEN"));
+    assert!(!map.values().any(|value| value.contains("should-not-leak")));
+}
+
+#[test]
+fn plugin_mcp_subprocess_sees_user_dirs_but_not_github_tokens() {
+    let pairs = super::plugin_mcp_passthrough_env_from(|key| match key {
+        "USERPROFILE" => Some(OsString::from(r"C:\Users\wisp-plugin-test")),
+        "APPDATA" => Some(OsString::from(r"C:\Users\wisp-plugin-test\AppData\Roaming")),
+        "LOCALAPPDATA" => Some(OsString::from(r"C:\Users\wisp-plugin-test\AppData\Local")),
+        "HOME" => Some(OsString::from("/home/wisp-plugin-test")),
+        "XDG_CONFIG_HOME" => Some(OsString::from("/home/wisp-plugin-test/.config")),
+        "GH_TOKEN" | "GITHUB_TOKEN" => Some(OsString::from("should-not-leak")),
+        "PATH" | "SYSTEMROOT" | "SYSTEMDRIVE" | "PATHEXT" | "COMSPEC" | "TEMP" | "TMP"
+        | "TMPDIR" | "LANG" | "LC_ALL" => std::env::var_os(key),
+        _ => None,
+    });
+
+    let mut command = std::process::Command::new("unused");
+    command.env("GH_TOKEN", "should-not-leak");
+    command.env("GITHUB_TOKEN", "should-not-leak");
+    command.env_clear();
+    command.envs(pairs.iter().cloned());
+    let assigned = command
+        .get_envs()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.map(|value| value.to_string_lossy().into_owned()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    assert_eq!(
+        assigned.get("APPDATA").and_then(Option::as_deref),
+        Some(r"C:\Users\wisp-plugin-test\AppData\Roaming")
+    );
+    assert_eq!(
+        assigned.get("USERPROFILE").and_then(Option::as_deref),
+        Some(r"C:\Users\wisp-plugin-test")
+    );
+    assert!(!assigned.contains_key("GH_TOKEN"));
+    assert!(!assigned.contains_key("GITHUB_TOKEN"));
+
+    let dump = dump_child_env(&pairs);
+    assert!(
+        dump.lines().any(|line| line
+            .eq_ignore_ascii_case(r"APPDATA=C:\Users\wisp-plugin-test\AppData\Roaming")
+            || line == r"APPDATA=C:\Users\wisp-plugin-test\AppData\Roaming"),
+        "child missing APPDATA: {dump}"
     );
     assert!(
-        script.lines().any(
-            |line| line.contains("Resolve-Path") && line.contains("icons/app-icon-rounded.svg")
-        ),
-        "Windows/Linux icons must come from the rounded master"
+        dump.lines().any(|line| line
+            .eq_ignore_ascii_case(r"USERPROFILE=C:\Users\wisp-plugin-test")
+            || line == r"USERPROFILE=C:\Users\wisp-plugin-test"),
+        "child missing USERPROFILE: {dump}"
     );
     assert!(
-        !script.lines().any(|line| {
-            let trimmed = line.trim_start();
-            !trimmed.starts_with('#') && line.contains("ui/logo.svg")
-        }),
-        "do not pass the in-app logo (canvas-filling badge) to cargo tauri icon"
+        !dump.contains("should-not-leak"),
+        "child leaked a GitHub token: {dump}"
     );
+    assert!(
+        !dump
+            .lines()
+            .any(|line| line.to_ascii_uppercase().starts_with("GH_TOKEN=")
+                || line.to_ascii_uppercase().starts_with("GITHUB_TOKEN=")),
+        "child inherited a GitHub token variable: {dump}"
+    );
+}
+
+fn dump_child_env(pairs: &[(OsString, OsString)]) -> String {
+    let mut command = if cfg!(windows) {
+        let comspec = std::env::var_os("COMSPEC")
+            .unwrap_or_else(|| OsString::from(r"C:\Windows\System32\cmd.exe"));
+        let mut command = std::process::Command::new(comspec);
+        command.args(["/C", "set"]);
+        command
+    } else {
+        std::process::Command::new("/usr/bin/env")
+    };
+    command.env_clear();
+    command.envs(pairs.iter().cloned());
+    let output = command.output().expect("spawn plugin MCP env dump");
+    assert!(
+        output.status.success(),
+        "env dump failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+#[tokio::test(start_paused = true)]
+async fn mcp_app_default_allows_calls_longer_than_old_limits() {
+    assert!(super::MCP_APP_TOOL_CALL_TIMEOUT.is_none());
+    let task = tokio::spawn(async {
+        let server = FakeAppServer {
+            connector_id: "figure-library".into(),
+            tool: "figure_preview_exact".into(),
+            delay: Some(std::time::Duration::from_secs(130)),
+        };
+        super::invoke_mcp_app_server_tool(
+            &server,
+            "figure_preview_exact",
+            &serde_json::json!({}),
+            super::MCP_APP_TOOL_CALL_TIMEOUT,
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(121)).await;
+    assert!(!task.is_finished());
+    tokio::time::advance(std::time::Duration::from_secs(10)).await;
+    assert!(task.await.unwrap().is_ok());
 }

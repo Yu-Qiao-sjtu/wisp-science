@@ -5,7 +5,7 @@ use super::*;
 #[tauri::command]
 pub(super) async fn new_session(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
 ) -> Result<String, String> {
     // Create a fresh frame and hand its id to the UI up front, so the UI can
     // route streamed events to the right transcript *before* the first delta
@@ -13,7 +13,7 @@ pub(super) async fn new_session(
     // running. Persisted history still ignores empty untitled frames; the UI
     // keeps the currently active draft visible until its first user turn is
     // stored, and an explicit rename makes the draft listable right away (#888).
-    let active = state.active(window.label());
+    let active = state.require_active(window.label())?;
     let ap = project_commands::load_active_project(&state, &active.id)
         .await?
         .0;
@@ -24,19 +24,26 @@ pub(super) async fn new_session(
     let id = create_session_frame(&state.store, &ap.id).await?;
     state.set_active(window.label(), ap);
     state.set_active_frame(window.label(), Some(id.clone()));
+    let store = state.store.clone();
+    let restored_frame = id.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Ok(Some(project)) = store.frame_project_id(&restored_frame).await {
+            crate::mcp_connections::restore(&store, &project, &restored_frame).await;
+        }
+    });
     Ok(id)
 }
 
 #[tauri::command]
 pub(super) async fn branch_session(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     session_id: Option<String>,
     title: Option<String>,
     user_index: Option<usize>,
     checkpoint_kind: Option<String>,
 ) -> Result<String, String> {
-    let active = state.active(window.label());
+    let active = state.require_active(window.label())?;
     let ap = project_commands::load_active_project(&state, &active.id)
         .await?
         .0;
@@ -74,18 +81,26 @@ pub(super) async fn branch_session(
     // as any other non-source mainline conversation during an active round.
     let id = create_session_frame(&state.store, &ap.id).await?;
     if let Some(source) = session_id.as_deref().filter(|s| !s.is_empty()) {
-        let msgs = state
-            .store
-            .load_messages(source)
-            .await
-            .map_err(|e| format!("{e}"))?;
+        // A branch is a continuation of the source conversation's identity.
+        // Prefer that frozen Specialist over a newer project default.
+        if let Some(specialist_id) = specialists::frame_specialist_id(&state.store, source).await {
+            specialists::set_frame_specialist(&state.store, &id, &specialist_id).await?;
+        }
         let checkpoint_kind = checkpoint_kind.as_deref().unwrap_or("after_response");
-        let checkpoint_user_index = user_index.unwrap_or_else(|| {
-            msgs.iter()
-                .filter(|message| message.role == wisp_llm::Role::User)
-                .count()
-                .saturating_sub(1)
-        });
+        if !matches!(checkpoint_kind, "before_user" | "after_response") {
+            return Err("Invalid conversation branch checkpoint kind.".into());
+        }
+        let checkpoint_user_index = match user_index {
+            Some(index) => index,
+            None => last_user_index(&state.store, source).await?,
+        };
+        let (epoch, keep_seq) = resolve_visual_keep(
+            &state.store,
+            source,
+            checkpoint_user_index,
+            checkpoint_kind == "after_response",
+        )
+        .await?;
         state
             .store
             .set_session_branch_point(&id, source, checkpoint_user_index, checkpoint_kind)
@@ -107,12 +122,23 @@ pub(super) async fn branch_session(
             .set_frame_reasoning_effort(&id, &ap.id, reasoning_effort.as_deref())
             .await
             .map_err(|error| error.to_string())?;
-        let keep = match checkpoint_kind {
-            "before_user" => user_message_start(&msgs, checkpoint_user_index),
-            "after_response" => user_message_start(&msgs, checkpoint_user_index.saturating_add(1)),
-            _ => return Err("Invalid conversation branch checkpoint kind.".into()),
-        };
-        for (idx, msg) in msgs.iter().take(keep).enumerate() {
+        let service_tier = state
+            .store
+            .frame_service_tier(source)
+            .await
+            .map_err(|error| error.to_string())?;
+        state
+            .store
+            .set_frame_service_tier(&id, &ap.id, service_tier.as_deref())
+            .await
+            .map_err(|error| error.to_string())?;
+        ssh_hosts::copy_session_default_execution_context(&state.store, source, &id).await?;
+        let msgs = state
+            .store
+            .load_messages_in_epoch(source, epoch)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        for (idx, (_, msg)) in msgs.iter().filter(|(seq, _)| *seq <= keep_seq).enumerate() {
             state
                 .store
                 .append_message(&id, idx as i64 + 1, msg)
@@ -131,10 +157,10 @@ pub(super) async fn branch_session(
 #[tauri::command]
 pub(super) async fn preview_session_branch_merge(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     id: String,
 ) -> Result<wisp_store::SessionBranchMergePreview, String> {
-    let project = state.active(window.label());
+    let project = state.require_active(window.label())?;
     state
         .store
         .preview_session_branch_merge(&id, &project.id)
@@ -186,16 +212,26 @@ fn branch_summary_payload(
     }
 }
 
+/// Profile budget or the summary floor, whichever is larger, capped at what
+/// the model accepts.
+fn branch_summary_output_budget(profile_max: u64, catalog_max: Option<u64>) -> u64 {
+    let desired = profile_max.max(BRANCH_SUMMARY_OUTPUT_TOKENS);
+    match catalog_max {
+        Some(cap) => desired.min(cap).max(16),
+        None => desired,
+    }
+}
+
 #[tauri::command]
 pub(super) async fn summarize_session_branch_merge(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     id: String,
     expected_guard_hash: String,
     current_version: Option<String>,
     user_guidance: Option<String>,
 ) -> Result<String, String> {
-    let project = state.active(window.label());
+    let project = state.require_active(window.label())?;
     let preview = state
         .store
         .preview_session_branch_merge(&id, &project.id)
@@ -215,15 +251,35 @@ pub(super) async fn summarize_session_branch_merge(
         current_version.as_deref(),
         user_guidance.as_deref(),
     )?;
-    let (provider, api_url, model, api_key, _, reasoning_effort) =
-        load_session_settings(&state.store, &id).await;
+    let (
+        provider,
+        api_url,
+        model,
+        api_key,
+        profile_max_tokens,
+        reasoning_effort,
+        service_tier,
+        user_agent,
+        send_user_agent,
+        send_session_id,
+        session_header_name,
+    ) = load_session_settings(&state.store, &id).await;
     let config = build_provider_config(
         &provider,
         &api_url,
         &api_key,
         &model,
-        BRANCH_SUMMARY_OUTPUT_TOKENS,
+        branch_summary_output_budget(
+            profile_max_tokens,
+            crate::model_catalog::output_tokens(&provider, &api_url, &model),
+        ),
         &reasoning_effort,
+        &service_tier,
+        &user_agent,
+        send_user_agent,
+        send_session_id,
+        &session_header_name,
+        Some(&id),
     )?;
     let completion = tokio::time::timeout(
         BRANCH_SUMMARY_TIMEOUT,
@@ -233,7 +289,12 @@ pub(super) async fn summarize_session_branch_merge(
         ),
     )
     .await
-    .map_err(|_| "Branch summary model timed out after 120 seconds.".to_string())?
+    .map_err(|_| {
+        format!(
+            "Branch summary model timed out after {} seconds.",
+            BRANCH_SUMMARY_TIMEOUT.as_secs()
+        )
+    })?
     .map_err(|error| format!("Branch summary model failed: {error}"))?;
     let summary = completion.content.trim();
     if summary.is_empty() {
@@ -245,12 +306,12 @@ pub(super) async fn summarize_session_branch_merge(
 #[tauri::command]
 pub(super) async fn merge_session_branch_summary(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     id: String,
     expected_guard_hash: String,
     summary: String,
 ) -> Result<wisp_store::SessionBranchMerge, String> {
-    let project = state.active(window.label());
+    let project = state.require_active(window.label())?;
     let _project_activity = state.begin_project_activity(&project.id)?;
     exploration_commands::require_writable_scope(
         &state.store,
@@ -264,7 +325,21 @@ pub(super) async fn merge_session_branch_summary(
         .map_err(|error| error.to_string())?;
     let ids = [preview.main_session_id.clone(), id.clone()];
     if session_branch_is_busy(&state, &ids).await {
-        return Err("Wait for the branch and main conversation to finish before merging.".into());
+        return Err(BRANCH_MERGE_BUSY.into());
+    }
+
+    // A finishing turn drops `running_turns` before persist/compaction, but
+    // still holds `rt.workflow`. Collect existing runtimes (never insert) and
+    // wait for those locks so merge cannot detach a frame the old Arc still
+    // owns — that would let a new turn `or_insert_with` a second runtime.
+    let runtimes = {
+        let sessions = state.sessions.lock().await;
+        wisp_core::session_locks::existing_in_lock_order(&sessions, &ids)
+    };
+    let (_workflow_locks, mut agent_guards) = lock_session_branch_merge_runtimes(&runtimes).await;
+
+    if session_branch_is_busy(&state, &ids).await {
+        return Err(BRANCH_MERGE_BUSY.into());
     }
     if state
         .store
@@ -280,38 +355,72 @@ pub(super) async fn merge_session_branch_summary(
         .merge_session_branch_summary(&id, &project.id, &expected_guard_hash, &summary)
         .await
         .map_err(|error| error.to_string())?;
-    state.sessions.lock().await.remove(&merged.main_session_id);
+    // Main history changed. Drop the cached agent but keep the Arc so a turn
+    // that already cloned it cannot `or_insert_with` a second runtime.
+    for ((session_id, runtime), agent) in runtimes.iter().zip(agent_guards.iter_mut()) {
+        if session_id == &merged.main_session_id {
+            agent.take();
+            let generation = runtime
+                .agent_config_generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .saturating_add(1);
+            runtime
+                .cached_agent_generation
+                .store(generation, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
     state.set_active_frame(window.label(), Some(merged.main_session_id.clone()));
     Ok(merged)
 }
 
-const BRANCH_SUMMARY_OUTPUT_TOKENS: u64 = 4_096;
-const BRANCH_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Floor, not a cap: a branch summary inherits the session's reasoning effort,
+/// so the chain of thought spends this budget before any Markdown is written.
+/// The profile's own Max output tokens wins when it is larger, and the model's
+/// catalog ceiling caps both — that is what the "raise Max output tokens"
+/// error advice acts on.
+const BRANCH_SUMMARY_OUTPUT_TOKENS: u64 = 16_384;
+const BRANCH_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+const BRANCH_MERGE_BUSY: &str =
+    "Wait for the branch and main conversation to finish before merging.";
 
-fn session_branch_is_waiting(state: &AppState, ids: &[String]) -> bool {
-    let awaiting = state.awaiting_confirm.lock().unwrap();
-    let reviewing = state.reviewing.lock().unwrap();
-    ids.iter()
-        .any(|id| awaiting.contains(id) || reviewing.contains(id))
+/// Workflow then agent, in the already-sorted runtime list (lexicographic ids).
+/// Matches transfer/delete lock order per session; missing runtimes were skipped.
+async fn lock_session_branch_merge_runtimes(
+    runtimes: &[(String, Arc<SessionRuntime>)],
+) -> (
+    Vec<tokio::sync::OwnedMutexGuard<()>>,
+    Vec<tokio::sync::MutexGuard<'_, Option<Agent>>>,
+) {
+    let ids: Vec<String> = runtimes.iter().map(|(id, _)| id.clone()).collect();
+    let workflows = runtimes
+        .iter()
+        .map(|(id, rt)| (id.clone(), rt.workflow.clone()))
+        .collect();
+    let workflow = wisp_core::session_locks::lock_existing_in_order(&workflows, &ids).await;
+    let mut agent = Vec::with_capacity(runtimes.len());
+    for (_, rt) in runtimes {
+        agent.push(rt.agent.lock().await);
+    }
+    (workflow, agent)
 }
 
 async fn session_branch_is_busy(state: &AppState, ids: &[String]) -> bool {
-    state
-        .running_turns
-        .lock()
-        .await
-        .iter()
-        .any(|running| ids.contains(running))
-        || session_branch_is_waiting(state, ids)
+    let running = state.running_turns.lock().await.clone();
+    wisp_core::session_locks::session_targets_busy(
+        &running,
+        &state.awaiting_confirm.lock().unwrap(),
+        &state.reviewing.lock().unwrap(),
+        ids,
+    )
 }
 
 #[tauri::command]
 pub(super) async fn list_sessions_page(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     cursor: Option<SessionCursor>,
 ) -> Result<SessionPage, String> {
-    let ap = state.active(window.label());
+    let ap = state.require_active(window.label())?;
     let mut rows = state
         .store
         .list_sessions_page(
@@ -434,10 +543,10 @@ async fn stale_prompt_frames(
 #[tauri::command]
 pub(super) async fn reload_project_rules(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     frame_id: String,
 ) -> Result<bool, String> {
-    let ap = state.active(window.label());
+    let ap = state.require_active(window.label())?;
     let owner = state
         .store
         .frame_project_id(&frame_id)
@@ -491,9 +600,9 @@ pub(super) async fn reload_project_rules(
 #[tauri::command]
 pub(super) async fn list_folders(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
 ) -> Result<Vec<FolderInfo>, String> {
-    let ap = state.active(window.label());
+    let ap = state.require_active(window.label())?;
     let rows = state
         .store
         .list_folders(&ap.id)
@@ -508,10 +617,10 @@ pub(super) async fn list_folders(
 #[tauri::command]
 pub(super) async fn create_folder(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     name: String,
 ) -> Result<FolderInfo, String> {
-    let ap = state.active(window.label());
+    let ap = state.require_active(window.label())?;
     let _project_activity = state.begin_project_activity(&ap.id)?;
     let id = Uuid::new_v4().to_string();
     state
@@ -528,11 +637,11 @@ pub(super) async fn create_folder(
 #[tauri::command]
 pub(super) async fn rename_folder(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     id: String,
     name: String,
 ) -> Result<(), String> {
-    let ap = state.active(window.label());
+    let ap = state.require_active(window.label())?;
     let _project_activity = state.begin_project_activity(&ap.id)?;
     state
         .store
@@ -545,10 +654,10 @@ pub(super) async fn rename_folder(
 #[tauri::command]
 pub(super) async fn delete_folder(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     id: String,
 ) -> Result<(), String> {
-    let ap = state.active(window.label());
+    let ap = state.require_active(window.label())?;
     let _project_activity = state.begin_project_activity(&ap.id)?;
     state
         .store
@@ -561,11 +670,11 @@ pub(super) async fn delete_folder(
 #[tauri::command]
 pub(super) async fn move_session(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     id: String,
     folder_id: Option<String>,
 ) -> Result<(), String> {
-    let ap = state.active(window.label());
+    let ap = state.require_active(window.label())?;
     let _project_activity = state.begin_project_activity(&ap.id)?;
     state
         .store
@@ -578,12 +687,12 @@ pub(super) async fn move_session(
 #[tauri::command]
 pub(super) async fn transfer_session_to_project(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     id: String,
     target_project_id: String,
     mode: String,
 ) -> Result<String, String> {
-    let source = state.active(window.label());
+    let source = state.require_active(window.label())?;
     if target_project_id == source.id {
         return Err("Source and target projects must be different.".into());
     }
@@ -622,6 +731,13 @@ pub(super) async fn transfer_session_to_project(
         "move" => true,
         _ => return Err("Transfer mode must be 'copy' or 'move'.".into()),
     };
+    if remove_source {
+        state
+            .store
+            .require_unarchived_session(&id)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
 
     let session_is_busy = || {
         state.awaiting_confirm.lock().unwrap().contains(&id)
@@ -687,10 +803,15 @@ pub(super) async fn transfer_session_to_project(
 #[tauri::command]
 pub(super) async fn delete_session(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     id: String,
 ) -> Result<(), String> {
-    let ap = state.active(window.label());
+    state
+        .store
+        .require_unarchived_session(&id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let ap = state.require_active(window.label())?;
     let _project_activity = state.begin_project_activity(&ap.id)?;
     let owner = state
         .store
@@ -729,6 +850,9 @@ pub(super) async fn delete_session(
         rt.cancel.store(true, Ordering::Relaxed);
     }
     acp::cancel_frame(&state, &id).await;
+    // Revoke Host ownership before waiting for a turn that may be connecting.
+    // This also fences background restore/wiring snapshots for this frame.
+    mcp_connections::host().retire_frame(&id).await;
     // Match send/Plan lock order. The tombstone prevents work already queued
     // behind these guards from restarting after the DB cascade.
     let _workflow_guard = match runtime.as_ref() {
@@ -766,11 +890,11 @@ pub(super) async fn delete_session(
 #[tauri::command]
 pub(super) async fn rename_session(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     id: String,
     title: String,
 ) -> Result<(), String> {
-    let ap = state.active(window.label());
+    let ap = state.require_active(window.label())?;
     let _project_activity = state.begin_project_activity(&ap.id)?;
     state
         .store
@@ -783,11 +907,11 @@ pub(super) async fn rename_session(
 #[tauri::command]
 pub(super) async fn set_session_pinned(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     id: String,
     pinned: bool,
 ) -> Result<(), String> {
-    let ap = state.active(window.label());
+    let ap = state.require_active(window.label())?;
     let _project_activity = state.begin_project_activity(&ap.id)?;
     state
         .store
@@ -807,14 +931,27 @@ pub(super) const RECENT_SESSIONS_LIMIT: i64 = 5;
 #[tauri::command]
 pub(super) async fn latest_used_session(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
 ) -> Result<Option<String>, String> {
-    let ap = state.active(window.label());
-    state
+    let ap = state.require_active(window.label())?;
+    let Some(id) = state
         .store
         .latest_used_session_id(&ap.id)
         .await
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| format!("{e}"))?
+    else {
+        return Ok(None);
+    };
+    let _ = crate::models::session_profile_id(&state.store, &id).await;
+    if let Err(error) = state.store.load_messages(&id).await {
+        tracing::warn!(
+            session_id = %id,
+            %error,
+            "skipping last-session resume because the transcript could not be loaded"
+        );
+        return Ok(None);
+    }
+    Ok(Some(id))
 }
 
 #[tauri::command]
@@ -856,7 +993,7 @@ pub(super) async fn list_recent_sessions(
 #[tauri::command]
 pub(super) async fn rewind_session(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     session_id: Option<String>,
     user_index: usize,
 ) -> Result<(), String> {
@@ -873,6 +1010,11 @@ pub(super) async fn rewind_session(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "Session project was not found.".to_string())?;
     let _project_activity = state.begin_project_activity(&project_id)?;
+    state
+        .store
+        .require_unarchived_session(&frame_id)
+        .await
+        .map_err(|e| e.to_string())?;
     if matches!(
         state
             .store
@@ -899,42 +1041,207 @@ pub(super) async fn rewind_session(
     {
         return Err("ACP sessions cannot be rewound in protocol v1.".into());
     }
-    let rt = state.sessions.lock().await.get(&frame_id).cloned();
-    let keep = if let Some(rt) = rt {
-        let mut guard = rt.agent.lock().await;
-        if let Some(agent) = guard.as_mut() {
-            let k = user_message_start(&agent.ctx.messages, user_index);
-            agent.ctx.messages.truncate(k);
-            k
-        } else {
-            user_index_to_keep_after_db(&state.store, &frame_id, user_index).await?
-        }
-    } else {
-        user_index_to_keep_after_db(&state.store, &frame_id, user_index).await?
-    };
+    let (epoch, keep_seq) = resolve_visual_keep(&state.store, &frame_id, user_index, false).await?;
     state
         .store
-        .truncate_messages(&frame_id, keep as i64)
+        .rewind_to_seq(&frame_id, epoch, keep_seq)
         .await
         .map_err(|e| format!("{e}"))?;
-    if let Some(rt) = state.sessions.lock().await.get(&frame_id) {
-        rt.set_last_seq(keep as i64);
+    if let Some(rt) = state.sessions.lock().await.get(&frame_id).cloned() {
+        *rt.agent.lock().await = None;
+        rt.sync_last_seq_from_store(&state.store, &frame_id).await?;
     }
     Ok(())
 }
 
-/// Compute the `keep` index purely from persisted messages when no in-memory
-/// agent exists for the session yet.
-pub(super) async fn user_index_to_keep_after_db(
+/// Roll back the latest context epoch when the user has not continued after
+/// compact. The compaction card stays in the transcript and is marked undone.
+#[tauri::command]
+pub(super) async fn undo_compaction(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    window: crate::workspace_surface::WorkspaceSurface,
+    session_id: Option<String>,
+) -> Result<u64, String> {
+    let frame_id = match session_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(id) => id.to_string(),
+        None => state
+            .active_frame(window.label())
+            .ok_or_else(|| "No active session to undo compaction.".to_string())?,
+    };
+    let project_id = state
+        .store
+        .frame_project_id(&frame_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Session project was not found.".to_string())?;
+    let _project_activity = state.begin_project_activity(&project_id)?;
+    state
+        .store
+        .require_unarchived_session(&frame_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if matches!(
+        state
+            .store
+            .session_branch_state(&frame_id)
+            .await
+            .map_err(|error| error.to_string())?,
+        Some("merged" | "orphaned")
+    ) {
+        return Err("Frozen conversation branches cannot undo compaction.".into());
+    }
+    let scope = state
+        .store
+        .frame_state_scope(&frame_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Session state scope was not found.".to_string())?;
+    exploration_commands::require_writable_scope(&state.store, &scope).await?;
+    if state
+        .store
+        .get_acp_session(&frame_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Err("ACP sessions cannot undo compaction.".into());
+    }
+    if state.running_turns.lock().await.contains(&frame_id) {
+        return Err("Stop the running turn before undoing compaction.".into());
+    }
+    let epoch = state
+        .store
+        .undo_context_epoch(&frame_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Some(rt) = state.sessions.lock().await.get(&frame_id).cloned() {
+        *rt.agent.lock().await = None;
+        rt.sync_last_seq_from_store(&state.store, &frame_id).await?;
+    }
+    persist_and_emit_app_context_update(
+        &state,
+        &app,
+        &frame_id,
+        Some(&project_id),
+        AgentEvent::CompactionUndone {
+            frame_id: frame_id.clone(),
+            epoch: u64::try_from(epoch).unwrap_or(0),
+        },
+    )
+    .await;
+    Ok(u64::try_from(epoch).unwrap_or(0))
+}
+
+async fn last_user_index(store: &Store, frame_id: &str) -> Result<usize, String> {
+    let visual = store
+        .visual_user_count(frame_id)
+        .await
+        .map_err(|e| format!("{e}"))?;
+    if visual > 0 {
+        return Ok(visual - 1);
+    }
+    let rows = store
+        .load_messages_in_epoch(frame_id, 0)
+        .await
+        .map_err(|e| format!("{e}"))?;
+    Ok(rows
+        .iter()
+        .filter(|(_, message)| {
+            message.role == wisp_llm::Role::User
+                && message.tool_name.as_deref() != Some(wisp_store::AGENT_WORKFLOW_COMPLETION_TOOL)
+                && !message.content.as_text().trim().is_empty()
+                && !wisp_store::is_compaction_checkpoint(&message.content.as_text())
+        })
+        .count()
+        .saturating_sub(1))
+}
+
+/// Map a visual user turn to `(epoch, keep_seq)`.
+/// `after_response` keeps that turn's reply; otherwise the cut is just before it.
+/// Legacy sessions without User events fall back to epoch-0 row indexes.
+pub(super) async fn resolve_visual_keep(
     store: &Store,
     frame_id: &str,
     user_index: usize,
-) -> Result<usize, String> {
-    let msgs = store
-        .load_messages(frame_id)
+    after_response: bool,
+) -> Result<(i64, i64), String> {
+    if after_response {
+        if let Some(next) = store
+            .visual_turn_anchor(frame_id, user_index.saturating_add(1))
+            .await
+            .map_err(|e| format!("{e}"))?
+        {
+            let epoch = store
+                .resolve_message_epoch(frame_id, next.saturating_sub(1).max(1))
+                .await
+                .map_err(|e| format!("{e}"))?
+                .unwrap_or(0);
+            return Ok((epoch, next - 1));
+        }
+        if let Some(anchor) = store
+            .visual_turn_anchor(frame_id, user_index)
+            .await
+            .map_err(|e| format!("{e}"))?
+        {
+            let epoch = store
+                .resolve_message_epoch(frame_id, anchor)
+                .await
+                .map_err(|e| format!("{e}"))?
+                .unwrap_or(0);
+            let keep_seq = store
+                .load_messages_in_epoch(frame_id, epoch)
+                .await
+                .map_err(|e| format!("{e}"))?
+                .last()
+                .map(|(seq, _)| *seq)
+                .unwrap_or(anchor);
+            return Ok((epoch, keep_seq));
+        }
+    } else if let Some(anchor) = store
+        .visual_turn_anchor(frame_id, user_index)
+        .await
+        .map_err(|e| format!("{e}"))?
+    {
+        let keep_seq = anchor - 1;
+        let epoch = if keep_seq <= 0 {
+            0
+        } else {
+            store
+                .resolve_message_epoch(frame_id, keep_seq)
+                .await
+                .map_err(|e| format!("{e}"))?
+                .unwrap_or(0)
+        };
+        return Ok((epoch, keep_seq));
+    }
+    let rows = store
+        .load_messages_in_epoch(frame_id, 0)
         .await
         .map_err(|e| format!("{e}"))?;
-    Ok(user_message_start(&msgs, user_index))
+    let msgs = rows
+        .iter()
+        .map(|(_, message)| message.clone())
+        .collect::<Vec<_>>();
+    let keep = if after_response {
+        user_message_start(&msgs, user_index.saturating_add(1))
+    } else {
+        user_message_start(&msgs, user_index)
+    };
+    Ok((0, head_keep_seq(&rows, keep)))
+}
+
+/// Durable seq below which the first `keep` head-epoch rows are retained.
+/// Keeping zero rows lands just below the head epoch's first row so frozen
+/// epochs (all lower seqs) survive; keeping more than exist keeps everything.
+pub(super) fn head_keep_seq(rows: &[(i64, wisp_llm::Message)], keep: usize) -> i64 {
+    match keep {
+        0 => rows.first().map_or(0, |(seq, _)| seq - 1),
+        _ => rows
+            .get(keep - 1)
+            .or(rows.last())
+            .map_or(0, |(seq, _)| *seq),
+    }
 }
 
 /// The frame's ACP `ask_user` rows, appended after the transcript (a pending
@@ -1019,17 +1326,22 @@ pub(super) fn transcript_page_items(
         })
         .collect();
     let (mut items, boundaries) = if events.is_empty() {
-        (messages_to_items(&msgs), HashMap::new())
+        (
+            messages_to_items(&msgs[..page.event_message_prefix_len.unwrap_or(msgs.len())]),
+            HashMap::new(),
+        )
     } else {
         let first_seq = events.iter().find_map(|event| match event {
             AgentEvent::MessageBoundary { seq, .. } => Some(*seq),
             _ => None,
         });
-        let prefix_len = first_seq.map_or(msgs.len(), |first_seq| {
-            page.messages
-                .iter()
-                .take_while(|(seq, _)| *seq < first_seq)
-                .count()
+        let prefix_len = page.event_message_prefix_len.unwrap_or_else(|| {
+            first_seq.map_or(msgs.len(), |first_seq| {
+                page.messages
+                    .iter()
+                    .take_while(|(seq, _)| *seq < first_seq)
+                    .count()
+            })
         });
         let mut prefix = messages_to_items(&msgs[..prefix_len]);
         let prefix_items = prefix.len();
@@ -1158,17 +1470,15 @@ pub(super) fn transcript_page_items(
 #[tauri::command]
 pub(super) async fn load_session(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     id: String,
     before_seq: Option<i64>,
 ) -> Result<SessionTranscriptPage, String> {
-    let page = state
-        .store
-        .load_session_transcript_page(&id, before_seq, SESSION_TRANSCRIPT_PAGE_TURNS)
-        .await
-        .map_err(|e| format!("{e}"))?;
+    let runtime = state.sessions.lock().await.get(&id).cloned();
+    let page =
+        read_session_transcript_page(&state.store, runtime.as_deref(), &id, before_seq).await?;
     let presentations = if before_seq.is_none() {
-        state
+        let mut presentations = state
             .store
             .load_latest_session_ui_event(&id, "ToolPresentation")
             .await
@@ -1188,28 +1498,28 @@ pub(super) async fn load_session(
                 _ => None,
             })
             .into_iter()
-            .collect()
+            .collect::<Vec<_>>();
+        for presentation in &mut presentations {
+            if presentation.presentation_kind == "mcp_app" {
+                restore_mcp_app_snapshot(
+                    &state.store,
+                    &id,
+                    &presentation.presentation_id,
+                    &mut presentation.payload,
+                )
+                .await;
+            }
+        }
+        presentations
     } else {
         Vec::new()
     };
     let outline = if before_seq.is_none() {
         state
             .store
-            .load_session_user_messages(&id)
+            .load_session_outline(&id)
             .await
-            .map_err(|e| format!("{e}"))?
-            .into_iter()
-            .enumerate()
-            .map(
-                |(user_index, (seq, text, sent_at, response_at))| SessionOutlineItem {
-                    user_index,
-                    seq,
-                    text,
-                    sent_at,
-                    response_at,
-                },
-            )
-            .collect()
+            .map_err(|e| e.to_string())?
     } else {
         Vec::new()
     };
@@ -1243,15 +1553,22 @@ pub(super) async fn load_session(
         state.set_active(window.label(), project);
         state.set_active_frame(window.label(), Some(id.clone()));
         let _ = state.store.mark_frame_seen(&id).await;
-        if let Some(rt) = state.sessions.lock().await.get(&id).cloned() {
-            rt.set_last_seq(page.latest_seq);
-        }
     }
     let mut items = transcript_page_items(&page)?;
     if before_seq.is_none() {
         items.extend(ask_user_items(&state, &id).await);
     }
+    let (context_epochs, head_epoch) =
+        load_context_epoch_page(&state.store, &id, &mut items).await?;
+    let in_context_from_user_index =
+        in_context_from_user_index(&state.store, &id, &context_epochs, head_epoch).await?;
     Ok(SessionTranscriptPage {
+        archived: state
+            .store
+            .research_archive(&id)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_some_and(|a| a.frozen_at.is_some()),
         items,
         next_before_seq: page.next_before_seq,
         user_offset: page.user_offset,
@@ -1259,7 +1576,358 @@ pub(super) async fn load_session(
         presentations,
         branches,
         branch_state,
+        context_epochs,
+        head_epoch,
+        in_context_from_user_index,
+        pending_approvals: if before_seq.is_none() {
+            state
+                .confirms
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|pending| {
+                    let request = &pending.request;
+                    wisp_dto::PendingToolApproval {
+                        approval_id: request.approval_id.clone(),
+                        frame_id: request.frame_id.clone(),
+                        message: request.message.clone(),
+                        tool: request.tool.clone(),
+                        preview: request.preview.clone(),
+                    }
+                })
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        },
     })
+}
+
+async fn load_context_epoch_page(
+    store: &Store,
+    frame_id: &str,
+    items: &mut [UiItem],
+) -> Result<(Vec<wisp_dto::ContextEpochDto>, u64), String> {
+    let head_epoch = store
+        .frame_head_epoch(frame_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let records = store
+        .context_epochs(frame_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let undone = store
+        .undone_context_epochs(frame_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let head_max = store
+        .max_message_seq(frame_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut dtos = Vec::with_capacity(records.len());
+    for record in &records {
+        let has_new_turns = record.epoch == head_epoch && head_max > record.initial_head_seq;
+        dtos.push(wisp_dto::ContextEpochDto {
+            epoch: u64::try_from(record.epoch).unwrap_or(0),
+            parent_epoch: u64::try_from(record.parent_epoch).unwrap_or(0),
+            strategy: record.strategy.clone(),
+            kind: record.kind.clone(),
+            before_tokens: u64::try_from(record.before_tokens).unwrap_or(0),
+            after_tokens: u64::try_from(record.after_tokens).unwrap_or(0),
+            initial_head_seq: record.initial_head_seq,
+            first_kept_seq: record.first_kept_seq,
+            checkpoint_seq: record.checkpoint_seq,
+            ui_event_seq: record.ui_event_seq,
+            has_new_turns,
+        });
+    }
+    enrich_compaction_items(store, frame_id, items, &dtos, &undone, head_epoch).await?;
+    Ok((dtos, u64::try_from(head_epoch).unwrap_or(0)))
+}
+
+async fn in_context_from_user_index(
+    store: &Store,
+    frame_id: &str,
+    epochs: &[wisp_dto::ContextEpochDto],
+    head_epoch: u64,
+) -> Result<Option<usize>, String> {
+    if head_epoch == 0 {
+        return Ok(None);
+    }
+    let Some(head) = epochs.iter().find(|row| row.epoch == head_epoch) else {
+        return Ok(None);
+    };
+    let Some(seq) = head.first_kept_seq else {
+        return Ok(None);
+    };
+    store
+        .visual_user_index_for_kept_seq(frame_id, seq)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Refresh compaction metadata without replacing the transcript, pagination,
+/// active window, pending questions, or approvals.
+#[tauri::command]
+pub(super) async fn load_session_context_state(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<wisp_dto::SessionContextState, String> {
+    let runtime = state.sessions.lock().await.get(&session_id).cloned();
+    if let Some(runtime) = runtime.as_deref() {
+        flush_session_events(&runtime.ui_event_writer).await?;
+    }
+    read_session_context_state(&state.store, &session_id).await
+}
+
+async fn read_session_context_state(
+    store: &Store,
+    frame_id: &str,
+) -> Result<wisp_dto::SessionContextState, String> {
+    let (context_epochs, head_epoch) = load_context_epoch_page(store, frame_id, &mut []).await?;
+    let in_context_from_user_index =
+        in_context_from_user_index(store, frame_id, &context_epochs, head_epoch).await?;
+    let undone_epochs = store
+        .undone_context_epochs(frame_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter_map(|epoch| u64::try_from(epoch).ok())
+        .collect::<Vec<_>>();
+    let mut items = context_epochs
+        .iter()
+        .map(|record| UiItem {
+            role: "compaction".into(),
+            text: serde_json::json!({"epoch": record.epoch, "before": record.before_tokens,
+            "after": record.after_tokens, "strategy": record.strategy})
+            .to_string(),
+            tool_name: None,
+            ok: None,
+            duration_ms: None,
+            input: None,
+            model_name: None,
+            call_id: None,
+            kind: None,
+            status: None,
+            locations: None,
+            resources: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let undone = undone_epochs
+        .iter()
+        .map(|epoch| *epoch as i64)
+        .collect::<Vec<_>>();
+    enrich_compaction_items(
+        store,
+        frame_id,
+        &mut items,
+        &context_epochs,
+        &undone,
+        head_epoch as i64,
+    )
+    .await?;
+    let compactions = items
+        .into_iter()
+        .map(|item| {
+            serde_json::from_str::<wisp_dto::ContextCompactionDto>(&item.text)
+                .map_err(|e| e.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(wisp_dto::SessionContextState {
+        head_epoch,
+        context_epochs,
+        in_context_from_user_index,
+        compactions,
+        undone_epochs,
+    })
+}
+
+/// Head-epoch messages the model currently sees, including the folded system
+/// prompt and the compaction checkpoint.
+#[tauri::command]
+pub(super) async fn load_session_context_view(
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+    session_id: Option<String>,
+) -> Result<Vec<UiItem>, String> {
+    let frame_id = match session_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(id) => id.to_string(),
+        None => state
+            .active_frame(window.label())
+            .ok_or_else(|| "No active session to load the model view.".to_string())?,
+    };
+    let runtime = state.sessions.lock().await.get(&frame_id).cloned();
+    if let Some(runtime) = runtime.as_deref() {
+        flush_session_events(&runtime.ui_event_writer).await?;
+    }
+    let messages = state
+        .store
+        .load_messages(&frame_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(messages_to_context_view_items(&messages))
+}
+
+async fn enrich_compaction_items(
+    store: &Store,
+    frame_id: &str,
+    items: &mut [UiItem],
+    epochs: &[wisp_dto::ContextEpochDto],
+    undone: &[i64],
+    head_epoch: i64,
+) -> Result<(), String> {
+    for item in items.iter_mut().filter(|item| item.role == "compaction") {
+        let mut value: serde_json::Value = serde_json::from_str(&item.text).unwrap_or_default();
+        let epoch = value.get("epoch").and_then(serde_json::Value::as_u64);
+        let Some(epoch) = epoch else {
+            continue;
+        };
+        let record = epochs.iter().find(|row| row.epoch == epoch);
+        let is_undone = undone
+            .iter()
+            .any(|undone_epoch| *undone_epoch as u64 == epoch);
+        if let Some(record) = record {
+            if let Some(seq) = record.checkpoint_seq {
+                if let Some(message) = store
+                    .load_message_at_seq(frame_id, seq)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    value["checkpoint"] = serde_json::Value::String(message.content.as_text());
+                }
+            }
+            if let Some(seq) = record.first_kept_seq {
+                if let Some(index) = store
+                    .visual_user_index_for_kept_seq(frame_id, seq)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    value["kept_from_user_index"] = serde_json::json!(index);
+                }
+            }
+            let (can_undo, undo_reason) = if is_undone {
+                (false, Some("undone"))
+            } else if i64::try_from(record.epoch).unwrap_or(0) != head_epoch {
+                (false, Some("not_head"))
+            } else if record.has_new_turns {
+                (false, Some("has_new_turns"))
+            } else {
+                (true, None)
+            };
+            value["can_undo"] = serde_json::json!(can_undo);
+            if let Some(reason) = undo_reason {
+                value["undo_reason"] = serde_json::Value::String(reason.into());
+            }
+        } else if is_undone {
+            value["can_undo"] = serde_json::json!(false);
+            value["undo_reason"] = serde_json::Value::String("undone".into());
+        }
+        value["undone"] = serde_json::json!(is_undone);
+        item.text = value.to_string();
+    }
+    Ok(())
+}
+
+/// Bounded native refresh: no full outline, branch list or window selection
+/// writes on every tick. Shares the flush and fold path with load_session.
+pub(crate) async fn native_transcript(
+    state: &AppState,
+    id: &str,
+    before_seq: Option<i64>,
+) -> Result<(Vec<UiItem>, Option<i64>, bool, usize), String> {
+    let runtime = state.sessions.lock().await.get(id).cloned();
+    let page =
+        read_session_transcript_page(&state.store, runtime.as_deref(), id, before_seq).await?;
+    let mut items = transcript_page_items(&page)?;
+    if before_seq.is_none() {
+        items.extend(ask_user_items(state, id).await);
+    }
+    let _ = load_context_epoch_page(&state.store, id, &mut items).await?;
+    let frozen = state
+        .store
+        .research_archive(id)
+        .await
+        .map_err(|e| e.to_string())?
+        .is_some_and(|a| a.frozen_at.is_some())
+        || matches!(
+            state
+                .store
+                .session_branch_state(id)
+                .await
+                .map_err(|e| e.to_string())?,
+            Some("merged" | "orphaned")
+        );
+    Ok((items, page.next_before_seq, frozen, page.user_offset))
+}
+
+/// Navigation reads must remain safe while the workflow and Agent are locked.
+async fn read_session_transcript_page(
+    store: &Store,
+    runtime: Option<&SessionRuntime>,
+    id: &str,
+    before_seq: Option<i64>,
+) -> Result<wisp_store::SessionTranscriptPage, String> {
+    if before_seq.is_none() {
+        if let Some(runtime) = runtime {
+            flush_session_events(&runtime.ui_event_writer).await?;
+        }
+    }
+    let page = store
+        .load_session_transcript_page(id, before_seq, SESSION_TRANSCRIPT_PAGE_TURNS)
+        .await
+        .map_err(|error| error.to_string())?;
+    if before_seq.is_none() {
+        if let Some(runtime) = runtime {
+            // Deliver already-buffered live deltas before returning the snapshot
+            // that contains them. The frontend's revision guard then retries.
+            flush_session_events(&runtime.live_event_writer).await?;
+        }
+    }
+    Ok(page)
+}
+
+async fn flush_session_events(
+    writer: &StdMutex<Option<tokio::sync::mpsc::WeakUnboundedSender<SessionUiMessage>>>,
+) -> Result<(), String> {
+    let writer = writer
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|writer| writer.upgrade());
+    if let Some(writer) = writer {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if writer.send(SessionUiMessage::Flush(tx)).is_ok() {
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+                .await
+                .map_err(|_| "Timed out loading the live transcript. Please retry.".to_string())?
+                .map_err(|_| "The live transcript writer stopped. Please retry.".to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Reload a session's persisted messages and UI events, then fold them into
+/// a trajectory snapshot. The HTML export command repeats this same store
+/// read so it never depends on the frontend's filtered inspector view.
+pub(crate) async fn folded_session_trajectory(
+    store: &wisp_store::Store,
+    frame_id: &str,
+) -> Result<trajectory::TrajectorySnapshot, String> {
+    let messages = store
+        .load_messages_with_seq(frame_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let events = store
+        .load_session_ui_events_timed(frame_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let model = store
+        .frame_model(frame_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(trajectory::fold_trajectory(
+        frame_id, model, &messages, &events,
+    ))
 }
 
 /// Fold a session's stored messages and persisted UI events into the
@@ -1270,35 +1938,15 @@ pub(super) async fn load_session_trajectory(
     state: State<'_, AppState>,
     frame_id: String,
 ) -> Result<trajectory::TrajectorySnapshot, String> {
-    let messages = state
-        .store
-        .load_messages_with_seq(&frame_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    let events = state
-        .store
-        .load_session_ui_events_timed(&frame_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    let model = state
-        .store
-        .frame_model(&frame_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(trajectory::fold_trajectory(
-        &frame_id, model, &messages, &events,
-    ))
+    folded_session_trajectory(&state.store, &frame_id).await
 }
 
-/// Mark which session this window is viewing without loading it. The UI calls
-/// this instead of `load_session` when switching to a *running* session (it
-/// renders the cached streaming transcript), so uploads still attach to the
-/// viewed session (#194) — `load_session` would clobber the runtime's
-/// `last_seq` with the DB snapshot mid-stream.
+/// Mark which session this window is viewing without loading its transcript.
+/// This command never alters the runtime message cursor.
 #[tauri::command]
 pub(super) async fn set_viewed_session(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     id: String,
 ) -> Result<(), String> {
     let (project, _) = exploration_commands::working_project_for_frame(&state, &id).await?;
@@ -1352,7 +2000,20 @@ pub(super) async fn search_sessions(
 
 #[cfg(test)]
 mod branch_summary_tests {
-    use super::branch_summary_payload;
+    use super::{
+        branch_summary_output_budget, branch_summary_payload, BRANCH_SUMMARY_OUTPUT_TOKENS,
+    };
+
+    #[test]
+    fn output_budget_follows_the_profile_up_to_the_model_ceiling() {
+        assert_eq!(
+            branch_summary_output_budget(4_096, None),
+            BRANCH_SUMMARY_OUTPUT_TOKENS
+        );
+        assert_eq!(branch_summary_output_budget(65_536, None), 65_536);
+        assert_eq!(branch_summary_output_budget(65_536, Some(32_768)), 32_768);
+        assert_eq!(branch_summary_output_budget(4_096, Some(8_192)), 8_192);
+    }
 
     #[test]
     fn guided_generation_keeps_the_three_context_sections_in_order() {
@@ -1370,5 +2031,353 @@ mod branch_summary_tests {
             "【变更】\nbranch delta"
         );
         assert!(branch_summary_payload("branch delta", Some("draft"), None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod hydration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn running_snapshot_flushes_deltas_without_locking_agent_or_resetting_cursor() {
+        let root = std::env::temp_dir().join(format!("wisp_hydration_{}", Uuid::new_v4()));
+        let store = Store::open(&root.join("wisp.sqlite")).await.unwrap();
+        store
+            .create_project("p", "Project", &root.to_string_lossy())
+            .await
+            .unwrap();
+        store
+            .create_frame("f", "p", "OPERON", "model")
+            .await
+            .unwrap();
+        store
+            .append_message("f", 1, &wisp_llm::Message::user("question"))
+            .await
+            .unwrap();
+        let runtime = SessionRuntime::new();
+        runtime.set_last_seq(42);
+        let _workflow = runtime.workflow.lock().await;
+        let _agent = runtime.agent.lock().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *runtime.ui_event_writer.lock().unwrap() = Some(tx.downgrade());
+        let (live_tx, live_rx) = tokio::sync::mpsc::unbounded_channel();
+        *runtime.live_event_writer.lock().unwrap() = Some(live_tx.downgrade());
+        let emitted = Arc::new(StdMutex::new(Vec::new()));
+        let sink = emitted.clone();
+        let live_writer = tokio::spawn(coalesce_live_agent_events(
+            live_rx,
+            std::time::Duration::from_secs(3600),
+            move |event| sink.lock().unwrap().push(event),
+        ));
+        let writer = tokio::spawn(persist_ui_events(
+            store.clone(),
+            "f".into(),
+            1,
+            rx,
+            std::time::Duration::from_secs(3600),
+        ));
+        tx.send(SessionUiMessage::Event(AgentEvent::Text {
+            frame_id: "f".into(),
+            delta: "latest live text".into(),
+        }))
+        .unwrap();
+        live_tx
+            .send(SessionUiMessage::Event(AgentEvent::Text {
+                frame_id: "f".into(),
+                delta: "latest live text".into(),
+            }))
+            .unwrap();
+        let page = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_session_transcript_page(&store, Some(&runtime), "f", None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(page
+            .ui_events
+            .iter()
+            .any(|event| event.contains("latest live text")));
+        assert_eq!(runtime.last_seq(), 42);
+        assert!(matches!(emitted.lock().unwrap().as_slice(),
+            [AgentEvent::Text { delta, .. }] if delta == "latest live text"
+        ));
+        drop(tx);
+        drop(live_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(2), writer)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), live_writer)
+            .await
+            .unwrap()
+            .unwrap();
+        // A weak writer reference must not keep a completed turn alive.
+        read_session_transcript_page(&store, Some(&runtime), "f", None)
+            .await
+            .unwrap();
+        assert_eq!(runtime.last_seq(), 42);
+    }
+}
+
+#[cfg(test)]
+async fn store_with_compacted_frame() -> Store {
+    let tmp = std::env::temp_dir().join(format!(
+        "wisp_undo_compaction_{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let store = Store::open(&tmp).await.unwrap();
+    store.create_project("p", "proj", "").await.unwrap();
+    store.create_frame("f", "p", "OPERON", "m").await.unwrap();
+    for (seq, role, text) in [
+        (1, "system", "sys"),
+        (2, "user", "q1"),
+        (3, "assistant", "a1"),
+        (4, "user", "q2"),
+        (5, "assistant", "a2"),
+    ] {
+        let message = match role {
+            "system" => wisp_llm::Message::system(text),
+            "user" => wisp_llm::Message::user(text),
+            _ => wisp_llm::Message::assistant(text),
+        };
+        store.append_message("f", seq, &message).await.unwrap();
+    }
+    store
+        .open_context_epoch(
+            "f",
+            wisp_store::OpenContextEpoch {
+                messages: &[
+                    wisp_llm::Message::system("sys"),
+                    wisp_llm::Message::user("[context summary checkpoint]\n\nfolded"),
+                    wisp_llm::Message::user("q2"),
+                    wisp_llm::Message::assistant("a2"),
+                ],
+                strategy: "manual",
+                kind: "semantic",
+                before_tokens: 1000,
+                after_tokens: 200,
+                checkpoint_index: Some(1),
+                first_kept_seq: Some(4),
+                archive_ref: None,
+                ui_event_seq: Some(9),
+            },
+        )
+        .await
+        .unwrap();
+    store
+}
+
+#[cfg(test)]
+mod compaction_undo_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn context_state_restores_parent_and_does_not_reuse_undone_identity() {
+        let store = store_with_compacted_frame().await;
+        let messages = store.load_messages("f").await.unwrap();
+        let open = || wisp_store::OpenContextEpoch {
+            messages: &messages,
+            strategy: "manual",
+            kind: "semantic",
+            before_tokens: 500,
+            after_tokens: 100,
+            checkpoint_index: Some(1),
+            first_kept_seq: Some(8),
+            archive_ref: None,
+            ui_event_seq: None,
+        };
+        store.open_context_epoch("f", open()).await.unwrap();
+        let state = read_session_context_state(&store, "f").await.unwrap();
+        assert_eq!(state.head_epoch, 2);
+        assert_eq!(
+            state.compactions[1].checkpoint.as_deref(),
+            Some("[context summary checkpoint]\n\nfolded")
+        );
+        assert!(!state.compactions[0].can_undo);
+        assert!(state.compactions[1].can_undo);
+        store.undo_context_epoch("f").await.unwrap();
+        store
+            .append_session_ui_event(
+                "f",
+                10,
+                r#"{"kind":"CompactionUndone","frame_id":"f","epoch":2}"#,
+            )
+            .await
+            .unwrap();
+        let state = read_session_context_state(&store, "f").await.unwrap();
+        assert_eq!(state.head_epoch, 1);
+        assert_eq!(state.context_epochs.len(), 1);
+        assert_eq!(state.undone_epochs, [2]);
+        assert!(state.compactions[0].can_undo);
+        assert_eq!(store.open_context_epoch("f", open()).await.unwrap(), 3);
+        let state = read_session_context_state(&store, "f").await.unwrap();
+        assert_eq!(state.head_epoch, 3);
+        assert!(state.compactions[1].can_undo);
+        assert!(!state.undone_epochs.contains(&state.head_epoch));
+    }
+
+    #[tokio::test]
+    async fn load_context_epoch_page_merges_checkpoint_and_undo_flags() {
+        let store = store_with_compacted_frame().await;
+        let mut items = vec![UiItem {
+            role: "compaction".into(),
+            text: r#"{"before":1000,"after":200,"strategy":"manual","epoch":1}"#.into(),
+            tool_name: None,
+            ok: None,
+            duration_ms: None,
+            input: None,
+            model_name: None,
+            call_id: None,
+            kind: None,
+            status: None,
+            locations: None,
+            resources: Vec::new(),
+        }];
+        let (epochs, head) = load_context_epoch_page(&store, "f", &mut items)
+            .await
+            .unwrap();
+        assert_eq!(head, 1);
+        assert_eq!(epochs.len(), 1);
+        assert!(!epochs[0].has_new_turns);
+        let value: serde_json::Value = serde_json::from_str(&items[0].text).unwrap();
+        assert_eq!(value["can_undo"], true);
+        assert_eq!(value["undone"], false);
+        assert!(value["checkpoint"]
+            .as_str()
+            .unwrap()
+            .contains("[context summary checkpoint]"));
+    }
+
+    #[tokio::test]
+    async fn load_context_epoch_page_marks_undone_after_store_undo() {
+        let store = store_with_compacted_frame().await;
+        store.undo_context_epoch("f").await.unwrap();
+        store
+            .append_session_ui_event(
+                "f",
+                20,
+                r#"{"kind":"CompactionUndone","frame_id":"f","epoch":1}"#,
+            )
+            .await
+            .unwrap();
+        let mut items = vec![UiItem {
+            role: "compaction".into(),
+            text: r#"{"before":1000,"after":200,"strategy":"manual","epoch":1}"#.into(),
+            tool_name: None,
+            ok: None,
+            duration_ms: None,
+            input: None,
+            model_name: None,
+            call_id: None,
+            kind: None,
+            status: None,
+            locations: None,
+            resources: Vec::new(),
+        }];
+        let (epochs, head) = load_context_epoch_page(&store, "f", &mut items)
+            .await
+            .unwrap();
+        assert_eq!(head, 0);
+        assert!(epochs.is_empty());
+        let value: serde_json::Value = serde_json::from_str(&items[0].text).unwrap();
+        assert_eq!(value["undone"], true);
+        assert_eq!(value["can_undo"], false);
+        assert_eq!(value["undo_reason"], "undone");
+    }
+}
+
+#[cfg(test)]
+mod context_view_tests {
+    use super::*;
+
+    async fn persist_end_boundary(
+        store: &Store,
+        event_seq: &mut i64,
+        message_seq: i64,
+        text: &str,
+    ) {
+        store
+            .append_session_ui_event(
+                "f",
+                *event_seq,
+                &format!(r#"{{"kind":"User","frame_id":"f","text":"{text}"}}"#),
+            )
+            .await
+            .unwrap();
+        *event_seq += 1;
+        store
+            .append_session_ui_event(
+                "f",
+                *event_seq,
+                &format!(r#"{{"kind":"MessageBoundary","frame_id":"f","seq":{message_seq}}}"#),
+            )
+            .await
+            .unwrap();
+        *event_seq += 1;
+    }
+
+    #[tokio::test]
+    async fn context_view_items_include_system_checkpoint_and_tail() {
+        let items = messages_to_context_view_items(&[
+            wisp_llm::Message::system("sys"),
+            wisp_llm::Message::user("[context summary checkpoint]\n\nfolded"),
+            wisp_llm::Message::user("q2"),
+            wisp_llm::Message::assistant("a2"),
+        ]);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.role.as_str(), item.kind.as_deref(), item.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("system", Some("system"), "sys"),
+                (
+                    "checkpoint",
+                    Some("checkpoint"),
+                    "[context summary checkpoint]\n\nfolded"
+                ),
+                ("user", None, "q2"),
+                ("assistant", None, "a2"),
+            ]
+        );
+        assert!(messages_to_items(&[
+            wisp_llm::Message::system("sys"),
+            wisp_llm::Message::user("[context summary checkpoint]\n\nfolded"),
+            wisp_llm::Message::user("q2"),
+        ])
+        .iter()
+        .all(|item| item.role == "user" && item.text == "q2"));
+    }
+
+    #[tokio::test]
+    async fn in_context_from_matches_first_kept_seq() {
+        let store = store_with_compacted_frame().await;
+        let mut event_seq = 1i64;
+        persist_end_boundary(&store, &mut event_seq, 3, "q1").await;
+        persist_end_boundary(&store, &mut event_seq, 5, "q2").await;
+        let (epochs, head) = load_context_epoch_page(&store, "f", &mut []).await.unwrap();
+        assert_eq!(head, 1);
+        assert_eq!(epochs[0].first_kept_seq, Some(4));
+        assert_eq!(
+            in_context_from_user_index(&store, "f", &epochs, head)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            in_context_from_user_index(&store, "f", &[], 0)
+                .await
+                .unwrap(),
+            None
+        );
+        let mut no_kept = epochs.clone();
+        no_kept[0].first_kept_seq = None;
+        assert_eq!(
+            in_context_from_user_index(&store, "f", &no_kept, head)
+                .await
+                .unwrap(),
+            None
+        );
     }
 }

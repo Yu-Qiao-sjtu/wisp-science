@@ -1,3 +1,4 @@
+use crate::app_support::compose_icon;
 use crate::app_support::{
     classify_ssh_failure, js_error_text, refresh_execution_contexts, refresh_remote_dir,
     show_probe_stopped_toast, show_toast, show_warning_toast, ssh_connectivity_gap,
@@ -7,9 +8,10 @@ use crate::app_support::{
 use crate::bindings::{download_app_update, invoke, invoke_checked, open_external_url};
 use crate::dto::*;
 use crate::i18n::{localize_backend, t, tf, Locale};
-use crate::text::{event_target_value, format_bytes, md_to_html};
+use crate::text::{event_target_checked, event_target_value, format_bytes, md_to_html};
 use leptos::*;
 use serde_wasm_bindgen::to_value;
+use std::collections::HashSet;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -347,6 +349,282 @@ pub(crate) fn ExternalLinkConfirm(
                                     open_external_url(target.clone());
                                 }>
                                 {move || t(locale.get(), "link.confirm_open")}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            }
+        })}
+    }
+}
+
+pub(crate) fn present_browser_tab_cleanup(
+    pending: RwSignal<Option<BrowserTabCleanupPrompt>>,
+    queue: RwSignal<Vec<BrowserTabCleanupPrompt>>,
+    selected: RwSignal<HashSet<(String, i64)>>,
+    error: RwSignal<Option<String>>,
+    prompt: BrowserTabCleanupPrompt,
+) {
+    if prompt.tabs.is_empty() {
+        return;
+    }
+    let turn_id = prompt.turn_id.clone();
+    let select_all = |prompt: &BrowserTabCleanupPrompt| {
+        selected.set(
+            prompt
+                .tabs
+                .iter()
+                .map(|tab| (tab.session.clone(), tab.tab_id))
+                .collect(),
+        );
+        error.set(None);
+    };
+    if pending
+        .get_untracked()
+        .as_ref()
+        .is_some_and(|current| current.turn_id == turn_id)
+    {
+        select_all(&prompt);
+        pending.set(Some(prompt));
+        return;
+    }
+    if pending.get_untracked().is_some() {
+        queue.update(|queue| {
+            queue.retain(|item| item.turn_id != turn_id);
+            queue.push(prompt);
+        });
+        return;
+    }
+    select_all(&prompt);
+    pending.set(Some(prompt));
+}
+
+pub(crate) fn advance_browser_tab_cleanup(
+    pending: RwSignal<Option<BrowserTabCleanupPrompt>>,
+    queue: RwSignal<Vec<BrowserTabCleanupPrompt>>,
+    selected: RwSignal<HashSet<(String, i64)>>,
+    error: RwSignal<Option<String>>,
+    busy: RwSignal<bool>,
+) {
+    busy.set(false);
+    error.set(None);
+    pending.set(None);
+    let next = queue.try_update(|queue| {
+        if queue.is_empty() {
+            None
+        } else {
+            Some(queue.remove(0))
+        }
+    });
+    if let Some(prompt) = next.flatten() {
+        present_browser_tab_cleanup(pending, queue, selected, error, prompt);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BrowserTabCleanupOverlayState {
+    pub(crate) locale: RwSignal<Locale>,
+    pub(crate) pending: RwSignal<Option<BrowserTabCleanupPrompt>>,
+    pub(crate) selected: RwSignal<HashSet<(String, i64)>>,
+    pub(crate) busy: RwSignal<bool>,
+    pub(crate) error: RwSignal<Option<String>>,
+}
+
+#[component]
+pub(crate) fn BrowserTabCleanupOverlay(
+    state: BrowserTabCleanupOverlayState,
+    on_keep: Callback<()>,
+    on_close: Callback<Vec<BrowserTabCleanupItem>>,
+) -> impl IntoView {
+    let BrowserTabCleanupOverlayState {
+        locale,
+        pending,
+        selected,
+        busy,
+        error,
+    } = state;
+    view! {
+        {move || pending.get().map(|prompt| {
+            let n = prompt.tabs.len();
+            let tabs = prompt.tabs.clone();
+            view! {
+                <div class="overlay" data-testid="browser-tab-cleanup">
+                    <div class="modal confirm-modal browser-tab-cleanup-modal"
+                        role="dialog" aria-modal="true"
+                        aria-labelledby="browser-tab-cleanup-title">
+                        <h2 id="browser-tab-cleanup-title">
+                            {move || t(locale.get(), "browser.cleanup.title")}
+                        </h2>
+                        <div class="hint">
+                            {move || tf(
+                                locale.get(),
+                                "browser.cleanup.body",
+                                &[("n", &n.to_string())],
+                            )}
+                        </div>
+                        <div class="browser-tab-cleanup-list" data-testid="browser-tab-cleanup-list">
+                            {tabs.iter().cloned().map(|tab| {
+                                let key = (tab.session.clone(), tab.tab_id);
+                                let key_for_check = key.clone();
+                                view! {
+                                    <label class="browser-tab-cleanup-row"
+                                        data-testid=format!("browser-tab-cleanup-row-{}", tab.tab_id)>
+                                        <input type="checkbox"
+                                            data-testid=format!("browser-tab-cleanup-check-{}", tab.tab_id)
+                                            prop:checked=move || selected.get().contains(&key_for_check)
+                                            on:change=move |ev| {
+                                                let checked = event_target_checked(&ev);
+                                                selected.update(|set| {
+                                                    if checked {
+                                                        set.insert(key.clone());
+                                                    } else {
+                                                        set.remove(&key);
+                                                    }
+                                                });
+                                            } />
+                                        <span class="browser-tab-cleanup-body">
+                                            <strong>{if tab.title.trim().is_empty() {
+                                                tab.url.clone()
+                                            } else {
+                                                tab.title.clone()
+                                            }}</strong>
+                                            <span class="browser-tab-cleanup-url">{tab.url.clone()}</span>
+                                        </span>
+                                    </label>
+                                }
+                            }).collect_view()}
+                        </div>
+                        {move || error.get().map(|text| view! {
+                            <div class="settings-status fail">{text}</div>
+                        })}
+                        <div class="row">
+                            <button type="button"
+                                data-testid="browser-tab-cleanup-keep"
+                                disabled=move || busy.get()
+                                on:click=move |_| on_keep.call(())>
+                                {move || t(locale.get(), "browser.cleanup.keep")}
+                            </button>
+                            <button type="button" class="primary"
+                                data-testid="browser-tab-cleanup-close"
+                                disabled=move || busy.get()
+                                on:click=move |_| {
+                                    let chosen = pending
+                                        .get_untracked()
+                                        .map(|prompt| {
+                                            prompt
+                                                .tabs
+                                                .into_iter()
+                                                .filter(|tab| selected.get_untracked().contains(&(tab.session.clone(), tab.tab_id)))
+                                                .collect::<Vec<_>>()
+                                        })
+                                        .unwrap_or_default();
+                                    on_close.call(chosen);
+                                }>
+                                {move || t(locale.get(), "browser.cleanup.close")}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            }
+        })}
+    }
+}
+
+pub(crate) fn present_browser_needs_human(
+    pending: RwSignal<Option<BrowserNeedsHumanPrompt>>,
+    error: RwSignal<Option<String>>,
+    prompt: BrowserNeedsHumanPrompt,
+) {
+    error.set(None);
+    if prompt.tabs.is_empty() {
+        pending.set(None);
+        return;
+    }
+    pending.set(Some(prompt));
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BrowserNeedsHumanOverlayState {
+    pub(crate) locale: RwSignal<Locale>,
+    pub(crate) pending: RwSignal<Option<BrowserNeedsHumanPrompt>>,
+    pub(crate) busy: RwSignal<bool>,
+    pub(crate) error: RwSignal<Option<String>>,
+}
+
+#[component]
+pub(crate) fn BrowserNeedsHumanOverlay(
+    state: BrowserNeedsHumanOverlayState,
+    on_later: Callback<()>,
+    on_done: Callback<Vec<BrowserNeedsHumanTab>>,
+    on_show: Callback<BrowserNeedsHumanTab>,
+) -> impl IntoView {
+    let BrowserNeedsHumanOverlayState {
+        locale,
+        pending,
+        busy,
+        error,
+    } = state;
+    view! {
+        {move || pending.get().map(|prompt| {
+            let tabs = prompt.tabs.clone();
+            view! {
+                <div class="overlay" data-testid="browser-needs-human">
+                    <div class="modal confirm-modal browser-tab-cleanup-modal"
+                        role="dialog" aria-modal="true"
+                        aria-labelledby="browser-needs-human-title">
+                        <h2 id="browser-needs-human-title">
+                            {move || t(locale.get(), "browser.needs_human.title")}
+                        </h2>
+                        <div class="hint">
+                            {move || t(locale.get(), "browser.needs_human.body")}
+                        </div>
+                        <div class="hint">
+                            {move || t(locale.get(), "browser.needs_human.hint")}
+                        </div>
+                        <div class="browser-tab-cleanup-list" data-testid="browser-needs-human-list">
+                            {tabs.iter().cloned().map(|tab| {
+                                let show_tab = tab.clone();
+                                view! {
+                                    <button type="button" class="browser-tab-cleanup-row browser-needs-human-row"
+                                        data-testid=format!("browser-needs-human-row-{}", tab.tab_id)
+                                        disabled=move || busy.get()
+                                        on:click=move |_| on_show.call(show_tab.clone())>
+                                        <span class="browser-tab-cleanup-body">
+                                            <strong>{if tab.title.trim().is_empty() {
+                                                tab.url.clone()
+                                            } else {
+                                                tab.title.clone()
+                                            }}</strong>
+                                            <span class="browser-tab-cleanup-url">{tab.url.clone()}</span>
+                                            <span class="browser-tab-cleanup-url">
+                                                {move || t(locale.get(), "browser.needs_human.show")}
+                                            </span>
+                                        </span>
+                                    </button>
+                                }
+                            }).collect_view()}
+                        </div>
+                        {move || error.get().map(|text| view! {
+                            <div class="settings-status fail" data-testid="browser-needs-human-error">{text}</div>
+                        })}
+                        <div class="row">
+                            <button type="button"
+                                data-testid="browser-needs-human-later"
+                                disabled=move || busy.get()
+                                on:click=move |_| on_later.call(())>
+                                {move || t(locale.get(), "browser.needs_human.later")}
+                            </button>
+                            <button type="button" class="primary"
+                                data-testid="browser-needs-human-done"
+                                disabled=move || busy.get()
+                                on:click=move |_| {
+                                    let tabs = pending
+                                        .get_untracked()
+                                        .map(|prompt| prompt.tabs)
+                                        .unwrap_or_default();
+                                    on_done.call(tabs);
+                                }>
+                                {move || t(locale.get(), "browser.needs_human.done")}
                             </button>
                         </div>
                     </div>
@@ -726,6 +1004,7 @@ pub(crate) fn SshConnectivityOverlay(
                     SshFailKind::ProbeOutput => t(loc, "ssh_check.probe_output_title"),
                     SshFailKind::PasswordAuth => t(loc, "ssh_check.password_title"),
                     SshFailKind::KeyAuth => t(loc, "ssh_check.key_title"),
+                    SshFailKind::ClientVersion => t(loc, "ssh_check.client_title"),
                     _ => t(loc, "ssh_check.fail_title"),
                 }
             } else {
@@ -736,6 +1015,7 @@ pub(crate) fn SshConnectivityOverlay(
                     SshFailKind::ProbeOutput => "ssh_check.probe_output_body",
                     SshFailKind::PasswordAuth => "ssh_check.password_body",
                     SshFailKind::KeyAuth => "ssh_check.key_body",
+                    SshFailKind::ClientVersion => "ssh_check.client_body",
                     _ => "ssh_check.fail_body",
                 };
                 tf(loc, key, &[("host", &host)])
@@ -1030,6 +1310,197 @@ pub(crate) fn ContextRecoveryOverlay(
                     </div>
                 </div>
             }
+        })}
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompactDialogMode {
+    Regular,
+    Semantic,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CompactOverlayState {
+    pub(crate) locale: RwSignal<Locale>,
+    pub(crate) dialog: RwSignal<Option<String>>,
+    pub(crate) mode: RwSignal<CompactDialogMode>,
+    pub(crate) instruction: RwSignal<String>,
+    pub(crate) busy: RwSignal<bool>,
+    pub(crate) error: RwSignal<Option<String>>,
+}
+
+#[component]
+pub(crate) fn CompactOverlay(
+    state: CompactOverlayState,
+    on_start: Callback<(String, String)>,
+    on_close: Callback<()>,
+) -> impl IntoView {
+    let CompactOverlayState {
+        locale,
+        dialog,
+        mode,
+        instruction,
+        busy,
+        error,
+    } = state;
+    view! {
+        {move || dialog.get().map(|frame_id| {
+            let start_id = frame_id.clone();
+            view! {
+                <div class="overlay compact-overlay" data-testid="compact-overlay">
+                    <div
+                        class="modal compact-modal"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-labelledby="compact-title"
+                        aria-busy=move || busy.get().to_string()
+                        data-testid="compact-modal"
+                    >
+                        <div class="ps-head">
+                            <div>
+                                <h2 id="compact-title">{move || t(locale.get(), "compact.title")}</h2>
+                                <p class="compact-modal-subtitle">{move || t(locale.get(), "compact.subtitle")}</p>
+                            </div>
+                            {move || (!busy.get()).then(|| view! {
+                                <button
+                                    type="button"
+                                    class="ps-close"
+                                    data-testid="compact-close"
+                                    title=move || t(locale.get(), "compact.close")
+                                    aria-label=move || t(locale.get(), "compact.close")
+                                    on:click=move |_| on_close.call(())
+                                >
+                                    {compose_icon("close")}
+                                </button>
+                            })}
+                        </div>
+                        <div class="compact-mode-row">
+                            <button
+                                type="button"
+                                class="compact-mode"
+                                class:active=move || mode.get() == CompactDialogMode::Regular
+                                data-testid="compact-mode-regular"
+                                aria-pressed=move || (mode.get() == CompactDialogMode::Regular).to_string()
+                                disabled=move || busy.get()
+                                on:click=move |_| mode.set(CompactDialogMode::Regular)
+                            >
+                                <strong>{move || t(locale.get(), "compact.mode_regular")}</strong>
+                                <span>{move || t(locale.get(), "compact.mode_regular_hint")}</span>
+                            </button>
+                            <button
+                                type="button"
+                                class="compact-mode"
+                                class:active=move || mode.get() == CompactDialogMode::Semantic
+                                data-testid="compact-mode-semantic"
+                                aria-pressed=move || (mode.get() == CompactDialogMode::Semantic).to_string()
+                                disabled=move || busy.get()
+                                on:click=move |_| mode.set(CompactDialogMode::Semantic)
+                            >
+                                <strong>{move || t(locale.get(), "compact.mode_semantic")}</strong>
+                                <span>{move || t(locale.get(), "compact.mode_semantic_hint")}</span>
+                            </button>
+                        </div>
+                        <label
+                            for="compact-instruction"
+                            class="compact-instruction-field"
+                            class:hidden=move || mode.get() != CompactDialogMode::Semantic
+                        >
+                            {move || t(locale.get(), "compact.instruction_label")}
+                            <textarea
+                                id="compact-instruction"
+                                class="compact-instruction"
+                                data-testid="compact-instruction"
+                                rows="4"
+                                placeholder=move || t(locale.get(), "compact.instruction_placeholder")
+                                prop:value=move || instruction.get()
+                                disabled=move || busy.get()
+                                on:input=move |ev| instruction.set(event_target_value(&ev))
+                            ></textarea>
+                        </label>
+                        <p class="compact-modal-hint">{move || t(
+                            locale.get(),
+                            if mode.get() == CompactDialogMode::Semantic {
+                                "compact.hint_semantic"
+                            } else {
+                                "compact.hint_regular"
+                            },
+                        )}</p>
+                        {move || busy.get().then(|| view! {
+                            <div class="compact-progress" data-testid="compact-progress" role="status" aria-live="polite">
+                                <span class="compact-progress-dot" aria-hidden="true"></span>
+                                <span>{move || t(locale.get(), "compact.running")}</span>
+                            </div>
+                        })}
+                        {move || error.get().map(|message| view! {
+                            <div class="context-recovery-error" data-testid="compact-error" role="alert">{message}</div>
+                        })}
+                        {move || (!busy.get()).then(|| {
+                            let action_id = start_id.clone();
+                            view! {
+                                <div class="row">
+                                    <button type="button" data-testid="compact-cancel" on:click=move |_| on_close.call(())>
+                                        {move || t(locale.get(), "compact.cancel")}
+                                    </button>
+                                    <button type="button" class="primary" data-testid="compact-start" on:click=move |_| {
+                                        on_start.call((action_id.clone(), instruction.get_untracked()));
+                                    }>
+                                        {move || t(locale.get(), "compact.start")}
+                                    </button>
+                                </div>
+                            }
+                        })}
+                    </div>
+                </div>
+            }
+        })}
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CompactIdlePromptOverlayState {
+    pub(crate) locale: RwSignal<Locale>,
+    pub(crate) prompt: RwSignal<Option<(String, u64)>>,
+}
+
+#[component]
+pub(crate) fn CompactIdlePromptOverlay(
+    state: CompactIdlePromptOverlayState,
+    on_accept: Callback<String>,
+    on_dismiss: Callback<()>,
+) -> impl IntoView {
+    let CompactIdlePromptOverlayState { locale, prompt } = state;
+    view! {
+        {move || prompt.get().map(|(session_id, hours)| {
+            let accept_id = session_id.clone();
+            view! {
+                <div class="overlay compact-overlay" data-testid="compact-idle-overlay">
+                    <div
+                        class="modal compact-modal"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-labelledby="compact-idle-title"
+                        data-testid="compact-idle-prompt"
+                    >
+                        <h2 id="compact-idle-title">{move || t(locale.get(), "compact.idle_title")}</h2>
+                        <p class="compact-modal-hint">{move || tf(
+                            locale.get(),
+                            "compact.idle_body",
+                            &[("hours", &hours.to_string())],
+                        )}</p>
+                        <div class="row">
+                            <button type="button" data-testid="compact-idle-dismiss" on:click=move |_| on_dismiss.call(())>
+                                {move || t(locale.get(), "compact.idle_dismiss")}
+                            </button>
+                            <button type="button" class="primary" data-testid="compact-idle-accept" on:click=move |_| {
+                                on_accept.call(accept_id.clone());
+                            }>
+                                {move || t(locale.get(), "compact.idle_accept")}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            }.into_view()
         })}
     }
 }

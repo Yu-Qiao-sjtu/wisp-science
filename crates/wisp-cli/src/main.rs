@@ -1,5 +1,9 @@
+mod claim_catalog;
 mod eval;
 mod rpc;
+mod runs;
+mod trajectory_eval;
+mod workflows;
 
 use anyhow::{bail, Context, Result};
 use std::collections::VecDeque;
@@ -7,7 +11,10 @@ use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use wisp_core::{Agent, MemoryManager, Output};
+use wisp_core::{
+    host_agent_observability, Agent, AgentTrace, HostObservabilityConfig, MemoryManager,
+    ObservabilityHost, Output,
+};
 use wisp_llm::{Message, ProviderConfig, ToolCall};
 use wisp_skills::SkillIndex;
 
@@ -18,6 +25,7 @@ const USAGE: &str = "Usage:
   wisp-science run [--output console|jsonl] <prompt>
   wisp-science rpc
   wisp-science eval [--mode offline|live] [--suite suite.yaml] [options]
+  wisp-science trajectory-eval --input trajectory.html [--rubric rubric.yaml] [--save report.json] [--allow-failures]
   wisp-science dev
 
 Eval defaults to the built-in deterministic offline suite and requires no API key.
@@ -44,6 +52,7 @@ enum CliCommand {
         output: OutputFormat,
     },
     Eval(eval::EvalOptions),
+    TrajectoryEval(trajectory_eval::Options),
     Rpc,
     Dev,
     Help,
@@ -178,6 +187,26 @@ fn parse_command(args: impl IntoIterator<Item = String>) -> Result<CliCommand> {
             }
             Ok(CliCommand::Eval(options))
         }
+        "trajectory-eval" => {
+            let mut options = trajectory_eval::Options::default();
+            while let Some(arg) = args.next() {
+                let value = |args: &mut std::vec::IntoIter<String>| -> Result<String> {
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("{arg} requires a value"))
+                };
+                match arg.as_str() {
+                    "--input" => replace_path(&mut options.input, &arg, value(&mut args)?)?,
+                    "--rubric" => replace_path(&mut options.rubric, &arg, value(&mut args)?)?,
+                    "--save" => replace_path(&mut options.save, &arg, value(&mut args)?)?,
+                    "--allow-failures" => options.allow_failures = true,
+                    _ => bail!("unknown trajectory-eval option '{arg}'"),
+                }
+            }
+            if options.input.is_none() {
+                bail!("trajectory-eval requires --input");
+            }
+            Ok(CliCommand::TrajectoryEval(options))
+        }
         _ => bail!("unknown command '{command}'\n\n{USAGE}"),
     }
 }
@@ -205,8 +234,21 @@ fn parse_percent(option: &str, value: &str) -> Result<u64> {
     parse_u64(option, value.trim_end_matches('%'))
 }
 
-struct CliOutput;
+struct CliOutput {
+    trace: AgentTrace,
+}
 impl CliOutput {
+    fn new(root: &std::path::Path) -> Self {
+        Self {
+            trace: host_agent_observability(HostObservabilityConfig::for_host(
+                ObservabilityHost::Cli,
+                root,
+            )),
+        }
+    }
+    fn tracer(&self) -> AgentTrace {
+        self.trace.clone()
+    }
     fn dim(&self) -> &'static str {
         if std::io::stdout().is_terminal() {
             "\x1b[2m"
@@ -399,6 +441,9 @@ impl Output for CliOutput {
         std::io::stdin().read_line(&mut line).ok();
         matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
     }
+    fn agent_trace(&self) -> Option<&AgentTrace> {
+        Some(&self.trace)
+    }
 }
 
 struct JsonlOutput<W> {
@@ -408,17 +453,31 @@ struct JsonlOutput<W> {
     turn_id: String,
     pending_calls: Mutex<VecDeque<ToolCall>>,
     active_call_ids: Mutex<VecDeque<String>>,
+    trace: AgentTrace,
 }
 
 impl<W: Write + Send> JsonlOutput<W> {
     fn new(writer: W) -> Self {
+        Self::with_root(writer, None)
+    }
+
+    fn with_root(writer: W, root: Option<&std::path::Path>) -> Self {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let mut config = match root {
+            Some(root) => HostObservabilityConfig::for_host(ObservabilityHost::Cli, root),
+            None => HostObservabilityConfig::memory(ObservabilityHost::Cli),
+        };
+        config.identity.session_id = Some(session_id.clone());
+        config.identity.turn_id = Some(turn_id.clone());
         Self {
             writer: Mutex::new(writer),
             sequence: AtomicU64::new(0),
-            session_id: uuid::Uuid::new_v4().to_string(),
-            turn_id: uuid::Uuid::new_v4().to_string(),
+            session_id,
+            turn_id,
             pending_calls: Mutex::new(VecDeque::new()),
             active_call_ids: Mutex::new(VecDeque::new()),
+            trace: host_agent_observability(config),
         }
     }
 
@@ -621,6 +680,10 @@ impl<W: Write + Send> Output for JsonlOutput<W> {
             "tool_calls": message.tool_calls,
         }));
     }
+
+    fn agent_trace(&self) -> Option<&AgentTrace> {
+        Some(&self.trace)
+    }
 }
 
 fn env(name: &str, default: &str) -> String {
@@ -671,37 +734,180 @@ async fn register_mcp_tools(
     }
 }
 
-fn provider_config() -> Result<ProviderConfig> {
-    let kind = match env("WISP_PROVIDER", "openai").to_ascii_lowercase().as_str() {
-        "anthropic" => "anthropic".to_string(),
-        "openai_responses" | "openai-responses" | "responses" => "openai_responses".to_string(),
-        _ => "openai".to_string(),
-    };
-    let api_key = env("WISP_API_KEY", "");
-    let base_url = env(
-        "WISP_API_URL",
-        match kind.as_str() {
-            "anthropic" => "https://api.anthropic.com",
-            "openai_responses" => "https://api.openai.com/v1",
-            _ => "https://api.deepseek.com",
-        },
-    );
-    let model = env(
-        "WISP_MODEL",
-        match kind.as_str() {
-            "anthropic" => "claude-sonnet-5",
-            "openai_responses" => "gpt-5.5",
-            _ => "deepseek-v4-flash",
-        },
-    );
-    if api_key.is_empty() {
-        anyhow::bail!("WISP_API_KEY is not set (required). Set it to your provider API key.");
+fn parse_provider_kind(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "anthropic" => "anthropic".into(),
+        "openai_responses" | "openai-responses" | "responses" => "openai_responses".into(),
+        _ => "openai".into(),
     }
-    Ok(match kind.as_str() {
+}
+
+fn default_provider_url(kind: &str) -> &'static str {
+    match kind {
+        "anthropic" => "https://api.anthropic.com",
+        "openai_responses" => "https://api.openai.com/v1",
+        _ => "https://api.deepseek.com",
+    }
+}
+
+fn default_provider_model(kind: &str) -> &'static str {
+    match kind {
+        "anthropic" => "claude-sonnet-5",
+        "openai_responses" => "gpt-5.5",
+        _ => "deepseek-v4-flash",
+    }
+}
+
+fn env_opt(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn build_named_provider_config(
+    kind: &str,
+    base_url: String,
+    api_key: String,
+    model: String,
+) -> ProviderConfig {
+    match kind {
         "anthropic" => ProviderConfig::anthropic(base_url, api_key, model),
         "openai_responses" => ProviderConfig::openai_responses(base_url, api_key, model),
         _ => ProviderConfig::openai(base_url, api_key, model),
-    })
+    }
+}
+
+/// Keep routing identity alongside the existing CLI transcript. A fresh or
+/// explicitly reset conversation receives a new ID; restarting CLI/RPC resumes it.
+fn cli_session_id(root: &std::path::Path, reset: bool) -> Result<String> {
+    let directory = root.join(".wisp");
+    let path = directory.join("session-id");
+    if !reset && directory.join("session.json").is_file() {
+        if let Ok(saved) = std::fs::read_to_string(&path) {
+            if let Ok(id) = uuid::Uuid::parse_str(saved.trim()) {
+                return Ok(id.to_string());
+            }
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    std::fs::create_dir_all(&directory)?;
+    std::fs::write(path, &id)?;
+    Ok(id)
+}
+
+fn provider_config() -> Result<ProviderConfig> {
+    let kind = parse_provider_kind(&env("WISP_PROVIDER", "openai"));
+    let api_key = env("WISP_API_KEY", "");
+    let base_url = env("WISP_API_URL", default_provider_url(&kind));
+    let model = env("WISP_MODEL", default_provider_model(&kind));
+    if api_key.is_empty() {
+        anyhow::bail!("WISP_API_KEY is not set (required). Set it to your provider API key.");
+    }
+    let mut cfg = build_named_provider_config(&kind, base_url, api_key, model);
+    cfg.max_tokens = parse_wisp_max_tokens(std::env::var("WISP_MAX_TOKENS").ok().as_deref())
+        .unwrap_or(DEFAULT_HEADLESS_MAX_TOKENS);
+    if let Some(effort) =
+        parse_wisp_reasoning_effort(std::env::var("WISP_REASONING_EFFORT").ok().as_deref())
+    {
+        cfg.reasoning_effort = Some(effort);
+    }
+    Ok(cfg)
+}
+
+/// Dedicated image-analysis model used when the primary chat model cannot see.
+/// `WISP_VISION_MODEL` is the gate; provider/url/key fall back to the primary
+/// `WISP_*` values when omitted.
+fn vision_provider_from_values(
+    model: Option<&str>,
+    provider: Option<&str>,
+    api_url: Option<&str>,
+    api_key: Option<&str>,
+    fallback_provider: Option<&str>,
+    fallback_url: Option<&str>,
+    fallback_key: Option<&str>,
+) -> Result<Option<ProviderConfig>> {
+    let model = model.map(str::trim).filter(|value| !value.is_empty());
+    let provider = provider.map(str::trim).filter(|value| !value.is_empty());
+    let api_url = api_url.map(str::trim).filter(|value| !value.is_empty());
+    if model.is_none() && provider.is_none() && api_url.is_none() {
+        return Ok(None);
+    }
+    let Some(model) = model else {
+        bail!(
+            "WISP_VISION_MODEL is required when WISP_VISION_PROVIDER or WISP_VISION_API_URL is set"
+        );
+    };
+    let kind = parse_provider_kind(provider.unwrap_or(fallback_provider.unwrap_or("openai")));
+    let base_url = api_url
+        .map(str::to_string)
+        .or_else(|| provider.map(|_| default_provider_url(&kind).to_string()))
+        .or_else(|| fallback_url.map(str::to_string))
+        .unwrap_or_else(|| default_provider_url(&kind).to_string());
+    let api_key = api_key
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            fallback_key
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or("");
+    if api_key.is_empty() {
+        bail!("WISP_VISION_API_KEY or WISP_API_KEY is required for the dedicated vision model");
+    }
+    Ok(Some(build_named_provider_config(
+        &kind,
+        base_url,
+        api_key.to_string(),
+        model.to_string(),
+    )))
+}
+
+fn vision_provider_config() -> Result<Option<ProviderConfig>> {
+    vision_provider_from_values(
+        env_opt("WISP_VISION_MODEL").as_deref(),
+        env_opt("WISP_VISION_PROVIDER").as_deref(),
+        env_opt("WISP_VISION_API_URL").as_deref(),
+        env_opt("WISP_VISION_API_KEY").as_deref(),
+        env_opt("WISP_PROVIDER").as_deref(),
+        env_opt("WISP_API_URL").as_deref(),
+        env_opt("WISP_API_KEY").as_deref(),
+    )
+}
+
+const DEFAULT_HEADLESS_MAX_TOKENS: u64 = 32_768;
+const DEFAULT_HEADLESS_MAX_ITER: usize = 0;
+const DEFAULT_HEADLESS_VISION: bool = false;
+
+fn parse_wisp_max_tokens(raw: Option<&str>) -> Option<u64> {
+    raw.and_then(|value| value.parse().ok())
+}
+
+fn parse_wisp_max_iter(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|value| value.parse().ok())
+}
+
+fn parse_wisp_vision(raw: Option<&str>) -> Option<bool> {
+    let value = raw?.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "1" | "true" | "on" | "yes" | "y" => Some(true),
+        "0" | "false" | "off" | "no" | "n" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_wisp_reasoning_effort(raw: Option<&str>) -> Option<String> {
+    let value = raw?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let value = value.to_ascii_lowercase();
+    matches!(
+        value.as_str(),
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+    )
+    .then_some(value)
 }
 
 fn skill_paths(root: &std::path::Path) -> Vec<PathBuf> {
@@ -769,9 +975,17 @@ async fn main() -> Result<()> {
         } else {
             None
         };
-        return eval::run(live_config, options).await;
+        let live_vision = if options.mode == eval::EvalMode::Live {
+            vision_provider_config()?
+        } else {
+            None
+        };
+        return eval::run(live_config, live_vision, options).await;
     }
-    let cfg = match provider_config() {
+    if let CliCommand::TrajectoryEval(options) = &command {
+        return trajectory_eval::run(options);
+    }
+    let mut cfg = match provider_config() {
         Ok(cfg) => cfg,
         Err(error) => {
             if command == CliCommand::Rpc {
@@ -797,27 +1011,64 @@ async fn main() -> Result<()> {
     let max_context = env("WISP_MAX_CONTEXT", "1000000")
         .parse::<usize>()
         .unwrap_or(1_000_000);
-    let max_iter = env("WISP_MAX_ITER", "100").parse::<usize>().unwrap_or(100);
+    let max_iter = parse_wisp_max_iter(std::env::var("WISP_MAX_ITER").ok().as_deref())
+        .unwrap_or(DEFAULT_HEADLESS_MAX_ITER);
 
     let skills = Arc::new(SkillIndex::load(&skill_paths(&root)));
     let memory = Arc::new(MemoryManager::new(&root));
 
+    let mut vision_cfg = match vision_provider_config() {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            if command == CliCommand::Rpc {
+                rpc::startup_error(&error);
+            } else if jsonl {
+                JsonlOutput::new(std::io::stdout()).error(&error);
+            }
+            return Err(error);
+        }
+    };
+    cfg.session_id = cli_session_id(&root, false)?;
+    if let Some(vision) = &mut vision_cfg {
+        vision.session_id = cfg.session_id.clone();
+    }
     let mut agent = Agent::new(
-        cfg,
+        cfg.clone(),
         skills.clone(),
         memory.clone(),
         root.clone(),
         max_context,
         max_iter,
         true,
-        None,
+        vision_cfg.clone(),
     );
-    agent.seed_system_prompt(&skills, None);
+    agent.ctx.supports_vision = parse_wisp_vision(std::env::var("WISP_VISION").ok().as_deref())
+        .unwrap_or(DEFAULT_HEADLESS_VISION);
+    if let Some(vision) = &vision_cfg {
+        setup_message(jsonl, format_args!("vision model wired ({})", vision.model));
+    }
+    let run_store = wisp_runs::open_project_store(&root, runs::CLI_PROJECT_ID, "CLI").await?;
+    let run_manager = wisp_runs::RunManager::new();
+    runs::register_run_tools(
+        &mut agent.tools,
+        run_store.clone(),
+        run_manager.clone(),
+        runs::CLI_PROJECT_ID,
+    );
+    workflows::register(
+        &mut agent.tools,
+        run_store.clone(),
+        skills.clone(),
+        cfg.clone(),
+        run_manager.clone(),
+        max_context,
+        max_iter,
+    );
+    let compute = wisp_runs::cli_compute_section(&run_store).await;
+    agent.seed_system_prompt(&skills, Some(compute));
 
-    // Provision a uv venv once; shared by the Python REPL and the bundled
-    // bio-tools MCP server. Skipped silently if uv isn't installed.
+    // Python is prepared on demand through local-env-setup.
     let app_data = root.join(".wisp");
-    let py_env = wisp_runtime::PythonEnv::ensure(&app_data).ok();
 
     // Python REPL: needs a kernel_worker path. Default to the bundled worker.
     let worker = std::env::var("WISP_KERNEL_WORKER")
@@ -839,18 +1090,11 @@ async fn main() -> Result<()> {
         vec![],
     );
     if worker_path.is_file() {
-        if py_env.is_some() {
-            agent.add_tool(Box::new(wisp_runtime::ReplTool::new(
-                runtime_manager.clone(),
-                root.to_string_lossy(),
-            )));
-            setup_message(jsonl, format_args!("python repl wired ({worker})."));
-        } else {
-            setup_message(
-                jsonl,
-                format_args!("python repl skipped: uv venv unavailable"),
-            );
-        }
+        agent.add_tool(Box::new(wisp_runtime::ReplTool::new(
+            runtime_manager.clone(),
+            root.to_string_lossy(),
+        )));
+        setup_message(jsonl, format_args!("python repl wired ({worker})."));
     } else {
         setup_message(
             jsonl,
@@ -871,8 +1115,30 @@ async fn main() -> Result<()> {
         );
     }
 
-    // MCP server: WISP_MCP_COMMAND overrides; otherwise WISP_MCP_PKG launches
-    // the bundled bio-tools server (<pkg> e.g. mcp_pubmed) via the venv python.
+    let bio_package = std::env::var("WISP_MCP_PKG").unwrap_or_else(|_| "mcp_bio".into());
+    let native_bio =
+        std::env::var("WISP_MCP_COMMAND").is_err() && wisp_bio::selected_by_package(&bio_package);
+    if native_bio {
+        let credentials: Vec<_> = std::env::vars()
+            .filter(|(key, value)| {
+                !value.is_empty()
+                    && (key.ends_with("_API_KEY")
+                        || key.ends_with("_EMAIL")
+                        || key.ends_with("_TOKEN")
+                        || key == "NCBI_EMAIL")
+            })
+            .collect();
+        match wisp_bio::NativeBio::new(&credentials) {
+            Ok(client) => {
+                for tool in wisp_bio::tools_for_package(std::sync::Arc::new(client), &bio_package) {
+                    agent.add_tool(tool);
+                }
+            }
+            Err(error) => setup_message(jsonl, format_args!("native bio: {error}")),
+        }
+    }
+
+    // Explicit stdio override; WISP_MCP_PKG selects native tools above.
     if let Ok(cmdline) = std::env::var("WISP_MCP_COMMAND") {
         let parts: Vec<String> = cmdline
             .split_whitespace()
@@ -890,28 +1156,33 @@ async fn main() -> Result<()> {
             let args: Vec<String> = parts[1..].to_vec();
             wire_mcp(&mut agent, &parts[0], &args, jsonl).await;
         }
-    } else if let Some(env) = &py_env {
-        let pkg = std::env::var("WISP_MCP_PKG").unwrap_or_else(|_| "mcp_bio".into());
-        match wisp_mcp::McpClient::launch_bio_tools(&env.python(), &pkg, &[]).await {
-            Ok(client) => {
-                register_mcp_tools(
-                    &mut agent,
-                    std::sync::Arc::new(client),
-                    &format!("bio-tools:{pkg}"),
-                    jsonl,
-                )
-                .await
-            }
-            Err(e) => setup_message(
-                jsonl,
-                format_args!("mcp bio-tools:{pkg} launch failed: {e}"),
-            ),
-        }
+    } else if !wisp_bio::selected_by_package(&bio_package) {
+        setup_message(
+            jsonl,
+            format_args!("Unknown native bio package: {bio_package}"),
+        );
     }
 
-    let out = CliOutput;
+    let _scientific_bridge = wisp_core::host_scientific_bridge(
+        &wisp_core::specialist_manifest::HostPolicy::bundled_depmap(),
+    );
+    wisp_core::install_scientific_intent_planner_in(&mut agent.tools, "workspace", "cli");
+    claim_catalog::install_session_claim_grounding(
+        &mut agent.ctx,
+        &run_store,
+        runs::CLI_PROJECT_ID,
+        "cli",
+    )
+    .await;
+    if let Some(pending) = wisp_core::latest_pending_checkpoint(&root) {
+        agent
+            .ctx
+            .inject_user(wisp_core::checkpoint_resume_injection(&pending));
+    }
+
+    let out = CliOutput::new(&root);
     if command == CliCommand::Rpc {
-        let result = rpc::serve(agent).await;
+        let result = rpc::serve(agent, out.tracer()).await;
         runtime_manager.shutdown_all().await;
         return result;
     }
@@ -923,7 +1194,7 @@ async fn main() -> Result<()> {
                 result
             }
             OutputFormat::Jsonl => {
-                let jsonl_out = JsonlOutput::new(std::io::stdout());
+                let jsonl_out = JsonlOutput::with_root(std::io::stdout(), Some(&root));
                 jsonl_out.start(&prompt, agent.provider.model(), &root);
                 let result = run_prompt(&mut agent, &prompt, &jsonl_out).await;
                 match &result {
@@ -988,9 +1259,23 @@ async fn main() -> Result<()> {
                 continue;
             }
             "/n" | "/new" => {
+                let session_id = cli_session_id(&root, true)?;
+                cfg.session_id = session_id.clone();
+                if let Some(vision) = &mut vision_cfg {
+                    vision.session_id = session_id;
+                }
+                agent.provider = wisp_llm::build(cfg.clone());
+                agent.vision_provider = vision_cfg.clone().map(wisp_llm::build);
+                agent
+                    .tools
+                    .add(Box::new(wisp_core::subagent::ExploreTool::from_config(
+                        cfg.clone(),
+                        max_context,
+                    )));
                 agent.ctx.backup(&agent.session_path);
                 agent.ctx.clear();
-                agent.seed_system_prompt(&skills, None);
+                let compute = wisp_runs::cli_compute_section(&run_store).await;
+                agent.seed_system_prompt(&skills, Some(compute));
                 println!("{}New session created.{}", out.green(), out.reset());
                 agent.save();
                 continue;
@@ -1009,6 +1294,24 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cli_routing_identity_resumes_and_rotates_with_new_conversations() {
+        let root = std::env::temp_dir().join(format!("wisp-cli-session-{}", uuid::Uuid::new_v4()));
+        let first = super::cli_session_id(&root, false).unwrap();
+        std::fs::write(root.join(".wisp/session.json"), "[]").unwrap();
+        assert_eq!(super::cli_session_id(&root, false).unwrap(), first);
+        let second = super::cli_session_id(&root, true).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(super::cli_session_id(&root, false).unwrap(), second);
+        std::fs::remove_file(root.join(".wisp/session.json")).unwrap();
+        let third = super::cli_session_id(&root, false).unwrap();
+        assert_ne!(third, second);
+        std::fs::write(root.join(".wisp/session.json"), "[]").unwrap();
+        std::fs::write(root.join(".wisp/session-id"), "bad\r\nheader: injected").unwrap();
+        assert!(uuid::Uuid::parse_str(&super::cli_session_id(&root, false).unwrap()).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
 
     fn command(args: &[&str]) -> Result<CliCommand> {
@@ -1107,6 +1410,39 @@ mod tests {
     }
 
     #[test]
+    fn parses_trajectory_eval_paths_and_failure_policy() {
+        let mut expected = trajectory_eval::Options::default();
+        expected.input = Some(PathBuf::from("trace.html"));
+        expected.rubric = Some(PathBuf::from("rubric.yaml"));
+        expected.save = Some(PathBuf::from("report.json"));
+        expected.allow_failures = true;
+        assert_eq!(
+            command(&[
+                "trajectory-eval",
+                "--input",
+                "trace.html",
+                "--rubric",
+                "rubric.yaml",
+                "--save",
+                "report.json",
+                "--allow-failures"
+            ])
+            .unwrap(),
+            CliCommand::TrajectoryEval(expected)
+        );
+        assert!(command(&["trajectory-eval"])
+            .unwrap_err()
+            .to_string()
+            .contains("requires --input"));
+        assert!(
+            command(&["trajectory-eval", "--input", "one", "--input", "two"])
+                .unwrap_err()
+                .to_string()
+                .contains("only be specified once")
+        );
+    }
+
+    #[test]
     fn jsonl_output_emits_one_valid_object_per_line() {
         let output = JsonlOutput::new(Vec::new());
         output.start("inspect", "test-model", std::path::Path::new("project"));
@@ -1164,5 +1500,152 @@ mod tests {
         assert_eq!(events[1]["call_id"], "call-42");
         assert_eq!(events[1]["arguments"]["path"], "notes.txt");
         assert_eq!(events[2]["call_id"], "call-42");
+    }
+
+    #[test]
+    fn wisp_max_tokens_override_parses_set_unset_and_invalid() {
+        assert_eq!(parse_wisp_max_tokens(None), None);
+        assert_eq!(
+            parse_wisp_max_tokens(None).unwrap_or(DEFAULT_HEADLESS_MAX_TOKENS),
+            32_768
+        );
+        assert_eq!(parse_wisp_max_tokens(Some("65536")), Some(65536));
+        assert_eq!(parse_wisp_max_tokens(Some("nope")), None);
+        assert_eq!(
+            parse_wisp_max_tokens(Some("nope")).unwrap_or(DEFAULT_HEADLESS_MAX_TOKENS),
+            32_768
+        );
+        assert_eq!(parse_wisp_max_tokens(Some("")), None);
+    }
+
+    #[test]
+    fn wisp_max_iter_override_parses_set_unset_and_invalid() {
+        assert_eq!(parse_wisp_max_iter(None), None);
+        assert_eq!(
+            parse_wisp_max_iter(None).unwrap_or(DEFAULT_HEADLESS_MAX_ITER),
+            0
+        );
+        assert_eq!(parse_wisp_max_iter(Some("50")), Some(50));
+        assert_eq!(parse_wisp_max_iter(Some("0")), Some(0));
+        assert_eq!(parse_wisp_max_iter(Some("nope")), None);
+        assert_eq!(
+            parse_wisp_max_iter(Some("nope")).unwrap_or(DEFAULT_HEADLESS_MAX_ITER),
+            0
+        );
+    }
+
+    #[test]
+    fn wisp_vision_override_parses_set_unset_and_invalid() {
+        assert_eq!(parse_wisp_vision(None), None);
+        assert_eq!(
+            parse_wisp_vision(None).unwrap_or(DEFAULT_HEADLESS_VISION),
+            false
+        );
+        assert_eq!(parse_wisp_vision(Some("0")), Some(false));
+        assert_eq!(parse_wisp_vision(Some("1")), Some(true));
+        assert_eq!(parse_wisp_vision(Some("TRUE")), Some(true));
+        assert_eq!(parse_wisp_vision(Some("off")), Some(false));
+        assert_eq!(parse_wisp_vision(Some("nope")), None);
+        assert_eq!(
+            parse_wisp_vision(Some("nope")).unwrap_or(DEFAULT_HEADLESS_VISION),
+            false
+        );
+    }
+
+    #[test]
+    fn dedicated_vision_model_is_optional_until_any_vision_env_is_set() {
+        assert!(
+            vision_provider_from_values(None, None, None, None, None, None, None)
+                .unwrap()
+                .is_none()
+        );
+        let err =
+            vision_provider_from_values(None, Some("openai"), None, Some("sk"), None, None, None)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("WISP_VISION_MODEL"), "{err}");
+    }
+
+    #[test]
+    fn dedicated_vision_model_falls_back_to_primary_endpoint() {
+        let cfg = vision_provider_from_values(
+            Some("qwen-vl"),
+            None,
+            None,
+            None,
+            Some("openai"),
+            Some("https://api.example.com/v1"),
+            Some("primary-key"),
+        )
+        .unwrap()
+        .expect("vision config");
+        assert_eq!(cfg.model, "qwen-vl");
+        assert_eq!(cfg.base_url, "https://api.example.com/v1");
+        assert_eq!(cfg.api_key, "primary-key");
+    }
+
+    #[test]
+    fn dedicated_vision_model_uses_its_own_provider_url_and_key() {
+        let cfg = vision_provider_from_values(
+            Some("gpt-4o-mini"),
+            Some("openai_responses"),
+            Some("https://api.openai.com/v1"),
+            Some("vision-key"),
+            Some("anthropic"),
+            Some("https://api.anthropic.com"),
+            Some("primary-key"),
+        )
+        .unwrap()
+        .expect("vision config");
+        assert_eq!(cfg.model, "gpt-4o-mini");
+        assert_eq!(cfg.base_url, "https://api.openai.com/v1");
+        assert_eq!(cfg.api_key, "vision-key");
+        assert!(matches!(cfg.kind, wisp_llm::ProviderKind::OpenAiResponses));
+    }
+
+    #[test]
+    fn dedicated_vision_provider_without_url_uses_that_provider_default() {
+        let cfg = vision_provider_from_values(
+            Some("claude-sonnet-5"),
+            Some("anthropic"),
+            None,
+            Some("sk"),
+            Some("openai"),
+            Some("https://api.deepseek.com"),
+            Some("primary-key"),
+        )
+        .unwrap()
+        .expect("vision config");
+        assert_eq!(cfg.base_url, "https://api.anthropic.com");
+        assert!(matches!(cfg.kind, wisp_llm::ProviderKind::Anthropic));
+    }
+
+    #[test]
+    fn dedicated_vision_model_requires_an_api_key() {
+        let err = vision_provider_from_values(
+            Some("qwen-vl"),
+            Some("openai"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("WISP_VISION_API_KEY"), "{err}");
+    }
+
+    #[test]
+    fn wisp_reasoning_effort_override_parses_set_unset_and_invalid() {
+        assert_eq!(parse_wisp_reasoning_effort(None), None);
+        assert_eq!(
+            parse_wisp_reasoning_effort(Some("high")),
+            Some("high".into())
+        );
+        assert_eq!(parse_wisp_reasoning_effort(Some("MAX")), Some("max".into()));
+        assert_eq!(parse_wisp_reasoning_effort(Some("nope")), None);
+        assert_eq!(parse_wisp_reasoning_effort(Some("")), None);
+        assert_eq!(parse_wisp_reasoning_effort(Some("  ")), None);
     }
 }

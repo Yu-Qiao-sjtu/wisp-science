@@ -1,9 +1,10 @@
 use super::AppState;
+use crate::workspace_surface::WorkspaceSurface;
 use base64::Engine;
 use serde::Serialize;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use tauri::{ipc::Response, State, WebviewWindow};
+use tauri::{ipc::Response, State};
 
 const REMOTE_DIR_PROTOCOL: &[u8] = b"WISP_REMOTE_DIR_V1\0";
 const REMOTE_FILE_PROTOCOL: &[u8] = b"WISP_REMOTE_FILE_V1\0";
@@ -29,6 +30,8 @@ pub(super) struct DirEntry {
     name: String,
     is_dir: bool,
     size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modified_unix_millis: Option<u64>,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -213,7 +216,7 @@ fn is_ooxml_path(path: &Path) -> bool {
     )
 }
 
-fn validate_external_relationships(xml: &str) -> Result<(), String> {
+fn validate_external_relationships(xml: &str, part_name: &str) -> Result<(), String> {
     let relationship = regex::Regex::new(r"(?is)<Relationship\b[^>]*>")
         .map_err(|error| format!("could not compile relationship validator: {error}"))?;
     let external = regex::Regex::new(r#"(?i)\bTargetMode\s*=\s*["']External["']"#)
@@ -231,6 +234,20 @@ fn validate_external_relationships(xml: &str) -> Result<(), String> {
             .captures(tag)
             .and_then(|captures| captures.get(1))
             .map(|value| value.as_str().to_ascii_lowercase());
+        // SheetJS displays stored cells/formulas without resolving external
+        // workbook references. Templates commonly retain these links to old
+        // files (including UNC paths); they are not external media to fetch.
+        // Scope this exception to spreadsheet external-link relationship parts.
+        if part_name.starts_with("xl/externallinks/_rels/")
+            && part_name.ends_with(".xml.rels")
+            && matches!(
+                kind.as_deref(),
+                Some("http://schemas.openxmlformats.org/officedocument/2006/relationships/externallinkpath")
+                    | Some("http://purl.oclc.org/ooxml/officedocument/relationships/externallinkpath")
+            )
+        {
+            continue;
+        }
         if !kind
             .as_deref()
             .is_some_and(|kind| kind.ends_with("/hyperlink"))
@@ -323,7 +340,7 @@ pub(super) fn validate_ooxml_archive(bytes: &[u8]) -> Result<(), String> {
             entry
                 .read_to_string(&mut xml)
                 .map_err(|error| format!("could not inspect OOXML relationships: {error}"))?;
-            validate_external_relationships(&xml)?;
+            validate_external_relationships(&xml, &normalized_name)?;
         }
     }
     Ok(())
@@ -482,11 +499,11 @@ fn collect_file_search_hits(
 #[tauri::command]
 pub(super) fn search_files(
     state: State<'_, AppState>,
-    window: WebviewWindow,
+    window: WorkspaceSurface,
     query: String,
     limit: Option<usize>,
 ) -> Result<Vec<FileSearchHit>, String> {
-    let ap = state.active(window.label());
+    let ap = state.require_active(window.label())?;
     let q = query.trim();
     if q.is_empty() {
         return Ok(vec![]);
@@ -506,17 +523,29 @@ pub(super) fn search_files(
 #[tauri::command]
 pub(super) fn list_dir(
     state: State<'_, AppState>,
-    window: WebviewWindow,
+    window: WorkspaceSurface,
     path: Option<String>,
 ) -> Result<Vec<DirEntry>, String> {
-    let ap = state.active(window.label());
+    let ap = state.require_active(window.label())?;
     let rel = path.unwrap_or_else(|| ".".into());
     let dir = wisp_tools::safety::resolve_under_root(&ap.root, &rel)?;
     if !dir.is_dir() {
         return Err(format!("'{}' is not a directory", rel));
     }
+    list_dir_entries(&dir)
+}
+
+fn modified_unix_millis(metadata: &std::fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+}
+
+pub(crate) fn list_dir_entries(dir: &Path) -> Result<Vec<DirEntry>, String> {
     let mut entries = vec![];
-    for ent in std::fs::read_dir(&dir).map_err(|e| format!("{e}"))? {
+    for ent in std::fs::read_dir(dir).map_err(|e| format!("{e}"))? {
         let ent = ent.map_err(|e| format!("{e}"))?;
         let meta = ent.metadata().map_err(|e| format!("{e}"))?;
         let name = ent.file_name().to_string_lossy().into_owned();
@@ -527,6 +556,7 @@ pub(super) fn list_dir(
             name,
             is_dir: meta.is_dir(),
             size: meta.len(),
+            modified_unix_millis: modified_unix_millis(&meta),
         });
     }
     entries.sort_by(|a, b| {
@@ -602,11 +632,62 @@ async fn writable_active_project(
 #[tauri::command]
 pub(super) async fn create_file(
     state: State<'_, AppState>,
-    window: WebviewWindow,
+    window: WorkspaceSurface,
     path: String,
 ) -> Result<(), String> {
     let (project, scope, _activity) = writable_active_project(&state, window.label()).await?;
     create_file_at(&project.root, &path)?;
+    state
+        .store
+        .bump_state_generation(&scope)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Byte ceiling for a user-driven editor save. The center editor refuses to
+/// edit files it could not load in full, so anything larger is a bug or abuse.
+const SAVE_FILE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Existing, fully loaded workspace text only. Comparing the original prevents
+/// an editor left open across an agent write from silently replacing that write.
+pub(super) fn save_file_preview_at(
+    root: &std::path::Path,
+    path: &str,
+    original: &str,
+    text: &str,
+) -> Result<(), String> {
+    let preview = read_file_at(root, path.into(), None)?;
+    if preview.truncated || preview.text.as_deref() != Some(original) {
+        return Err("File changed or was not loaded in full; reopen it before saving".into());
+    }
+    save_file_at(root, path, text)
+}
+
+pub(super) fn save_file_at(root: &Path, path: &str, content: &str) -> Result<(), String> {
+    if content.len() > SAVE_FILE_MAX_BYTES {
+        return Err(format!(
+            "file exceeds {SAVE_FILE_MAX_BYTES} byte save limit"
+        ));
+    }
+    // Existing files only: the editor edits what a preview loaded, and file
+    // creation stays with `create_file` / the agent's write tool.
+    let real = wisp_tools::safety::validate_file_path(root, path)?;
+    std::fs::write(&real, content).map_err(|error| format!("could not save '{path}': {error}"))
+}
+
+/// Persist an edited center-preview source file. User-driven like
+/// `execute_runtime`: the user is looking at the content they typed, so this
+/// deliberately does not route through agent tool approval.
+#[tauri::command]
+pub(super) async fn save_file(
+    state: State<'_, AppState>,
+    window: WorkspaceSurface,
+    path: String,
+    content: String,
+) -> Result<(), String> {
+    let (project, scope, _activity) = writable_active_project(&state, window.label()).await?;
+    save_file_at(&project.root, &path, &content)?;
     state
         .store
         .bump_state_generation(&scope)
@@ -624,7 +705,7 @@ pub(super) fn create_directory_at(root: &Path, path: &str) -> Result<(), String>
 #[tauri::command]
 pub(super) async fn create_directory(
     state: State<'_, AppState>,
-    window: WebviewWindow,
+    window: WorkspaceSurface,
     path: String,
 ) -> Result<(), String> {
     let (project, scope, _activity) = writable_active_project(&state, window.label()).await?;
@@ -664,7 +745,7 @@ pub(super) fn rename_entry_at(root: &Path, path: &str, new_path: &str) -> Result
 #[tauri::command]
 pub(super) async fn rename_entry(
     state: State<'_, AppState>,
-    window: WebviewWindow,
+    window: WorkspaceSurface,
     path: String,
     new_path: String,
 ) -> Result<(), String> {
@@ -693,7 +774,7 @@ pub(super) fn delete_entry_at(root: &Path, path: &str) -> Result<(), String> {
 #[tauri::command]
 pub(super) async fn delete_entry(
     state: State<'_, AppState>,
-    window: WebviewWindow,
+    window: WorkspaceSurface,
     path: String,
 ) -> Result<(), String> {
     let (project, scope, _activity) = writable_active_project(&state, window.label()).await?;
@@ -751,6 +832,9 @@ for entry in ./*; do
     continue
   fi
   name=${{entry#./}}
+  mtime=$(stat -c '%Y' "$entry" 2>/dev/null) ||
+    mtime=$(stat -f '%m' "$entry" 2>/dev/null) ||
+    mtime=0
   if [ -d "$entry" ]; then
     kind=d
     size=0
@@ -760,7 +844,7 @@ for entry in ./*; do
       size=$(stat -f '%z' "$entry" 2>/dev/null) ||
       size=0
   fi
-  printf '%s\000%s\000%s\000' "$kind" "$size" "$name"
+  printf '%s\000%s\000%s\000%s\000' "$kind" "$size" "$mtime" "$name"
 done"#
     ))
 }
@@ -803,11 +887,11 @@ fn parse_remote_directory(stdout: &[u8]) -> Result<DirectoryListing, String> {
     } else {
         records
     };
-    if records.len() % 3 != 0 {
+    if records.len() % 4 != 0 {
         return Err("Remote directory response contained an incomplete entry".into());
     }
-    let mut entries = Vec::with_capacity(records.len() / 3);
-    for record in records.chunks_exact(3) {
+    let mut entries = Vec::with_capacity(records.len() / 4);
+    for record in records.chunks_exact(4) {
         let is_dir = match record[0] {
             b"d" => true,
             b"f" => false,
@@ -817,10 +901,17 @@ fn parse_remote_directory(stdout: &[u8]) -> Result<DirectoryListing, String> {
             .trim()
             .parse::<u64>()
             .map_err(|_| "Remote directory response contained an invalid file size".to_string())?;
+        let mtime_secs = String::from_utf8_lossy(record[2])
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| {
+                "Remote directory response contained an invalid modified time".to_string()
+            })?;
         entries.push(DirEntry {
-            name: String::from_utf8_lossy(record[2]).into_owned(),
+            name: String::from_utf8_lossy(record[3]).into_owned(),
             is_dir,
             size,
+            modified_unix_millis: (mtime_secs > 0).then_some(mtime_secs.saturating_mul(1000)),
         });
     }
     entries.sort_by(|a, b| {
@@ -1254,21 +1345,25 @@ fn file_content_from_bytes(
 #[tauri::command]
 pub(super) fn read_file(
     state: State<'_, AppState>,
-    window: WebviewWindow,
+    window: WorkspaceSurface,
     path: String,
     max_bytes: Option<u64>,
 ) -> Result<FileContent, String> {
-    read_file_at(&state.active(window.label()).root, path, max_bytes)
+    read_file_at(&state.require_active(window.label())?.root, path, max_bytes)
 }
 
 #[tauri::command]
 pub(super) fn read_file_bytes(
     state: State<'_, AppState>,
-    window: WebviewWindow,
+    window: WorkspaceSurface,
     path: String,
     max_bytes: Option<u64>,
 ) -> Result<Response, String> {
-    let bytes = read_file_bytes_at(&state.active(window.label()).root, &path, max_bytes)?;
+    let bytes = read_file_bytes_at(
+        &state.require_active(window.label())?.root,
+        &path,
+        max_bytes,
+    )?;
     Ok(Response::new(bytes))
 }
 
@@ -1334,7 +1429,7 @@ pub(super) fn append_review_note_at(
 #[tauri::command]
 pub(super) async fn append_review_note(
     state: State<'_, AppState>,
-    window: WebviewWindow,
+    window: WorkspaceSurface,
     source_path: String,
     quote: String,
     note: Option<String>,
@@ -1468,6 +1563,8 @@ mod tests {
         assert!(script.contains("WISP_REMOTE_DIR_V1\\000"));
         assert!(script.contains("stat -c '%s'"));
         assert!(script.contains("stat -f '%z'"));
+        assert!(script.contains("stat -c '%Y'"));
+        assert!(script.contains("stat -f '%m'"));
         assert!(!script.contains("wc -c"));
     }
 
@@ -1480,7 +1577,7 @@ mod tests {
     #[test]
     fn remote_directory_runner_parses_banner_and_sorts_directories_first() {
         let identity = test_identity_file();
-        let stdout = b"login banner\nWISP_REMOTE_DIR_V1\0/home/research\0f\012\0notes.txt\0d\00\0projects\0f\03\0a.csv\0".to_vec();
+        let stdout = b"login banner\nWISP_REMOTE_DIR_V1\0/home/research\0f\012\01700000000\0notes.txt\0d\00\01700001000\0projects\0f\03\01700002000\0a.csv\0".to_vec();
         let mut runner = FakeRemoteRunner::returning(RemoteOutput {
             status: 0,
             stdout,
@@ -1496,16 +1593,19 @@ mod tests {
                     name: "projects".into(),
                     is_dir: true,
                     size: 0,
+                    modified_unix_millis: Some(1_700_001_000_000),
                 },
                 DirEntry {
                     name: "a.csv".into(),
                     is_dir: false,
                     size: 3,
+                    modified_unix_millis: Some(1_700_002_000_000),
                 },
                 DirEntry {
                     name: "notes.txt".into(),
                     is_dir: false,
                     size: 12,
+                    modified_unix_millis: Some(1_700_000_000_000),
                 },
             ]
         );
@@ -1642,6 +1742,56 @@ mod tests {
             br#"<Relationships><Relationship Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.org/paper" TargetMode="External"/></Relationships>"#,
         )]);
         validate_ooxml_archive(&safe_link).unwrap();
+    }
+
+    #[test]
+    fn ooxml_validation_accepts_inert_external_workbook_references() {
+        validate_ooxml_archive(include_bytes!(
+            "../../ui-tests/fixtures/office-external-reference.xlsx"
+        ))
+        .unwrap();
+        for namespace in [
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+            "http://purl.oclc.org/ooxml/officeDocument/relationships",
+        ] {
+            for target in [
+                r"\\server\templates\old-order.xls",
+                "https://example.invalid/old.xlsx",
+            ] {
+                let xml = format!(
+                    r#"<Relationships><Relationship Type="{namespace}/externalLinkPath" Target="{target}" TargetMode="External" Id="rId1"/></Relationships>"#
+                );
+                let bytes = test_ooxml(&[(
+                    "xl/externalLinks/_rels/externalLink1.xml.rels",
+                    xml.as_bytes(),
+                )]);
+                validate_ooxml_archive(&bytes).unwrap();
+
+                // The same relationship must not bypass media validation in
+                // a document or drawing part.
+                for part in [
+                    "word/_rels/document.xml.rels",
+                    "xl/drawings/_rels/drawing1.xml.rels",
+                ] {
+                    let bytes = test_ooxml(&[(part, xml.as_bytes())]);
+                    assert!(validate_ooxml_archive(&bytes)
+                        .unwrap_err()
+                        .contains("external media"));
+                }
+            }
+        }
+        for kind in ["image", "externalLinkPathSuffix"] {
+            let xml = format!(
+                r#"<Relationships><Relationship Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/{kind}" Target="https://example.invalid/file" TargetMode="External"/></Relationships>"#
+            );
+            let bytes = test_ooxml(&[(
+                "xl/externalLinks/_rels/externalLink1.xml.rels",
+                xml.as_bytes(),
+            )]);
+            assert!(validate_ooxml_archive(&bytes)
+                .unwrap_err()
+                .contains("external media"));
+        }
     }
 
     #[test]
@@ -1885,6 +2035,45 @@ mod tests {
     }
 
     #[test]
+    fn list_dir_entries_include_size_and_modified_time() {
+        let base = std::env::temp_dir().join(format!(
+            "wisp_list_dir_mtime_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("notes.md"), b"hello").unwrap();
+        std::fs::create_dir(base.join("analysis")).unwrap();
+
+        let entries = list_dir_entries(&base).unwrap();
+        assert_eq!(entries[0].name, "analysis");
+        assert!(entries[0].is_dir);
+        assert!(entries[0].modified_unix_millis.is_some());
+        assert_eq!(entries[1].name, "notes.md");
+        assert!(!entries[1].is_dir);
+        assert_eq!(entries[1].size, 5);
+        let modified = entries[1].modified_unix_millis.expect("mtime");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(
+            now.saturating_sub(modified) < 60_000,
+            "listed mtime {modified} should be recent relative to {now}"
+        );
+
+        let json = serde_json::to_value(&entries[1]).unwrap();
+        assert_eq!(json["size"], 5);
+        assert_eq!(json["modified_unix_millis"], modified);
+        let dto: wisp_dto::DirEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(dto.name, "notes.md");
+        assert_eq!(dto.size, 5);
+        assert_eq!(dto.modified_unix_millis, Some(modified));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn workspace_entry_operations_create_rename_and_delete_files_and_directories() {
         let base = std::env::temp_dir().join(format!(
             "wisp_file_operations_test_{}_{}",
@@ -1909,6 +2098,28 @@ mod tests {
         delete_entry_at(&base, "results").unwrap();
         assert!(!base.join("notes.md").exists());
         assert!(!base.join("results").exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn save_file_at_overwrites_in_root_and_rejects_escapes() {
+        let base = std::env::temp_dir().join(format!(
+            "wisp_save_file_test_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("analysis.R"), b"plot(1:3)\n").unwrap();
+
+        save_file_at(&base, "analysis.R", "plot(4:6)\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(base.join("analysis.R")).unwrap(),
+            "plot(4:6)\n"
+        );
+
+        // The editor saves what a preview loaded; escapes stay rejected.
+        assert!(save_file_at(&base, "../outside.R", "x").is_err());
 
         let _ = std::fs::remove_dir_all(&base);
     }

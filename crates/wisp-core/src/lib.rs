@@ -3,20 +3,47 @@
 
 pub mod agent;
 pub mod archive;
+pub mod bridge_checkpoint;
+pub mod claim_record;
 pub mod context;
 pub mod delegation;
 pub mod delegation_policy;
 pub mod execution;
+pub mod guardrail;
 pub mod memory;
 pub mod method_search;
+pub mod observability;
 pub mod orchestration;
 pub mod output;
 pub mod provenance;
+pub mod release_gate;
+pub mod scientific_intent;
+pub mod session_locks;
+pub mod specialist_manifest;
 pub mod subagent;
 pub mod system_prompt;
+pub mod workflow_conversion;
 
-pub use agent::{agent_loop, agent_loop_continue, AgentLoopOutcome, GuidanceQueue};
-pub use context::{ContextManager, ContextToolDetail, ContextUsage, ContextUsageDetails};
+pub use agent::{
+    agent_loop, agent_loop_continue, bound_tool_results_in_history, AgentLoopOutcome, GuidanceQueue,
+};
+pub use bridge_checkpoint::{
+    checkpoint_for_outcome, checkpoint_resume_injection, latest_pending_checkpoint,
+    persist_checkpoint, persist_checkpoint_file, resume_bridge_checkpoint, BridgeCheckpoint,
+    CheckpointState, ContractDigests, ResumeAction, ResumeEnvironment, ResumeOutcome,
+    BRIDGE_CHECKPOINT_CONTRACT, BRIDGE_CHECKPOINT_SCHEMA_VERSION,
+};
+pub use claim_record::{
+    claims_from_output, rewrite_unsupported_claims, validate_claims, ClaimCheck, ClaimCheckCode,
+    ClaimGroundingCatalog, ClaimKind, ClaimPersistHook, ClaimRecord, ClaimSourceKind,
+    ClaimSourceRef, ClaimValidationReport, GroundedArtifact, GroundedEvidence, GroundedPaper,
+    GroundedRun, CLAIM_RECORD_CONTRACT, CLAIM_RECORD_SCHEMA_VERSION,
+};
+pub use context::{
+    repair_unpaired_tool_calls, tool_call_pairing, unpaired_tool_call_ids, CompactIntent,
+    CompactionKind, CompactionOutcome, ContextManager, ContextToolDetail, ContextUsage,
+    ContextUsageDetails, COMPACTION_SUMMARY_PREFIX, UNPAIRED_ON_LOAD_RESULT,
+};
 pub use delegation::{
     degraded_delivery_marker, is_degraded_delivery, AgentArtifact, AgentAuthorizationSnapshot,
     AgentBackend, AgentBudget, AgentDelegationLineage, AgentDelegationRequest,
@@ -36,8 +63,19 @@ pub use execution::{
     DelegationExecutor, DelegationStepExecution, NoopDelegationObserver, WorkflowRunActivityDriver,
     WorkflowRunActivityRequest,
 };
+pub use guardrail::{
+    evaluate_final_output, evaluate_handoff, evaluate_tool_input, DispatchPath, GuardrailChain,
+    GuardrailContext, GuardrailDecision, GuardrailOutcome, GuardrailSeverity,
+    GUARDRAIL_CONTRACT_ID,
+};
 pub use memory::{
     MemoryManager, MemorySearchQuery, MemorySearchRequest, MemorySearchResponse, MemorySearchResult,
+};
+pub use observability::{
+    host_agent_observability, slo_from_document, AgentSloSnapshot, AgentTrace, CapturePolicy,
+    ErrorClass, HostObservabilityConfig, ObservabilityHost, RetentionPolicy, Span, SpanGuard,
+    SpanKind, SpanStatus, TraceContext, TraceDocument, TurnIdentity, OBSERVABILITY_CONTRACT_ID,
+    TRACE_FORMAT, TRACE_FORMAT_VERSION,
 };
 pub use orchestration::{
     DelegationMode, DelegationPlan, DelegationPlanStep, RunActivitySpec, WorkflowTaskKind,
@@ -45,6 +83,23 @@ pub use orchestration::{
 };
 pub use output::{NullOutput, Output, OutputFuture, StreamSinkAdapter, ToolEnvAdapter};
 pub use provenance::ProvenanceRecord;
+pub use release_gate::{
+    build_release_gate, load_bundled_depmap_acu_corpus, load_bundled_depmap_release_lock,
+    load_bundled_depmap_server_contract, replay_acu, replay_acu_prompt, validate_acu_corpus,
+    validate_acu_evidence, validate_release_canary, AcuBudget, AcuCase, AcuCompletionFixture,
+    AcuCorpus, AcuCoverageState, AcuEvidenceFixture, AcuEvidenceInvariant, AcuFixture,
+    AcuPromptMapping, AcuReplay, CapabilityClosureRow, DepMapServerContractSnapshot,
+    ReleaseCanaryObservation, ReleaseCanaryPolicy, ReleaseContractDigests, ReleaseContractLock,
+    ReleaseGateArtifact, ReleaseGateBlocker, ReleaseGateBlockerKind, ReleaseGateInputs,
+    ACU_CORPUS_SCHEMA, DEPMAP_SERVER_CONTRACT_SCHEMA, RELEASE_CONTRACT_LOCK_SCHEMA,
+    RELEASE_GATE_SCHEMA,
+};
+pub use scientific_intent::{
+    host_scientific_bridge, install_scientific_intent_planner,
+    install_scientific_intent_planner_in, plan_scientific_intent, IntentCatalog, PlannerDecision,
+    PlannerOutcome, ScientificIntent, ToolCatalog, INTENT_SCHEMA_VERSION, PLANNER_CONTRACT_ID,
+    SCIENTIFIC_INTENT_PLAN_TOOL,
+};
 pub use subagent::ExploreTool;
 pub use system_prompt::SystemPrompt;
 
@@ -96,24 +151,53 @@ impl Agent {
         memory_enabled: bool,
         vision_cfg: Option<ProviderConfig>,
     ) -> Self {
+        let mut agent = Self::new_without_session_file(
+            cfg,
+            skills,
+            memory,
+            root,
+            max_context,
+            max_iter,
+            memory_enabled,
+            vision_cfg,
+        );
+        agent.ctx.load(&agent.session_path);
+        agent
+    }
+
+    /// Desktop constructor: empty context, no `.wisp/session.json` load.
+    ///
+    /// CLI/headless should keep using [`Self::new`], which still hydrates the
+    /// project-level session file. Desktop turns load SQLite history afterward
+    /// and must fail closed if that load fails — leftover CLI or other-session
+    /// messages in the project file must never enter the model context.
+    pub fn new_without_session_file(
+        cfg: ProviderConfig,
+        skills: Arc<SkillIndex>,
+        memory: Arc<MemoryManager>,
+        root: PathBuf,
+        max_context: usize,
+        max_iter: usize,
+        memory_enabled: bool,
+        vision_cfg: Option<ProviderConfig>,
+    ) -> Self {
         let provider = wisp_llm::build(cfg.clone());
-        let vision_provider = vision_cfg.map(wisp_llm::build);
+        let vision_provider = vision_cfg
+            .map(|vision| wisp_llm::build(vision.with_session_id(cfg.session_id.clone())));
         let mut tools = build_registry(skills, memory, memory_enabled);
         // The explore subagent shares the primary model but runs in its own
         // context; only its anchor (stats + conclusion + trace path) lands in
         // the main context.
-        tools.add(Box::new(subagent::ExploreTool::new(
-            Arc::from(wisp_llm::build(cfg)),
+        tools.add(Box::new(subagent::ExploreTool::from_config(
+            cfg,
             max_context,
         )));
         let session_path = root.join(".wisp").join("session.json");
-        let mut ctx = ContextManager::new(max_context);
-        ctx.load(&session_path);
         Self {
             provider,
             vision_provider,
             tools,
-            ctx,
+            ctx: ContextManager::new(max_context),
             root,
             max_iter,
             session_path,
@@ -170,13 +254,14 @@ impl Agent {
         )
     }
 
-    /// Seed a fresh system prompt or refresh its catalog-free skills section.
+    /// Seed a fresh system prompt or refresh host execution and skills guidance.
     pub fn seed_system_prompt(&mut self, skills: &SkillIndex, compute_hosts: Option<String>) {
         let system_prompt = SystemPrompt::new(&self.root, skills, compute_hosts);
         if self.ctx.is_empty() {
             self.ctx.append_system(system_prompt.assemble());
         } else if let Some(message) = self.ctx.messages.first_mut() {
             if let wisp_llm::Content::Text(prompt) = &mut message.content {
+                system_prompt.refresh_execution_guidance(prompt);
                 system_prompt.refresh_skills_guidance(prompt);
             }
         }
@@ -254,6 +339,25 @@ impl Agent {
     /// checkpoint plus a bounded recent tail (see `ContextManager::compact`).
     /// Returns (before, after) estimated tokens and the archive path.
     pub async fn compact(&mut self) -> Result<(usize, usize, PathBuf), String> {
+        self.compact_with_instruction(None).await
+    }
+
+    /// User-triggered `/compact` with an optional instruction that shapes the
+    /// semantic checkpoint without becoming a conversation turn.
+    pub async fn compact_with_instruction(
+        &mut self,
+        custom_instruction: Option<&str>,
+    ) -> Result<(usize, usize, PathBuf), String> {
+        self.compact_with_intent(custom_instruction, CompactIntent::Auto)
+            .await
+    }
+
+    /// Compact with an explicit prune-only or force-semantic intent.
+    pub async fn compact_with_intent(
+        &mut self,
+        custom_instruction: Option<&str>,
+        intent: CompactIntent,
+    ) -> Result<(usize, usize, PathBuf), String> {
         let archive_id = uuid::Uuid::new_v4().simple().to_string();
         let archive = self
             .root
@@ -265,11 +369,13 @@ impl Agent {
         let fixed_tokens = ContextManager::estimated_tool_tokens(&schemas);
         let (before, after) = self
             .ctx
-            .compact_with_reserve_reference(
+            .compact_with_intent(
                 self.provider.as_ref(),
                 &archive,
                 fixed_tokens,
                 &archive_reference,
+                custom_instruction,
+                intent,
             )
             .await?;
         Ok((before, after, archive))
@@ -291,6 +397,17 @@ impl Agent {
     pub fn save(&self) {
         self.ctx.save(&self.session_path);
     }
+}
+
+/// Map a desktop SQLite `load_messages` result into a fail-closed turn error.
+///
+/// Desktop agents are constructed with [`Agent::new_without_session_file`], so
+/// a leftover `.wisp/session.json` is never in context. Callers must not fall
+/// back to that file when this returns `Err`.
+pub fn require_sqlite_session_messages<E: std::fmt::Display>(
+    loaded: Result<Vec<wisp_llm::Message>, E>,
+) -> Result<Vec<wisp_llm::Message>, String> {
+    loaded.map_err(|error| format!("Failed to load session messages from SQLite: {error}"))
 }
 
 // --- memory tools ---
@@ -383,5 +500,120 @@ mod memory_tool_tests {
             "queries": [{ "text": "cohort", "kind": "exact", "extra": true }]
         }))
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod session_ctor_tests {
+    use super::*;
+    use wisp_llm::ProviderConfig;
+
+    fn leftover_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "wisp-session-ctor-{label}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join(".wisp")).unwrap();
+        root
+    }
+
+    fn leftover_cfg() -> ProviderConfig {
+        ProviderConfig::openai("http://127.0.0.1:9/v1", "sk-test", "test-model")
+    }
+
+    fn write_leftover_session(root: &std::path::Path) {
+        let mut ctx = ContextManager::new(1_000);
+        ctx.append_user("leftover from another session");
+        ctx.save(&root.join(".wisp").join("session.json"));
+    }
+
+    fn construct(root: PathBuf, without_session_file: bool) -> Agent {
+        let skills = Arc::new(SkillIndex::load(&[]));
+        let memory = Arc::new(MemoryManager::new(&root));
+        if without_session_file {
+            Agent::new_without_session_file(
+                leftover_cfg(),
+                skills,
+                memory,
+                root,
+                8_000,
+                4,
+                false,
+                None,
+            )
+        } else {
+            Agent::new(leftover_cfg(), skills, memory, root, 8_000, 4, false, None)
+        }
+    }
+
+    #[test]
+    fn new_loads_project_session_json() {
+        let root = leftover_root("cli");
+        write_leftover_session(&root);
+        let agent = construct(root.clone(), false);
+        assert_eq!(agent.ctx.messages.len(), 1);
+        assert!(
+            agent.ctx.messages[0]
+                .content
+                .as_text()
+                .contains("leftover from another session"),
+            "CLI/headless Agent::new must still hydrate .wisp/session.json"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn new_without_session_file_ignores_leftover_session_json() {
+        let root = leftover_root("desktop");
+        write_leftover_session(&root);
+        let agent = construct(root.clone(), true);
+        assert!(
+            agent.ctx.is_empty(),
+            "desktop constructor must not read leftover .wisp/session.json"
+        );
+        assert_eq!(
+            agent.session_path,
+            root.join(".wisp").join("session.json"),
+            "session_path stays available for an explicit later save"
+        );
+        assert!(agent.session_path.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resumed_agent_refreshes_execution_rules_without_losing_history() {
+        let root = leftover_root("execution-guidance");
+        let mut ctx = ContextManager::new(8_000);
+        ctx.append_system("Intro\n\n## Tool Selection\n\nOld runtime preference.\n\n## User Rules\n\nKeep my instructions.");
+        ctx.append_user("Continue the project task.");
+        ctx.save(&root.join(".wisp/session.json"));
+        let mut agent = construct(root.clone(), false);
+        agent.seed_system_prompt(&SkillIndex::default(), None);
+        assert_eq!(agent.ctx.messages.len(), 2);
+        let prompt = agent.ctx.messages[0].content.as_text();
+        assert!(prompt.contains("provide persistent runtimes"));
+        assert!(!prompt.contains("Old runtime preference"));
+        assert!(prompt.ends_with("## User Rules\n\nKeep my instructions."));
+        assert_eq!(
+            agent.ctx.messages[1].content.as_text(),
+            "Continue the project task."
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn require_sqlite_session_messages_fails_closed() {
+        let loaded: Result<Vec<wisp_llm::Message>, &str> =
+            Ok(vec![wisp_llm::Message::user("from store")]);
+        let ok = require_sqlite_session_messages(loaded);
+        assert_eq!(ok.unwrap().len(), 1);
+
+        let err = require_sqlite_session_messages::<&str>(Err("disk full")).unwrap_err();
+        assert!(
+            err.contains("Failed to load session messages from SQLite"),
+            "desktop turns must surface a clear SQLite failure: {err}"
+        );
+        assert!(err.contains("disk full"), "{err}");
     }
 }

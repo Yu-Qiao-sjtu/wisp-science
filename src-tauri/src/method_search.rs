@@ -901,20 +901,20 @@ async fn method_search_details(
 #[tauri::command]
 pub(crate) async fn get_method_search_run(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     run_id: String,
 ) -> Result<MethodSearchRunDetails, String> {
-    let project = state.active(window.label());
+    let project = state.require_active(window.label())?;
     method_search_details(&state.store, &project.root, &project.id, &run_id).await
 }
 
 #[tauri::command]
 pub(crate) async fn pause_method_search(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     run_id: String,
 ) -> Result<MethodSearchRunDetails, String> {
-    let project = state.active(window.label());
+    let project = state.require_active(window.label())?;
     let _activity = state.begin_project_activity(&project.id)?;
     method_search_details(&state.store, &project.root, &project.id, &run_id).await?;
     if !state
@@ -934,6 +934,7 @@ async fn continue_recovered_workflow(
     run_manager: crate::run_context::RunManager,
     runtime_manager: wisp_runtime::RuntimeManager,
     app_data: PathBuf,
+    browser_bridge: std::sync::Arc<crate::browser_bridge::BrowserBridge>,
     run_id: String,
 ) {
     let workflow_id = match crate::method_search_coordinator::settle_linked_workflow_attempt(
@@ -954,6 +955,7 @@ async fn continue_recovered_workflow(
             run_manager,
             runtime_manager,
             app_data,
+            Some(browser_bridge),
             &workflow_id,
         )
         .await
@@ -966,7 +968,7 @@ async fn continue_recovered_workflow(
 #[tauri::command]
 pub(crate) async fn start_method_search(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     run_id: String,
 ) -> Result<MethodSearchRunDetails, String> {
     let (project, scope) =
@@ -992,6 +994,7 @@ pub(crate) async fn start_method_search(
     let generator = crate::method_search_coordinator::ProviderCandidateGenerator::from_profile(
         &state.store,
         &model_profile_id,
+        &run_id,
     )
     .await?;
     if crate::method_search_coordinator::method_search_is_active(&run_id) {
@@ -1018,6 +1021,7 @@ pub(crate) async fn start_method_search(
     let run_manager = state.run_manager.clone();
     let runtime_manager = state.runtime_manager.clone();
     let app_data = state.app_data.clone();
+    let browser_bridge = state.browser_bridge.clone();
     let run_id_for_task = run_id.clone();
     let project_for_task = project.clone();
     tauri::async_runtime::spawn(async move {
@@ -1040,6 +1044,7 @@ pub(crate) async fn start_method_search(
                     run_manager,
                     runtime_manager,
                     app_data,
+                    browser_bridge,
                     run_id_for_task,
                 )
                 .await;
@@ -1052,6 +1057,7 @@ pub(crate) async fn start_method_search(
                     run_manager,
                     runtime_manager,
                     app_data,
+                    browser_bridge,
                     run_id_for_task,
                 )
                 .await;
@@ -1064,7 +1070,7 @@ pub(crate) async fn start_method_search(
 #[tauri::command]
 pub(crate) async fn resume_method_search(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     run_id: String,
 ) -> Result<MethodSearchRunDetails, String> {
     let (project, scope) =
@@ -1099,6 +1105,7 @@ pub(crate) async fn resume_method_search(
     let generator = crate::method_search_coordinator::ProviderCandidateGenerator::from_profile(
         &state.store,
         &model_profile_id,
+        &run_id,
     )
     .await?;
     let guard = crate::method_search_coordinator::ActiveMethodSearchGuard::claim(&run_id)?;
@@ -1114,6 +1121,7 @@ pub(crate) async fn resume_method_search(
     let run_manager = state.run_manager.clone();
     let runtime_manager = state.runtime_manager.clone();
     let app_data = state.app_data.clone();
+    let browser_bridge = state.browser_bridge.clone();
     let run_id_for_task = run_id.clone();
     let project_for_task = project.clone();
     tauri::async_runtime::spawn(async move {
@@ -1136,6 +1144,7 @@ pub(crate) async fn resume_method_search(
                     run_manager,
                     runtime_manager,
                     app_data,
+                    browser_bridge,
                     run_id_for_task,
                 )
                 .await;
@@ -1148,6 +1157,7 @@ pub(crate) async fn resume_method_search(
                     run_manager,
                     runtime_manager,
                     app_data,
+                    browser_bridge,
                     run_id_for_task,
                 )
                 .await;
@@ -1160,10 +1170,10 @@ pub(crate) async fn resume_method_search(
 #[tauri::command]
 pub(crate) async fn cancel_method_search(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     run_id: String,
 ) -> Result<MethodSearchRunDetails, String> {
-    let project = state.active(window.label());
+    let project = state.require_active(window.label())?;
     let _activity = state.begin_project_activity(&project.id)?;
     let details = method_search_details(&state.store, &project.root, &project.id, &run_id).await?;
     if details.run.status.is_terminal() {
@@ -1187,6 +1197,7 @@ pub(crate) async fn cancel_method_search(
         let run_manager = state.run_manager.clone();
         let runtime_manager = state.runtime_manager.clone();
         let app_data = state.app_data.clone();
+        let browser_bridge = state.browser_bridge.clone();
         let project_for_task = project.clone();
         let run_id_for_task = run_id.clone();
         tauri::async_runtime::spawn(async move {
@@ -1205,6 +1216,7 @@ pub(crate) async fn cancel_method_search(
                 run_manager,
                 runtime_manager,
                 app_data,
+                browser_bridge,
                 run_id_for_task,
             )
             .await;

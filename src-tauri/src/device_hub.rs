@@ -178,8 +178,10 @@ impl DeviceHub {
             AgentEvent::MessageBoundary { .. }
             | AgentEvent::Resources { .. }
             | AgentEvent::ToolPresentation { .. }
+            | AgentEvent::AppContextUpdate { .. }
             | AgentEvent::Usage { .. }
             | AgentEvent::Compaction { .. }
+            | AgentEvent::CompactionUndone { .. }
             | AgentEvent::ContextWarning { .. }
             | AgentEvent::Diff { .. }
             | AgentEvent::FileChanged { .. } => return,
@@ -264,7 +266,7 @@ fn snapshot_from(state: &HubState) -> PetStateSnapshot {
     PetStateSnapshot {
         message_type: "pet_state",
         state: pet_state,
-        project: "Wisp Science",
+        project: "wisp-depmap",
         label: pet_state.label(),
         session_id,
         seq: state.seq,
@@ -293,6 +295,7 @@ mod tests {
             AgentEvent::User {
                 frame_id: "a".into(),
                 text: "prompt".into(),
+                queue_id: None,
             },
             text("a"),
             AgentEvent::Reasoning {
@@ -313,6 +316,7 @@ mod tests {
                 name: "read_file".into(),
                 ok: true,
                 content: "ok".into(),
+                structured_content: None,
                 duration_ms: 1,
             },
             AgentEvent::CorrectionStarted {
@@ -350,6 +354,7 @@ mod tests {
                 name: "shell".into(),
                 ok: false,
                 content: "failed".into(),
+                structured_content: None,
                 duration_ms: 1,
             },
             None,

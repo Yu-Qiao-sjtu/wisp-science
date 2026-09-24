@@ -18,14 +18,15 @@ use wisp_acp::{
     AcpUsageUpdate,
 };
 use wisp_core::{
-    AgentArtifact, AgentBackend, AgentBudget, AgentDelegationLineage, AgentDelegationRequest,
-    AgentDelegationResponse, AgentDelegator, AgentEvidence, AgentExecutorRef, AgentOrigin,
-    AgentOutputSchemaSource, AgentRole, AgentSessionPolicy, AgentSpec, AgentUsage,
-    CapabilityRegistry, ContextPolicy, DelegationExecutionObserver, DelegationExecutionResult,
-    DelegationExecutionStatus, DelegationExecutor, DelegationHostPolicy, DelegationMode,
-    DelegationPlan, DelegationStatus, ExecutorFeature, ExecutorProfilePolicy, ModelFeature,
-    ModelProfilePolicy, PermissionSet, ValidatedAgentDelegationRequest,
-    DYNAMIC_DELEGATION_SCHEMA_VERSION,
+    host_agent_observability, AgentArtifact, AgentBackend, AgentBudget, AgentDelegationLineage,
+    AgentDelegationRequest, AgentDelegationResponse, AgentDelegator, AgentEvidence,
+    AgentExecutorRef, AgentOrigin, AgentOutputSchemaSource, AgentRole, AgentSessionPolicy,
+    AgentSpec, AgentTrace, AgentUsage, CapabilityRegistry, ContextPolicy,
+    DelegationExecutionObserver, DelegationExecutionResult, DelegationExecutionStatus,
+    DelegationExecutor, DelegationHostPolicy, DelegationMode, DelegationPlan, DelegationStatus,
+    ExecutorFeature, ExecutorProfilePolicy, HostObservabilityConfig, ModelFeature,
+    ModelProfilePolicy, ObservabilityHost, PermissionSet, SpanKind,
+    ValidatedAgentDelegationRequest, DYNAMIC_DELEGATION_SCHEMA_VERSION,
 };
 use wisp_llm::Message;
 use wisp_store::{
@@ -149,10 +150,10 @@ pub(crate) fn sync_delegation_prompt(prompt: &mut String, enabled: bool) {
 #[tauri::command]
 pub(crate) async fn get_session_delegation_enabled(
     state: State<'_, crate::AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     session_id: String,
 ) -> Result<bool, String> {
-    let project = state.active(window.label());
+    let project = state.require_active(window.label())?;
     ensure_project_frame(&state.store, &project.id, &session_id).await?;
     Ok(session_delegation_enabled(&state.store, &session_id).await)
 }
@@ -160,7 +161,7 @@ pub(crate) async fn get_session_delegation_enabled(
 #[tauri::command]
 pub(crate) async fn set_session_delegation_enabled(
     state: State<'_, crate::AppState>,
-    _window: tauri::WebviewWindow,
+    _window: crate::workspace_surface::WorkspaceSurface,
     session_id: String,
     enabled: bool,
 ) -> Result<bool, String> {
@@ -181,17 +182,17 @@ pub(crate) async fn set_session_delegation_enabled(
 #[tauri::command]
 pub(crate) async fn list_agent_workflows(
     state: State<'_, crate::AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     session_id: Option<String>,
 ) -> Result<Vec<AgentWorkflowSnapshot>, String> {
-    let project = state.active(window.label());
+    let project = state.require_active(window.label())?;
     let Some(session_id) = session_id else {
         return Ok(vec![]);
     };
     load_agent_workflow_snapshots(&state.store, &project.id, Some(&session_id)).await
 }
 
-async fn load_agent_workflow_snapshots(
+pub(crate) async fn load_agent_workflow_snapshots(
     store: &Store,
     project_id: &str,
     session_id: Option<&str>,
@@ -310,10 +311,17 @@ fn root_limits_for_plan(
         },
         max_tasks: MAX_ROOT_AGENT_TASKS,
         max_parallel: u32::try_from(plan.max_parallel).unwrap_or(2).clamp(1, 2),
+        // Per-task max_tokens limits generated output, while root accounting
+        // intentionally includes both input and output tokens. Scientific
+        // workflows that read several bounded artifacts can therefore consume
+        // substantially more root input than the sum of their output ceilings.
+        // Keep the aggregate guard bounded, but provide four times the legacy
+        // allowance so a valid five-node fan-in can reach synthesis.
         max_tokens: multiply(
             host.budget_ceiling.max_tokens.map(u64::from),
             defaults.max_tokens / u64::from(MAX_ROOT_AGENT_TASKS),
-        ),
+        )
+        .max(defaults.max_tokens.saturating_mul(4)),
         max_tool_calls: multiply(
             host.budget_ceiling.max_tool_calls.map(u64::from),
             defaults.max_tool_calls / u64::from(MAX_ROOT_AGENT_TASKS),
@@ -322,10 +330,14 @@ fn root_limits_for_plan(
             host.budget_ceiling.max_cost_microunits,
             defaults.max_cost_microunits / u64::from(MAX_ROOT_AGENT_TASKS),
         ),
-        wall_time_secs: host
-            .timeout_ceiling_secs
-            .or(host.default_timeout_secs)
-            .unwrap_or(defaults.wall_time_secs),
+        // A finite batch deadline is the sum of its per-task limits, so serial
+        // tasks do not consume one another's allowance. Any unlimited task
+        // makes the root deadline unlimited as well.
+        wall_time_secs: plan.steps.iter().try_fold(0_u64, |total, step| {
+            step.spec
+                .timeout_secs
+                .map(|seconds| total.saturating_add(seconds))
+        }),
     }
 }
 
@@ -409,18 +421,22 @@ pub(crate) async fn create_dynamic_agent_workflow_draft(
     .await
 }
 
+/// Workflow Studio editor options for the window's bound project.
+/// File → New Window (`home-*`) has no project yet; return an error instead of
+/// panicking, which would exit every open window.
 #[tauri::command]
 pub(crate) async fn get_dynamic_agent_options(
     state: State<'_, crate::AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
 ) -> Result<dynamic_workflow::DynamicAgentEditorOptions, String> {
-    let project = state.active(window.label());
+    let project = state.require_active(window.label())?;
     let frame_id = state.active_frame(window.label());
     let policy = dynamic_delegation_policy_for_project(
         &state.store,
         &project,
         frame_id.as_deref(),
         &state.app_data,
+        true,
     )
     .await?;
     let mut options =
@@ -576,11 +592,11 @@ pub(crate) async fn load_agent_workflow_result(
 #[tauri::command]
 pub(crate) async fn get_agent_workflow_result(
     state: State<'_, crate::AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     workflow_id: String,
     step_id: String,
 ) -> Result<AgentWorkflowResultDetail, String> {
-    let project = state.active(window.label());
+    let project = state.require_active(window.label())?;
     load_agent_workflow_result(&state.store, &project.id, &workflow_id, &step_id).await
 }
 
@@ -602,7 +618,34 @@ async fn load_workflow_snapshot(
         .map_err(|error| error.to_string())?;
     let plan = stored_dynamic_plan(&workflow)?;
     let approval_policy = dynamic_workflow::AgentApprovalPolicy::from_mode(plan.mode);
-    let dynamic = dynamic_workflow::summarize(&plan, &attempts)?;
+    let mut dynamic = dynamic_workflow::summarize(&plan, &attempts)?;
+    for task in &mut dynamic.tasks {
+        let Some(result) = task.result.as_mut() else {
+            continue;
+        };
+        let Some(child_frame_id) = result.child_frame_id.as_deref() else {
+            continue;
+        };
+        let (message_count, live_tool_calls, last_activity_at) = store
+            .frame_message_activity(child_frame_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        result.activity_messages = message_count;
+        // A child frame may exist before its first message is committed. Keep
+        // the attempt heartbeat as a fallback instead of replacing it with
+        // `None`, otherwise the UI looks frozen during model startup.
+        result.last_activity_at = last_activity_at.or(result.last_activity_at);
+        // Terminal usage remains authoritative when it exists. A timed-out or
+        // still-running attempt can have zero finalized usage despite dozens
+        // of already-persisted tool results, so fill that blind spot only.
+        if result.tool_calls == 0 {
+            result.tool_calls = live_tool_calls;
+        }
+        result.research_progress =
+            crate::research_progress::latest_research_progress(store, child_frame_id)
+                .await
+                .map_err(|error| error.to_string())?;
+    }
     Ok(AgentWorkflowSnapshot {
         workflow,
         steps,
@@ -635,13 +678,41 @@ pub(crate) async fn approve_created_automatic_workflow(
 #[tauri::command]
 pub(crate) async fn approve_agent_workflow(
     state: State<'_, crate::AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     workflow_id: String,
     expected_version: i64,
 ) -> Result<AgentWorkflowSnapshot, String> {
-    let project = state.active(window.label());
+    let project = state.require_active(window.label())?;
+    approve_agent_workflow_for_project(&state, project, workflow_id, expected_version).await
+}
+
+pub(crate) async fn approve_agent_workflow_for_project(
+    state: &crate::AppState,
+    project: ActiveProject,
+    workflow_id: String,
+    expected_version: i64,
+) -> Result<AgentWorkflowSnapshot, String> {
     let current = project_workflow(&state.store, &project.id, &workflow_id).await?;
     require_workflow_delegation(&state.store, &current).await?;
+    if stored_dynamic_plan(&current)?
+        .steps
+        .iter()
+        .any(|step| !step.spec.skill_bindings.is_empty())
+    {
+        return Err(wisp_core::workflow_conversion::LEGACY_WORKFLOW_ERROR.into());
+    }
+    let policy = dynamic_delegation_policy_for_project(
+        &state.store,
+        &project,
+        current.frame_id.as_deref(),
+        &state.app_data,
+        true,
+    )
+    .await?;
+    policy
+        .registry
+        .validate_resolved_plan(&stored_dynamic_plan(&current)?, &policy.host)
+        .map_err(|e| e.to_string())?;
     let automatic = current.mode == "automatic";
     if !state
         .store
@@ -662,10 +733,10 @@ pub(crate) async fn approve_agent_workflow(
 #[tauri::command]
 pub(crate) async fn cancel_agent_workflow(
     state: State<'_, crate::AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     workflow_id: String,
 ) -> Result<(), String> {
-    let project = state.active(window.label());
+    let project = state.require_active(window.label())?;
     let workflow = project_workflow(&state.store, &project.id, &workflow_id).await?;
     if workflow.status != AgentWorkflowStatus::Running {
         return Err("Only a running Agent workflow can be cancelled.".into());
@@ -685,10 +756,10 @@ pub(crate) async fn cancel_agent_workflow(
 #[tauri::command]
 pub(crate) async fn discard_agent_workflow(
     state: State<'_, crate::AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     workflow_id: String,
 ) -> Result<(), String> {
-    let project = state.active(window.label());
+    let project = state.require_active(window.label())?;
     let workflow = project_workflow(&state.store, &project.id, &workflow_id).await?;
     // Cancel a running workflow before discarding; deleting mid-flight would
     // orphan the live attempt.
@@ -706,19 +777,36 @@ pub(crate) async fn discard_agent_workflow(
 #[tauri::command]
 pub(crate) async fn retry_agent_workflow(
     state: State<'_, crate::AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     workflow_id: String,
     budget_overrides: Option<HashMap<String, dynamic_workflow::AgentBudgetProposal>>,
 ) -> Result<AgentWorkflowSnapshot, String> {
-    let project = state.active(window.label());
+    let project = state.require_active(window.label())?;
+    retry_agent_workflow_for_project(
+        &state,
+        project,
+        state.active_frame(window.label()),
+        workflow_id,
+        budget_overrides,
+    )
+    .await
+}
+
+pub(crate) async fn retry_agent_workflow_for_project(
+    state: &crate::AppState,
+    project: ActiveProject,
+    frame_id: Option<String>,
+    workflow_id: String,
+    budget_overrides: Option<HashMap<String, dynamic_workflow::AgentBudgetProposal>>,
+) -> Result<AgentWorkflowSnapshot, String> {
     let snapshot = match budget_overrides.filter(|overrides| !overrides.is_empty()) {
         Some(overrides) => {
-            let frame_id = state.active_frame(window.label());
             let policy = dynamic_delegation_policy_for_project(
                 &state.store,
                 &project,
                 frame_id.as_deref(),
                 &state.app_data,
+                true,
             )
             .await?;
             prepare_agent_workflow_budget_retry(
@@ -911,6 +999,13 @@ pub(crate) async fn prepare_agent_workflow_retry(
 ) -> Result<AgentWorkflowSnapshot, String> {
     let workflow = project_workflow(store, project_id, workflow_id).await?;
     require_workflow_delegation(store, &workflow).await?;
+    if stored_dynamic_plan(&workflow)?
+        .steps
+        .iter()
+        .any(|step| !step.spec.skill_bindings.is_empty())
+    {
+        return Err(wisp_core::workflow_conversion::LEGACY_WORKFLOW_ERROR.into());
+    }
     if !matches!(
         workflow.status,
         AgentWorkflowStatus::Failed | AgentWorkflowStatus::Cancelled
@@ -935,10 +1030,18 @@ pub(crate) async fn prepare_agent_workflow_retry(
 #[tauri::command]
 pub(crate) async fn run_agent_workflow(
     state: State<'_, crate::AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     workflow_id: String,
 ) -> Result<DelegationExecutionResult, String> {
-    let project = state.active(window.label());
+    let project = state.require_active(window.label())?;
+    run_agent_workflow_for_project(&state, project, workflow_id).await
+}
+
+pub(crate) async fn run_agent_workflow_for_project(
+    state: &crate::AppState,
+    project: ActiveProject,
+    workflow_id: String,
+) -> Result<DelegationExecutionResult, String> {
     let _project_activity = state.begin_project_activity(&project.id)?;
     execute_agent_workflow(
         &state.store,
@@ -946,6 +1049,7 @@ pub(crate) async fn run_agent_workflow(
         state.run_manager.clone(),
         state.runtime_manager.clone(),
         state.app_data.clone(),
+        Some(state.browser_bridge.clone()),
         &workflow_id,
         None,
     )
@@ -995,6 +1099,7 @@ async fn spawn_agent_workflow_with_completion_override(
     let run_manager = state.run_manager.clone();
     let runtime_manager = state.runtime_manager.clone();
     let app_data = state.app_data.clone();
+    let browser_bridge = state.browser_bridge.clone();
     tauri::async_runtime::spawn(async move {
         let _project_activity = project_activity;
         let result = execute_agent_workflow(
@@ -1003,6 +1108,7 @@ async fn spawn_agent_workflow_with_completion_override(
             run_manager,
             runtime_manager,
             app_data,
+            Some(browser_bridge),
             &workflow_id,
             Some(delivery.generation),
         )
@@ -1047,6 +1153,7 @@ pub(crate) async fn dynamic_delegation_policy_for_project(
     project: &ActiveProject,
     frame_id: Option<&str>,
     app_data: &std::path::Path,
+    browser_available: bool,
 ) -> Result<ProjectDelegationPolicy, String> {
     let resources = crate::delegation_resources::ScientificResourceCatalog::discover(
         store, project, frame_id, app_data,
@@ -1063,6 +1170,7 @@ pub(crate) async fn dynamic_delegation_policy_for_project(
         Some(&resources),
         isolation_available,
         preferred_model_id.as_deref(),
+        browser_available,
     )
     .await?;
     Ok(ProjectDelegationPolicy {
@@ -1075,7 +1183,7 @@ pub(crate) async fn dynamic_delegation_policy_for_project(
 pub(crate) async fn dynamic_delegation_policy(
     store: &Store,
 ) -> Result<(CapabilityRegistry, DelegationHostPolicy), String> {
-    build_dynamic_delegation_policy(store, None, false, None).await
+    build_dynamic_delegation_policy(store, None, false, None, false).await
 }
 
 fn select_default_model_id(
@@ -1112,6 +1220,7 @@ async fn build_dynamic_delegation_policy(
     resources: Option<&crate::delegation_resources::ScientificResourceCatalog>,
     isolation_available: bool,
     preferred_model_id: Option<&str>,
+    browser_available: bool,
 ) -> Result<(CapabilityRegistry, DelegationHostPolicy), String> {
     let model_profiles = models::delegation_profiles(store).await;
     let (active_provider, active_url, active_model, active_key) = load_settings(store).await;
@@ -1168,11 +1277,17 @@ async fn build_dynamic_delegation_policy(
         ExecutorFeature::CodeExecution,
         ExecutorFeature::Delegation,
     ];
-    if resources.is_some_and(|resources| resources.has_external() || resources.has_literature()) {
+    if resources.is_some_and(|resources| {
+        resources.has_external() || resources.has_literature() || resources.has_depmap()
+    }) || browser_available
+    {
         native_features.push(ExecutorFeature::NetworkAccess);
     }
     if resources.is_some_and(|resources| resources.has_literature()) {
         native_features.push(ExecutorFeature::LiteratureAccess);
+    }
+    if browser_available {
+        native_features.push(ExecutorFeature::BrowserAccess);
     }
     if model_policies
         .iter()
@@ -1239,11 +1354,17 @@ async fn build_dynamic_delegation_policy(
         "review".into(),
         "delegation".into(),
     ];
+    if resources.is_some_and(crate::delegation_resources::ScientificResourceCatalog::has_depmap) {
+        enabled_capabilities.push("depmap_read".into());
+    }
     if resources.is_some_and(|resources| resources.has_literature()) {
         enabled_capabilities.push("literature_search".into());
     }
     if resources.is_some_and(|resources| resources.has_external()) {
         enabled_capabilities.push("external_research".into());
+    }
+    if browser_available {
+        enabled_capabilities.push("browser_research".into());
     }
     if resources.is_some_and(|resources| resources.has_runtime()) {
         enabled_capabilities.push("visualization".into());
@@ -1273,6 +1394,27 @@ async fn build_dynamic_delegation_policy(
     if resources.is_some_and(|resources| resources.has_external()) {
         permission_tools.push(crate::delegation_resources::EXTERNAL_TOOL_GRANT.into());
     }
+    if browser_available
+        || resources.is_some_and(|resources| resources.has_literature() || resources.has_external())
+    {
+        permission_tools.push(crate::research_progress::REPORT_RESEARCH_PROGRESS.into());
+    }
+    if browser_available {
+        permission_tools.extend(
+            [
+                "browser_setup",
+                "web_scan",
+                "web_execute_js",
+                "web_open_tab",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+    }
+    if resources.is_some_and(crate::delegation_resources::ScientificResourceCatalog::has_depmap) {
+        permission_tools.push("depmap_query".into());
+        permission_tools.push("depmap_evidence".into());
+    }
     if resources.is_some_and(|resources| resources.python) {
         permission_tools.push("python".into());
     }
@@ -1288,14 +1430,22 @@ async fn build_dynamic_delegation_policy(
     let host = DelegationHostPolicy {
         revision,
         enabled_capabilities,
+        available_skills: resources
+            .map(crate::delegation_resources::ScientificResourceCatalog::available_skill_ids)
+            .unwrap_or_default(),
+        available_connectors: resources
+            .map(crate::delegation_resources::ScientificResourceCatalog::available_connector_ids)
+            .unwrap_or_default(),
         models: model_policies,
         executors,
         default_model_id,
         permission_ceiling: PermissionSet {
             tools: permission_tools,
             paths: vec!["project://**".into()],
-            network: resources
-                .is_some_and(|resources| resources.has_external() || resources.has_literature()),
+            network: browser_available
+                || resources.is_some_and(|resources| {
+                    resources.has_external() || resources.has_literature() || resources.has_depmap()
+                }),
             write: true,
             execute: true,
         },
@@ -1308,7 +1458,9 @@ async fn build_dynamic_delegation_policy(
         // tool calls, or cost unless the user sets a per-task budget.
         budget_ceiling: AgentBudget::default(),
         default_timeout_secs: Some(600),
-        timeout_ceiling_secs: Some(1_800),
+        // Local users can explicitly opt out of the default wall timeout.
+        // Managed and nested policies may still install a finite ceiling.
+        timeout_ceiling_secs: None,
         auto_safe: true,
         ..DelegationHostPolicy::default()
     };
@@ -1368,11 +1520,9 @@ pub(crate) fn nested_delegation_policy(
         (vec![], None)
     };
     let timeout = parent.timeout_secs.map(|value| {
-        value.min(
-            host.timeout_ceiling_secs
-                .unwrap_or(value)
-                .min(limits.wall_time_secs),
-        )
+        value
+            .min(host.timeout_ceiling_secs.unwrap_or(value))
+            .min(limits.wall_time_secs.unwrap_or(value))
     });
     let revision_source = serde_json::to_vec(&(
         &host.revision,
@@ -1443,6 +1593,7 @@ async fn execute_agent_workflow(
     run_manager: crate::run_context::RunManager,
     runtime_manager: wisp_runtime::RuntimeManager,
     app_data: std::path::PathBuf,
+    browser_bridge: Option<Arc<crate::browser_bridge::BrowserBridge>>,
     workflow_id: &str,
     attempt_generation: Option<i64>,
 ) -> Result<DelegationExecutionResult, String> {
@@ -1452,6 +1603,7 @@ async fn execute_agent_workflow(
         &project,
         workflow.frame_id.as_deref(),
         &app_data,
+        browser_bridge.is_some(),
     )
     .await?;
     let delegator = Arc::new(TauriDelegator::new(
@@ -1461,6 +1613,7 @@ async fn execute_agent_workflow(
         runtime_manager,
         app_data,
         policy.resources.clone(),
+        browser_bridge,
     ));
     let result = execute_agent_workflow_with_delegator(
         store,
@@ -1483,6 +1636,7 @@ pub(crate) async fn execute_inline_agent_workflow(
     run_manager: crate::run_context::RunManager,
     runtime_manager: wisp_runtime::RuntimeManager,
     app_data: std::path::PathBuf,
+    browser_bridge: Option<Arc<crate::browser_bridge::BrowserBridge>>,
     workflow_id: &str,
     attempt_generation: Option<i64>,
 ) -> Result<DelegationExecutionResult, String> {
@@ -1492,6 +1646,7 @@ pub(crate) async fn execute_inline_agent_workflow(
         run_manager,
         runtime_manager,
         app_data,
+        browser_bridge,
         workflow_id,
         attempt_generation,
     )
@@ -1576,6 +1731,7 @@ pub(crate) async fn resume_inline_agent_workflow(
     run_manager: crate::run_context::RunManager,
     runtime_manager: wisp_runtime::RuntimeManager,
     app_data: std::path::PathBuf,
+    browser_bridge: Option<Arc<crate::browser_bridge::BrowserBridge>>,
     workflow_id: &str,
 ) -> Result<DelegationExecutionResult, String> {
     let workflow = project_workflow(store, &project.id, workflow_id).await?;
@@ -1587,6 +1743,7 @@ pub(crate) async fn resume_inline_agent_workflow(
         &project,
         workflow.frame_id.as_deref(),
         &app_data,
+        browser_bridge.is_some(),
     )
     .await?;
     let delegator = Arc::new(TauriDelegator::new(
@@ -1596,6 +1753,7 @@ pub(crate) async fn resume_inline_agent_workflow(
         runtime_manager,
         app_data,
         policy.resources.clone(),
+        browser_bridge,
     ));
     let prior = persisted_workflow_steps(store, workflow_id).await?;
     let result = execute_agent_workflow_with_delegator_inner(
@@ -1678,6 +1836,24 @@ async fn execute_agent_workflow_with_delegator_inner(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "Agent workflow project does not exist".to_string())?;
+    for previous in prior_steps.as_ref().unwrap_or(&completed_steps) {
+        if previous.response.status == DelegationStatus::Succeeded {
+            let spec = &plan
+                .steps
+                .iter()
+                .find(|step| step.id == previous.step_id)
+                .ok_or("Cached Workflow node is no longer in the plan")?
+                .spec;
+            crate::workflow_artifacts::validate_cached(
+                store,
+                project_id,
+                std::path::Path::new(&project_workspace),
+                &spec.output_contract,
+                &previous.response,
+            )
+            .await?;
+        }
+    }
     let activity_driver = Arc::new(
         crate::method_search_coordinator::StoreWorkflowRunActivityDriver::new(
             store.clone(),
@@ -1947,6 +2123,7 @@ impl TauriDelegator {
         runtime_manager: wisp_runtime::RuntimeManager,
         app_data: std::path::PathBuf,
         resources: crate::delegation_resources::ScientificResourceCatalog,
+        browser_bridge: Option<Arc<crate::browser_bridge::BrowserBridge>>,
     ) -> Self {
         let isolation = crate::delegation_isolation::GitWorktreeIsolation::new(
             app_data.join("agent-worktrees"),
@@ -1959,8 +2136,13 @@ impl TauriDelegator {
                 runtime_manager,
                 app_data: app_data.clone(),
                 resources: resources.clone(),
+                browser_bridge,
                 active: Arc::new(StdMutex::new(HashMap::new())),
                 provenance: Arc::new(Mutex::new(HashMap::new())),
+                trace: host_agent_observability(HostObservabilityConfig::for_host(
+                    ObservabilityHost::Desktop,
+                    &project.root,
+                )),
             },
             acp: AcpDelegator {
                 store,
@@ -1997,8 +2179,10 @@ impl TauriDelegator {
                     runtime_manager: self.native.runtime_manager.clone(),
                     app_data: self.native.app_data.clone(),
                     resources: self.native.resources.clone(),
+                    browser_bridge: self.native.browser_bridge.clone(),
                     active: self.native.active.clone(),
                     provenance: self.native.provenance.clone(),
+                    trace: self.native.trace.clone(),
                 }
                 .delegate_validated(request)
                 .await
@@ -2431,8 +2615,32 @@ struct NativeDelegator {
     runtime_manager: wisp_runtime::RuntimeManager,
     app_data: std::path::PathBuf,
     resources: crate::delegation_resources::ScientificResourceCatalog,
+    browser_bridge: Option<Arc<crate::browser_bridge::BrowserBridge>>,
     active: Arc<StdMutex<HashMap<String, Arc<AtomicBool>>>>,
     provenance: Arc<Mutex<HashMap<String, String>>>,
+    trace: AgentTrace,
+}
+
+fn add_browser_research_tools(
+    tools: &mut wisp_tools::Registry,
+    bridge: Arc<crate::browser_bridge::BrowserBridge>,
+    store: Store,
+) {
+    tools.add(Box::new(crate::browser_bridge::BrowserSetupTool::new(
+        bridge.clone(),
+        store.clone(),
+    )));
+    tools.add(Box::new(crate::browser_bridge::WebScanTool::new(
+        bridge.clone(),
+    )));
+    tools.add(Box::new(crate::browser_bridge::WebExecuteJsTool::new(
+        bridge.clone(),
+        store.clone(),
+    )));
+    tools.add(Box::new(crate::browser_bridge::WebOpenTabTool::new(
+        bridge.clone(),
+        store,
+    )));
 }
 
 #[async_trait]
@@ -2494,8 +2702,19 @@ impl AgentDelegator for NativeDelegator {
             String::new()
         };
         let prompt = delegation_task_prompt(&request, &host_evidence)?;
-        let (provider, api_url, model, api_key, max_tokens, reasoning_effort) =
-            native_llm_config(&self.store, &request).await?;
+        let (
+            provider,
+            api_url,
+            model,
+            api_key,
+            max_tokens,
+            reasoning_effort,
+            service_tier,
+            user_agent,
+            send_user_agent,
+            send_session_id,
+            session_header_name,
+        ) = native_llm_config(&self.store, &request).await?;
         let cfg = build_provider_config(
             &provider,
             &api_url,
@@ -2508,6 +2727,12 @@ impl AgentDelegator for NativeDelegator {
                 .map(u64::from)
                 .unwrap_or(max_tokens),
             &reasoning_effort,
+            &service_tier,
+            &user_agent,
+            send_user_agent,
+            send_session_id,
+            &session_header_name,
+            Some(&child_frame_id),
         )
         .map_err(anyhow::Error::msg)?;
         let llm = wisp_llm::build(cfg);
@@ -2519,6 +2744,11 @@ impl AgentDelegator for NativeDelegator {
         } else {
             request.spec.prompt_template.clone()
         };
+        system.push_str(&crate::network::package_guidance(
+            &crate::network::load(&self.store)
+                .await
+                .map_err(anyhow::Error::msg)?,
+        ));
         system.push_str(&resource_grant.prompt_section());
         let project_skills = crate::active_skill_index(&self.store, &self.project).await;
         system.push_str(&bound_skill_prompt(&request.spec, &project_skills)?);
@@ -2529,6 +2759,64 @@ impl AgentDelegator for NativeDelegator {
             .collect::<HashSet<_>>();
         let skills = Arc::new(project_skills.filtered_by_names(Some(&skill_allow)));
         let mut tools = wisp_core::build_registry(skills, self.project.memory.clone(), false);
+        let browser_granted = request
+            .spec
+            .capabilities
+            .iter()
+            .any(|capability| capability == "browser_research");
+        let research_progress_granted = request.spec.capabilities.iter().any(|capability| {
+            matches!(
+                capability.as_str(),
+                "browser_research" | "literature_search" | "external_research"
+            )
+        });
+        if browser_granted {
+            let bridge = self.browser_bridge.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "browser_research was approved, but this executor has no real-browser bridge"
+                )
+            })?;
+            add_browser_research_tools(&mut tools, bridge, self.store.clone());
+        }
+        if research_progress_granted {
+            tools.add(Box::new(
+                crate::research_progress::ReportResearchProgressTool::new(
+                    self.store.clone(),
+                    child_frame_id.clone(),
+                ),
+            ));
+            system.push_str(
+                "\n\n<research_progress_contract>\nBefore the first retrieval and after each bounded retrieval or evidence-review batch, call report_research_progress. Start by defining distinct research facets, then use each batch to close a specific facet or unresolved evidence gap. After every batch, assess observable marginal evidence gain. Transition to synthesis when the planned facets are adequately covered, or when another batch has no materially different query or source likely to resolve the remaining gaps; document those gaps instead of searching indefinitely. Reserve time for citation auditing. Report only observable activity and cumulative counts, never hidden reasoning. The host persists these checkpoints for the user and reconnect recovery. Do not invent totals: omit a total until the plan establishes it.\n</research_progress_contract>",
+            );
+        }
+        let depmap_query_granted = request
+            .spec
+            .permissions
+            .tools
+            .iter()
+            .any(|tool| tool == "depmap_query");
+        let depmap_evidence_granted = request
+            .spec
+            .permissions
+            .tools
+            .iter()
+            .any(|tool| tool == "depmap_evidence");
+        let depmap_tools_available = (depmap_query_granted || depmap_evidence_granted)
+            && specialist_from_request(&request).is_some_and(|specialist| {
+                specialist.id == crate::specialists::DEPMAP_SPECIALIST_ID
+            })
+            && crate::depmap_agent::DepMapQueryTool::from_project(
+                self.project.root.clone(),
+                project_skills.as_ref(),
+                self.store.clone(),
+                self.project.id.clone(),
+                child_frame_id.clone(),
+            )
+            .is_some_and(|tool| {
+                tools.add(Box::new(tool.evidence_tool()));
+                tools.add(Box::new(tool));
+                true
+            });
         tools.add(Box::new(
             crate::session_context_tool::SessionExecutionContextTool::new(
                 Box::new(crate::run_context::RunInContextTool::new(
@@ -2569,7 +2857,6 @@ impl AgentDelegator for NativeDelegator {
             &runtime_project_id,
             child_scope.scope_key(),
             &child_frame_id,
-            &self.app_data,
             &self.store,
             Some(&resource_grant.runtimes),
             Some(&resource_grant.connectors),
@@ -2580,13 +2867,14 @@ impl AgentDelegator for NativeDelegator {
                 .await;
         if nested_delegation {
             tools.add(Box::new(
-                crate::delegation_tool::DelegateTasksTool::new(
+                crate::delegation_tool::DelegateTasksTool::new_with_browser(
                     self.store.clone(),
                     self.project.clone(),
                     child_frame_id.clone(),
                     self.run_manager.clone(),
                     self.runtime_manager.clone(),
                     self.app_data.clone(),
+                    self.browser_bridge.clone(),
                 )
                 .await
                 .map_err(anyhow::Error::msg)?,
@@ -2611,6 +2899,14 @@ impl AgentDelegator for NativeDelegator {
             ));
         }
         let mut allowed_tools = native_tool_allowlist(&request);
+        if depmap_tools_available {
+            if depmap_query_granted {
+                allowed_tools.push("depmap_query".into());
+            }
+            if depmap_evidence_granted {
+                allowed_tools.push("depmap_evidence".into());
+            }
+        }
         if nested_delegation {
             allowed_tools.push("delegate_tasks".into());
             allowed_tools.push("get_delegated_result".into());
@@ -2618,6 +2914,21 @@ impl AgentDelegator for NativeDelegator {
         allowed_tools.extend(wiring.added_tools);
         if !resource_grant.skills.is_empty() {
             allowed_tools.push("use_skill".into());
+        }
+        if browser_granted {
+            allowed_tools.extend(
+                [
+                    "browser_setup",
+                    "web_scan",
+                    "web_execute_js",
+                    "web_open_tab",
+                ]
+                .into_iter()
+                .map(str::to_string),
+            );
+        }
+        if research_progress_granted {
+            allowed_tools.push(crate::research_progress::REPORT_RESEARCH_PROGRESS.into());
         }
         allowed_tools.sort();
         allowed_tools.dedup();
@@ -2627,6 +2938,9 @@ impl AgentDelegator for NativeDelegator {
             .lock()
             .unwrap()
             .insert(request.request_id.clone(), cancel.clone());
+        let _dispatch = self
+            .trace
+            .start_span(SpanKind::Delegation, "agent.delegate");
         let run = crate::native_delegation::run_native_agent(
             llm.as_ref(),
             request
@@ -2644,6 +2958,7 @@ impl AgentDelegator for NativeDelegator {
             system,
             prompt,
             &cancel,
+            Some(&self.trace),
         )
         .await;
         self.active.lock().unwrap().remove(&request.request_id);
@@ -2674,6 +2989,19 @@ impl AgentDelegator for NativeDelegator {
                 run.usage,
             ));
         }
+        if wisp_core::workflow_conversion::is_independent_contract(&request.spec.output_contract)
+            && !run.tool_errors.is_empty()
+        {
+            return Ok(failed_backend_response_with_usage(
+                &request.request_id,
+                format!(
+                    "Workflow node had failed tool calls: {}",
+                    run.tool_errors.join("; ")
+                ),
+                Some(child_frame_id),
+                run.usage,
+            ));
+        }
         let content = match run.result {
             Ok(content) => content,
             Err(error) => {
@@ -2696,6 +3024,29 @@ impl AgentDelegator for NativeDelegator {
                 ))
             }
         };
+        let (verified_artifacts, artifact_evidence) =
+            match crate::workflow_artifacts::validate_and_capture(
+                &self.store,
+                &self.project.id,
+                &self.project.root,
+                &child_frame_id,
+                &request.workflow_id,
+                &request.step_id,
+                &request.spec.output_contract,
+                &output,
+            )
+            .await
+            {
+                Ok(artifacts) => artifacts,
+                Err(error) => {
+                    return Ok(failed_backend_response_with_usage(
+                        &request.request_id,
+                        error,
+                        Some(child_frame_id),
+                        run.usage,
+                    ))
+                }
+            };
         if reviewer
             && request.spec.output_schema_source == AgentOutputSchemaSource::Standard
             && !output.get("findings").is_some_and(Value::is_array)
@@ -2719,6 +3070,9 @@ impl AgentDelegator for NativeDelegator {
                 path: Some(path),
             })
             .collect::<Vec<_>>();
+        if wisp_core::workflow_conversion::is_independent_contract(&request.spec.output_contract) {
+            artifacts = verified_artifacts;
+        }
         for artifact in artifacts_from_output(&output) {
             if !artifacts.iter().any(|item| item.id == artifact.id) {
                 artifacts.push(artifact);
@@ -2733,7 +3087,11 @@ impl AgentDelegator for NativeDelegator {
             status: DelegationStatus::Succeeded,
             artifact_ids,
             artifacts,
-            evidence: evidence_from_output(&output),
+            evidence: {
+                let mut evidence = evidence_from_output(&output);
+                evidence.extend(artifact_evidence);
+                evidence
+            },
             output,
             usage: run.usage,
             agent_session_id: None,
@@ -2779,7 +3137,19 @@ impl AgentDelegator for NativeDelegator {
 async fn native_llm_config(
     store: &Store,
     request: &AgentDelegationRequest,
-) -> anyhow::Result<(String, String, String, String, u64, String)> {
+) -> anyhow::Result<(
+    String,
+    String,
+    String,
+    String,
+    u64,
+    String,
+    String,
+    String,
+    bool,
+    Option<bool>,
+    String,
+)> {
     let profile_id = request
         .spec
         .model
@@ -2792,7 +3162,15 @@ async fn native_llm_config(
         .ok_or_else(|| anyhow::anyhow!("resolved model profile no longer exists"))?;
     if profile.active {
         let (provider, api_url, model, api_key) = load_settings(store).await;
-        let (max_tokens, reasoning_effort) = models::active_llm_advanced(store).await;
+        let (
+            max_tokens,
+            reasoning_effort,
+            service_tier,
+            user_agent,
+            send_user_agent,
+            send_session_id,
+            session_header_name,
+        ) = models::active_llm_advanced(store).await;
         return Ok((
             provider,
             api_url,
@@ -2800,6 +3178,11 @@ async fn native_llm_config(
             api_key,
             max_tokens,
             reasoning_effort,
+            service_tier,
+            user_agent,
+            send_user_agent,
+            send_session_id,
+            session_header_name,
         ));
     }
     models::profile_llm(store, profile_id)
@@ -2823,6 +3206,7 @@ fn native_tool_allowlist(request: &AgentDelegationRequest) -> Vec<String> {
             "run_in_context" | "get_run" | "cancel_run" | "prepare_method_search" => {
                 request.spec.permissions.execute && !reviewer
             }
+            "depmap_query" | "depmap_evidence" => request.spec.permissions.network,
             _ => false,
         };
         if permitted && !allowed.iter().any(|existing| existing == name) {
@@ -2859,6 +3243,15 @@ async fn sync_child_execution_contexts(
         store
             .set_session_execution_context_enabled(child_frame_id, context_id, true)
             .await?;
+    }
+    if let Some(parent_frame_id) = parent_frame_id {
+        crate::ssh_hosts::copy_session_default_execution_context(
+            store,
+            parent_frame_id,
+            child_frame_id,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
     }
     Ok(())
 }
@@ -3057,14 +3450,17 @@ impl AgentDelegator for AcpDelegator {
                 .await?;
         }
         sync_child_execution_contexts(&self.store, Some(&parent_frame_id), &child_frame_id).await?;
-        let project_skills = crate::active_skill_index(&self.store, &self.project).await;
         let prompt_text = format!(
             "{}{}{}",
             delegation_prompt(&request)?,
             resource_grant.prompt_section(),
-            bound_skill_prompt(&request.spec, &project_skills)?,
+            crate::network::package_guidance(
+                &crate::network::load(&self.store)
+                    .await
+                    .map_err(anyhow::Error::msg)?
+            ),
         );
-        let next_seq = self.store.load_messages(&child_frame_id).await?.len() as i64 + 1;
+        let next_seq = self.store.max_message_seq(&child_frame_id).await? + 1;
         self.store
             .append_message(&child_frame_id, next_seq, &Message::user(&prompt_text))
             .await?;
@@ -3245,6 +3641,9 @@ async fn run_acp_request(
     prompt_text: String,
     mut next_seq: i64,
 ) -> anyhow::Result<AgentDelegationResponse> {
+    let confirmer =
+        crate::workflow_approval::for_node(store, project_id, child_frame_id, &request.spec.name)
+            .await;
     let prompt = handle.prompt(
         session_id.clone(),
         vec![ContentBlock::Text(TextContent::new(prompt_text))],
@@ -3320,12 +3719,19 @@ async fn run_acp_request(
                     }
                 }
                 Some(AcpSessionEvent::Permission(permission)) => {
-                    let allowed = permission_option_with_resources(
+                    let mut allowed = permission_option_with_resources(
                         &permission,
                         &request.spec.permissions,
                         resource_grant,
                         project_root,
                     );
+                    if allowed.is_some() && wisp_tools::safety::check_command_safety(&permission.tool_call.to_string()).is_some() {
+                        let approved=match &confirmer {
+                            Some(confirmer)=>crate::workflow_approval::confirm_during_workflow(confirmer.as_ref(),&format!("Run ACP tool within the approved node grant?\n{}",permission.tool_call),store,&request.workflow_id).await.approved(),
+                            None=>false,
+                        };
+                        if !approved {allowed=None;}
+                    }
                     handle.respond_permission(permission.request_id, allowed)?;
                 }
                 Some(AcpSessionEvent::Exited { error }) => anyhow::bail!(error.unwrap_or_else(|| "ACP Agent exited".into())),
@@ -3474,6 +3880,31 @@ async fn run_acp_request(
             ))
         }
     };
+    let (verified_artifacts, artifact_evidence) =
+        match crate::workflow_artifacts::validate_and_capture(
+            store,
+            project_id,
+            project_root,
+            child_frame_id,
+            &request.workflow_id,
+            &request.step_id,
+            &request.spec.output_contract,
+            &output,
+        )
+        .await
+        {
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                return Ok(failed_acp_response(
+                    &request.request_id,
+                    error,
+                    &session_id,
+                    child_frame_id,
+                    evidence,
+                    usage.value,
+                ))
+            }
+        };
     let mut artifacts = store
         .list_artifacts(child_frame_id)
         .await?
@@ -3485,6 +3916,9 @@ async fn run_acp_request(
             path: Some(path),
         })
         .collect::<Vec<_>>();
+    if wisp_core::workflow_conversion::is_independent_contract(&request.spec.output_contract) {
+        artifacts = verified_artifacts;
+    }
     for artifact in artifacts_from_output(&output) {
         if !artifacts.iter().any(|item| item.id == artifact.id) {
             artifacts.push(artifact);
@@ -3495,6 +3929,7 @@ async fn run_acp_request(
         .map(|artifact| artifact.id.clone())
         .collect();
     evidence.extend(evidence_from_output(&output));
+    evidence.extend(artifact_evidence);
     Ok(AgentDelegationResponse {
         request_id: request.request_id.clone(),
         status: DelegationStatus::Succeeded,
@@ -3782,12 +4217,12 @@ impl AcpUsage {
 
 fn runtime_budget_violation(usage: &AgentUsage, budget: &AgentBudget) -> Option<String> {
     let total_tokens = usage.input_tokens.saturating_add(usage.output_tokens);
-    if budget
+    if let Some(limit) = budget
         .max_tokens
-        .is_some_and(|limit| limit > 0 && total_tokens > u64::from(limit))
+        .filter(|limit| *limit > 0 && total_tokens > u64::from(*limit))
     {
         return Some(format!(
-            "Agent exceeded its token budget ({total_tokens} tokens)"
+            "Agent exceeded its token budget (used {total_tokens} tokens; limit {limit})"
         ));
     }
     if budget
@@ -4161,6 +4596,14 @@ fn delegation_task_prompt(
     ))
 }
 
+fn delegation_prompt(request: &AgentDelegationRequest) -> anyhow::Result<String> {
+    Ok(format!(
+        "{}\n\n{}",
+        request.spec.prompt_template.trim(),
+        delegation_task_prompt(request, "")?
+    ))
+}
+
 fn bound_skill_prompt(
     spec: &wisp_core::AgentSpec,
     skills: &wisp_skills::SkillIndex,
@@ -4194,14 +4637,6 @@ fn bound_skill_prompt(
         ));
     }
     Ok(rendered)
-}
-
-fn delegation_prompt(request: &AgentDelegationRequest) -> anyhow::Result<String> {
-    Ok(format!(
-        "{}\n\n{}",
-        request.spec.prompt_template.trim(),
-        delegation_task_prompt(request, "")?
-    ))
 }
 
 /// Every JSON value that can be recovered from the Agent's final message.
@@ -4858,7 +5293,57 @@ mod tests {
             model_id: None,
             executor: None,
             budget: None,
+            timeout_secs: None,
         }
+    }
+
+    #[test]
+    fn root_wall_deadline_sums_finite_tasks_and_disappears_for_unlimited() {
+        let (registry, mut host) = test_dynamic_policy();
+        host.default_timeout_secs = Some(30);
+        host.timeout_ceiling_secs = None;
+        let task = |id: &str, timeout_secs| DelegatedTaskProposal {
+            id: id.into(),
+            instruction: format!("Complete {id}"),
+            context_summary: String::new(),
+            depends_on: vec![],
+            capabilities: vec!["reasoning".into()],
+            skill_bindings: vec![],
+            specialist: None,
+            output_schema: None,
+            isolated: false,
+            model_id: None,
+            executor: None,
+            budget: None,
+            timeout_secs,
+            input: json!({}),
+        };
+        let finite = registry
+            .resolve_plan(
+                "finite",
+                DelegationMode::Manual,
+                1,
+                vec![task("first", None), task("second", Some(45))],
+                &host,
+            )
+            .unwrap()
+            .into_plan();
+        assert_eq!(
+            root_limits_for_plan(&finite, &host).wall_time_secs,
+            Some(75)
+        );
+
+        let unlimited = registry
+            .resolve_plan(
+                "unlimited",
+                DelegationMode::Manual,
+                1,
+                vec![task("open", Some(0))],
+                &host,
+            )
+            .unwrap()
+            .into_plan();
+        assert_eq!(root_limits_for_plan(&unlimited, &host).wall_time_secs, None);
     }
 
     #[test]
@@ -4970,28 +5455,71 @@ mod tests {
     #[tokio::test]
     async fn project_policy_advertises_only_discovered_scientific_resources() {
         let (store, root) = dynamic_fixture().await;
+        let profiles = vec![acp::AcpAgentProfile {
+            id: "test-acp".into(),
+            label: "Test ACP".into(),
+            command: std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            args: vec!["--fake".into()],
+        }];
+        store
+            .set_setting(
+                "acp_agent_profiles",
+                &serde_json::to_string(&profiles).unwrap(),
+            )
+            .await
+            .unwrap();
         let resources = crate::delegation_resources::ScientificResourceCatalog::fake(
-            &["literature-review"],
+            &["literature-review", "depmap-knowledge-query"],
             &["literature-review"],
             &["pubmed"],
             &["web"],
             &["python"],
         );
         let (registry, host) =
-            build_dynamic_delegation_policy(&store, Some(&resources), true, None)
+            build_dynamic_delegation_policy(&store, Some(&resources), true, None, true)
                 .await
                 .unwrap();
 
-        for capability in ["literature_search", "external_research", "visualization"] {
+        for capability in [
+            "depmap_read",
+            "literature_search",
+            "external_research",
+            "browser_research",
+            "visualization",
+        ] {
             assert!(host.enabled_capabilities.contains(&capability.into()));
         }
+        assert!(host
+            .available_skills
+            .contains(&"depmap-knowledge-query".into()));
+        assert!(host.available_connectors.contains(&"pubmed".into()));
+        assert!(host.available_connectors.contains(&"web".into()));
+        assert!(registry
+            .available_ids(&host)
+            .contains(&"depmap_read".into()));
         assert!(host.permission_ceiling.network);
         assert!(host
             .permission_ceiling
             .tools
             .contains(&"literature_search".into()));
         assert!(host.permission_ceiling.tools.contains(&"web_search".into()));
+        assert!(host.permission_ceiling.tools.contains(&"web_scan".into()));
+        assert!(host
+            .permission_ceiling
+            .tools
+            .contains(&crate::research_progress::REPORT_RESEARCH_PROGRESS.into()));
         assert!(host.permission_ceiling.tools.contains(&"python".into()));
+        assert!(host
+            .permission_ceiling
+            .tools
+            .contains(&"depmap_query".into()));
+        assert!(host
+            .permission_ceiling
+            .tools
+            .contains(&"depmap_evidence".into()));
         assert!(!host.permission_ceiling.tools.contains(&"r".into()));
         assert_eq!(
             registry.get("visualization").unwrap().permissions.tools,
@@ -5007,19 +5535,55 @@ mod tests {
             .unwrap();
         assert!(native.features.contains(&ExecutorFeature::NetworkAccess));
         assert!(native.features.contains(&ExecutorFeature::LiteratureAccess));
+        assert!(native.features.contains(&ExecutorFeature::BrowserAccess));
         assert!(native.features.contains(&ExecutorFeature::Isolation));
+        let acp = host
+            .executors
+            .iter()
+            .find(|executor| matches!(executor.executor, AgentExecutorRef::Acp { .. }))
+            .unwrap();
+        assert!(!acp.features.contains(&ExecutorFeature::BrowserAccess));
 
         let offline =
             crate::delegation_resources::ScientificResourceCatalog::fake(&[], &[], &[], &[], &[]);
         let (_, offline_host) =
-            build_dynamic_delegation_policy(&store, Some(&offline), false, None)
+            build_dynamic_delegation_policy(&store, Some(&offline), false, None, false)
                 .await
                 .unwrap();
         assert!(!offline_host
             .enabled_capabilities
             .contains(&"literature_search".into()));
         assert!(!offline_host.permission_ceiling.network);
+        assert!(!offline_host
+            .enabled_capabilities
+            .contains(&"browser_research".into()));
         assert_ne!(offline_host.revision, host.revision);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn approved_native_browser_capability_registers_only_the_bounded_bridge_tools() {
+        let (store, root) = dynamic_fixture().await;
+        let bridge = Arc::new(crate::browser_bridge::BrowserBridge::new(
+            root.join("browser-extension"),
+        ));
+        let mut registry = wisp_tools::Registry::builtins().filtered(&[]);
+        add_browser_research_tools(&mut registry, bridge, store);
+        let names = registry.names();
+
+        assert_eq!(
+            names,
+            [
+                "browser_setup",
+                "web_scan",
+                "web_execute_js",
+                "web_open_tab",
+            ]
+        );
+        assert!(!names.contains(&"web_screenshot"));
+        assert!(!names.contains(&"web_save_assets"));
+        assert!(!names.contains(&"web_agent_send"));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -5031,6 +5595,31 @@ mod tests {
             approval_policy: AgentApprovalPolicy::ReviewAll,
             tasks,
         }
+    }
+
+    #[tokio::test]
+    async fn dynamic_root_budget_allows_bounded_scientific_fan_in_input() {
+        let (store, root) = dynamic_fixture().await;
+        let policy = test_dynamic_policy();
+        let created = create_dynamic_agent_workflow_draft(
+            &store,
+            "p",
+            &root,
+            "f".into(),
+            dynamic_proposal(vec![
+                dynamic_task("analysis", &[]),
+                dynamic_task("review", &[]),
+                dynamic_task("synthesis", &["analysis", "review"]),
+            ]),
+            &policy,
+            None,
+        )
+        .await
+        .unwrap();
+        let limits: AgentDelegationRootLimits =
+            serde_json::from_str(&created.workflow.root_limits_json).unwrap();
+        assert_eq!(limits.max_tokens, 1_024_000);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -5453,6 +6042,35 @@ mod tests {
     }
 
     #[test]
+    fn native_depmap_reader_receives_only_the_bounded_query_tool() {
+        let request = AgentDelegationRequest {
+            request_id: "request".into(),
+            workflow_id: "workflow".into(),
+            step_id: "depmap".into(),
+            spec: serde_json::from_value(json!({
+                "agent_id": "depmap-reader",
+                "name": "DepMap reader",
+                "goal": "Read bounded evidence",
+                "role": "temporary",
+                "backend": "local",
+                "prompt_template": "Query only.",
+                "permissions": {
+                    "tools": ["depmap_query"],
+                    "paths": ["project://**"],
+                    "network": true,
+                    "write": false,
+                    "execute": false
+                },
+                "capabilities": ["depmap_read"]
+            }))
+            .unwrap(),
+            input: json!({}),
+            lineage: None,
+        };
+        assert_eq!(native_tool_allowlist(&request), ["depmap_query"]);
+    }
+
+    #[test]
     fn native_code_execution_uses_run_manager_tools_not_direct_shell() {
         let request = AgentDelegationRequest {
             request_id: "request".into(),
@@ -5514,6 +6132,13 @@ mod tests {
             .set_session_execution_context_enabled("child", "ssh:stale", true)
             .await
             .unwrap();
+        crate::ssh_hosts::persist_session_default_execution_context(
+            &store,
+            "parent",
+            crate::ssh_hosts::SessionDefaultExecutionContext::Remote("ssh:selected".into()),
+        )
+        .await
+        .unwrap();
 
         sync_child_execution_contexts(&store, Some("parent"), "child")
             .await
@@ -5527,6 +6152,10 @@ mod tests {
             .session_execution_context_enabled("child", "ssh:stale")
             .await
             .unwrap());
+        assert_eq!(
+            crate::ssh_hosts::stored_session_default_execution_context(&store, "child").await,
+            crate::ssh_hosts::SessionDefaultExecutionContext::Remote("ssh:selected".into())
+        );
         drop(store);
         std::fs::remove_dir_all(root).ok();
     }
@@ -6751,15 +7380,18 @@ mod tests {
             max_tool_calls: Some(2),
             max_cost_microunits: Some(100),
         };
-        assert!(runtime_budget_violation(
-            &AgentUsage {
-                input_tokens: 6,
-                output_tokens: 5,
-                ..Default::default()
-            },
-            &budget
-        )
-        .is_some());
+        assert_eq!(
+            runtime_budget_violation(
+                &AgentUsage {
+                    input_tokens: 6,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+                &budget
+            )
+            .as_deref(),
+            Some("Agent exceeded its token budget (used 11 tokens; limit 10)")
+        );
         assert!(runtime_budget_violation(
             &AgentUsage {
                 tool_calls: 3,
@@ -7036,6 +7668,7 @@ mod tests {
                     model_id: None,
                     executor: None,
                     budget: None,
+                    timeout_secs: None,
                     input: json!({}),
                 },
                 &host,

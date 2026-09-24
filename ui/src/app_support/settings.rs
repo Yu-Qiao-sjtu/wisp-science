@@ -74,9 +74,15 @@ mod provider_form_tests {
             max_tokens: 0,
             context_window: 128_000,
             reasoning_effort: String::new(),
+            service_tier: String::new(),
+            user_agent: String::new(),
+            send_user_agent: true,
+            send_session_id: None,
+            session_header_name: String::new(),
             supports_vision: false,
             use_for_vision: false,
             use_for_image_generation: false,
+            image_generation_capable: false,
             image_size: String::new(),
             image_quality: String::new(),
             image_aspect_ratio: String::new(),
@@ -127,6 +133,23 @@ mod provider_form_tests {
                 ("openai_responses".into(), "gpt-image-2".into(), true),
             ]
         );
+    }
+
+    #[test]
+    fn opencode_endpoints_leave_model_selection_to_the_user() {
+        for base in [
+            "https://opencode.ai/zen/go",
+            "https://opencode.ai/zen/go/v1/",
+            "https://opencode.ai/zen/v1",
+            "https://opencode.ai.evil.test/zen/go/v1",
+        ] {
+            let mut form = new_model_form();
+            apply_base_url_suggestions(&mut form, base);
+            assert_eq!(form.api_url, base);
+            assert_eq!(form.entries.len(), 1);
+            assert!(form.entries[0].model.is_empty());
+            assert!(provider_entries_are_pristine(&form));
+        }
     }
 
     #[test]
@@ -229,6 +252,12 @@ pub(crate) mod tauri_args {
     pub fn rewind_session(session_id: &Option<String>, user_index: usize) -> Value {
         json!({ "sessionId": session_id, "userIndex": user_index })
     }
+    pub fn undo_compaction(session_id: &Option<String>) -> Value {
+        json!({ "sessionId": session_id })
+    }
+    pub fn load_session_context_view(session_id: &str) -> Value {
+        json!({ "sessionId": session_id })
+    }
     pub fn turn_undo(session_id: &str, user_index: usize) -> Value {
         json!({ "sessionId": session_id, "userIndex": user_index })
     }
@@ -316,6 +345,14 @@ mod tauri_args_tests {
         assert_eq!(v["sessionId"], "frame-1");
         assert_eq!(v["userIndex"], 3);
         assert!(v.get("user_index").is_none());
+
+        let v = tauri_args::undo_compaction(&sid);
+        assert_eq!(v["sessionId"], "frame-1");
+        assert!(v.get("session_id").is_none());
+
+        let v = tauri_args::load_session_context_view("frame-1");
+        assert_eq!(v["sessionId"], "frame-1");
+        assert!(v.get("session_id").is_none());
 
         let v = tauri_args::turn_undo("frame-1", 4);
         assert_eq!(v["sessionId"], "frame-1");
@@ -768,9 +805,15 @@ pub(crate) fn profile_to_form(m: &ModelProfile) -> ModelForm {
             128_000
         },
         reasoning_effort: m.reasoning_effort.clone(),
+        service_tier: m.service_tier.clone(),
+        user_agent: m.user_agent.clone(),
+        send_user_agent: m.send_user_agent,
+        send_session_id: m.send_session_id,
+        session_header_name: m.session_header_name.clone(),
         supports_vision: m.supports_vision,
         use_for_vision: m.use_for_vision,
         use_for_image_generation: m.use_for_image_generation,
+        image_generation_capable: m.image_generation_capable,
         image_size: m.image_size.clone(),
         image_quality: m.image_quality.clone(),
         image_aspect_ratio: m.image_aspect_ratio.clone(),
@@ -783,7 +826,7 @@ pub(crate) fn profile_to_form(m: &ModelProfile) -> ModelForm {
     }
 }
 
-fn next_model_row_id() -> u64 {
+fn next_ui_row_id() -> u64 {
     use std::cell::Cell;
     thread_local! {
         static NEXT: Cell<u64> = const { Cell::new(1) };
@@ -795,6 +838,23 @@ fn next_model_row_id() -> u64 {
     })
 }
 
+pub(crate) fn blank_conn_secret_field() -> ConnSecretField {
+    ConnSecretField {
+        row_id: next_ui_row_id(),
+        ..ConnSecretField::default()
+    }
+}
+
+pub(crate) fn new_conn_form() -> ConnForm {
+    ConnForm {
+        kind: "stdio".into(),
+        enabled: true,
+        headers: vec![blank_conn_secret_field()],
+        env: vec![blank_conn_secret_field()],
+        ..ConnForm::default()
+    }
+}
+
 pub(crate) fn model_form_entry(
     provider: &str,
     model: &str,
@@ -804,7 +864,7 @@ pub(crate) fn model_form_entry(
     let image = image || crate::dto::is_image_generation_model(model);
     let video = !image && crate::dto::is_video_generation_model(model);
     ModelFormEntry {
-        row_id: next_model_row_id(),
+        row_id: next_ui_row_id(),
         provider: provider_value(provider).into(),
         endpoint_suffix: endpoint_suffix.into(),
         label: String::new(),
@@ -819,12 +879,9 @@ pub(crate) fn model_form_entry(
 pub(crate) fn suggested_base_url_models(api_url: &str) -> Vec<ModelFormEntry> {
     let host = normalize_endpoint(api_url).to_ascii_lowercase();
     match host.as_str() {
-        host if host.contains("api.anthropic.com") => vec![model_form_entry(
-            "anthropic",
-            "claude-sonnet-5",
-            "",
-            false,
-        )],
+        host if host.contains("api.anthropic.com") => {
+            vec![model_form_entry("anthropic", "claude-sonnet-5", "", false)]
+        }
         host if host.contains("api.openai.com") => vec![
             model_form_entry("openai_responses", "gpt-5.5", "", false),
             model_form_entry("openai_responses", "gpt-image-2", "", true),
@@ -898,10 +955,7 @@ pub(crate) fn endpoint_has_stored_key(models: &[ModelProfile], api_url: &str) ->
         .any(|profile| profile.has_api_key && same_endpoint(&profile.api_url, api_url))
 }
 
-pub(crate) fn sibling_profile_id<'a>(
-    models: &'a [ModelProfile],
-    api_url: &str,
-) -> Option<&'a str> {
+pub(crate) fn sibling_profile_id<'a>(models: &'a [ModelProfile], api_url: &str) -> Option<&'a str> {
     models
         .iter()
         .find(|profile| profile.has_api_key && same_endpoint(&profile.api_url, api_url))
@@ -915,6 +969,7 @@ pub(crate) fn new_model_form() -> ModelForm {
         api_url: api_url.into(),
         max_tokens: 8192,
         context_window: 128_000,
+        send_user_agent: true,
         entries: suggested_base_url_models(api_url),
         ..Default::default()
     }
@@ -938,12 +993,89 @@ pub(crate) fn model_form_to_settings(form: &ModelForm, has_api_key: bool) -> Set
     cfg.has_api_key = has_api_key;
     cfg.max_tokens = form.max_tokens;
     cfg.reasoning_effort = form.reasoning_effort.clone();
+    cfg.service_tier = form.service_tier.clone();
+    cfg.user_agent = form.user_agent.clone();
+    cfg.send_user_agent = form.send_user_agent;
+    cfg.send_session_id = form.send_session_id;
+    cfg.session_header_name = form.session_header_name.clone();
     cfg.supports_vision = form.supports_vision;
     cfg
 }
 
+/// Sidebar groups and search aliases. Network / proxy settings live under
+/// General (not Models), so those keywords must match that section.
+pub(crate) const SETTINGS_NAV_GROUPS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "settings.nav.preferences",
+        &[
+            (
+                "general",
+                "notifications updates language network proxy 通知 更新 语言 网络 代理",
+            ),
+            (
+                "session",
+                "context tokens conversation compact semantic 语义压缩 上下文 对话",
+            ),
+            ("appearance", "theme font 主题 字体"),
+            ("pet", "companion 桌宠"),
+        ],
+    ),
+    (
+        "settings.nav.ai",
+        &[
+            ("models", "api key acp provider 模型 密钥 服务商"),
+            ("quick-actions", "shortcuts 快捷"),
+            ("workflows", "automation 自动化"),
+            ("specialists", "agents 专家 智能体"),
+            ("memory", "notes habits 笔记 习惯"),
+        ],
+    ),
+    (
+        "settings.nav.tools",
+        &[
+            ("skills", "skill 技能"),
+            ("plugins", "mcp 插件"),
+            ("browser", "web 浏览器"),
+            ("connections", "connectors integrations 连接 集成"),
+            ("channels", "sync feishu weixin device 同步 飞书 微信 设备"),
+        ],
+    ),
+    (
+        "settings.nav.system",
+        &[
+            ("credentials", "api key token secrets 密钥 令牌"),
+            ("permissions", "approval security 审批 安全"),
+            ("environments", "python ssh wsl runtime 环境 运行时"),
+            ("storage", "disk cache 磁盘 缓存"),
+            ("usage", "tokens cost 用量 费用"),
+        ],
+    ),
+];
+
+pub(crate) fn settings_nav_entry_matches(
+    query: &str,
+    group: &str,
+    section: &str,
+    aliases: &str,
+    loc: Locale,
+) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let haystack = format!(
+        "{} {} {} {aliases}",
+        t(loc, group),
+        settings_section_label(Locale::En, section),
+        settings_section_label(Locale::Zh, section)
+    )
+    .to_lowercase();
+    query.split_whitespace().all(|word| haystack.contains(word))
+}
+
 pub(crate) fn settings_section_label(loc: Locale, section: &str) -> String {
     match section {
+        "general" => t(loc, "settings.nav.general"),
         "session" => t(loc, "settings.nav.session"),
         "appearance" => t(loc, "settings.nav.appearance"),
         "pet" => t(loc, "settings.nav.pet"),
@@ -977,6 +1109,51 @@ mod settings_section_label_tests {
         assert_eq!(settings_section_label(Locale::En, "session"), "Session");
         assert_eq!(settings_section_label(Locale::Zh, "session"), "对话");
     }
+
+    fn aliases(section: &str) -> &'static str {
+        SETTINGS_NAV_GROUPS
+            .iter()
+            .flat_map(|(_, entries)| entries.iter())
+            .find(|(id, _)| *id == section)
+            .map(|(_, aliases)| *aliases)
+            .unwrap()
+    }
+
+    #[test]
+    fn general_search_aliases_include_proxy_and_network() {
+        for query in ["proxy", "网络", "代理", "network"] {
+            assert!(
+                settings_nav_entry_matches(
+                    query,
+                    "settings.nav.preferences",
+                    "general",
+                    aliases("general"),
+                    Locale::Zh
+                ),
+                "{query} should match General in zh"
+            );
+            assert!(
+                settings_nav_entry_matches(
+                    query,
+                    "settings.nav.preferences",
+                    "general",
+                    aliases("general"),
+                    Locale::En
+                ),
+                "{query} should match General in en"
+            );
+            assert!(
+                !settings_nav_entry_matches(
+                    query,
+                    "settings.nav.ai",
+                    "models",
+                    aliases("models"),
+                    Locale::Zh
+                ),
+                "{query} must not match Models"
+            );
+        }
+    }
 }
 
 /// A field within a credential service group: (credential id, i18n label key,
@@ -1008,6 +1185,20 @@ pub(crate) struct CredGroup {
 }
 
 pub(crate) const CRED_GROUPS: &[CredGroup] = &[
+    CredGroup {
+        id: "depmap",
+        name_key: "cred.depmap.name",
+        about_key: "cred.depmap.about",
+        configured_key: "cred.depmap.configured",
+        unconfigured_key: "cred.depmap.unconfigured",
+        hint_key: "cred.depmap.hint",
+        links: &[],
+        fields: &[CredField {
+            id: "depmap_knowledge_api_token",
+            label_key: "cred.depmap_knowledge_api_token.label",
+            secret: true,
+        }],
+    },
     CredGroup {
         id: "openalex",
         name_key: "cred.openalex.name",
@@ -1147,6 +1338,37 @@ pub(crate) fn settings_subpage_label(
     }
 }
 
+fn secret_fields_json(fields: &[ConnSecretField]) -> Vec<serde_json::Value> {
+    fields
+        .iter()
+        .filter(|field| !field.name.trim().is_empty())
+        .map(|field| {
+            let name = field.name.trim();
+            let value = field.value.trim();
+            if value.is_empty() {
+                serde_json::json!({ "name": name })
+            } else {
+                serde_json::json!({ "name": name, "value": value })
+            }
+        })
+        .collect()
+}
+
+fn secret_fields_from_entries(entries: &[McpSecretEntry]) -> Vec<ConnSecretField> {
+    let mut fields: Vec<ConnSecretField> = entries
+        .iter()
+        .map(|entry| {
+            let mut field = ConnSecretField::from_entry(entry);
+            field.row_id = next_ui_row_id();
+            field
+        })
+        .collect();
+    if fields.is_empty() {
+        fields.push(blank_conn_secret_field());
+    }
+    fields
+}
+
 pub(crate) fn build_conn_json(f: &ConnForm, assign_id: bool) -> serde_json::Value {
     let id = f.id.clone().unwrap_or_else(|| {
         if assign_id {
@@ -1156,33 +1378,39 @@ pub(crate) fn build_conn_json(f: &ConnForm, assign_id: bool) -> serde_json::Valu
         }
     });
     let transport = if f.kind == "http" {
-        let headers: Vec<(String, String)> = f
-            .headers
-            .lines()
-            .filter_map(|l| {
-                l.split_once(':')
-                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-            })
-            .collect();
         let auth = if f.auth == "oauth" { "oauth" } else { "none" };
-        serde_json::json!({ "kind": "http", "url": f.url.trim(), "headers": headers, "auth": auth })
+        serde_json::json!({
+            "kind": "http",
+            "url": f.url.trim(),
+            "headers": secret_fields_json(&f.headers),
+            "auth": auth
+        })
     } else {
         let args: Vec<String> = f.args.split_whitespace().map(|s| s.to_string()).collect();
-        serde_json::json!({ "kind": "stdio", "command": f.command.trim(), "args": args, "env": [], "cwd": null })
+        serde_json::json!({
+            "kind": "stdio",
+            "command": f.command.trim(),
+            "args": args,
+            "env": secret_fields_json(&f.env),
+            "cwd": null
+        })
     };
     serde_json::json!({ "id": id, "name": f.name.trim(), "enabled": f.enabled, "transport": transport })
 }
 
 pub(crate) fn conn_form_from_row(row: &ConnRow) -> ConnForm {
     match &row.transport {
-        ConnTransport::Stdio { command, args, .. } => ConnForm {
+        ConnTransport::Stdio {
+            command, args, env, ..
+        } => ConnForm {
             id: Some(row.id.clone()),
             name: row.name.clone(),
             kind: "stdio".into(),
             command: command.clone(),
             args: args.join(" "),
             url: String::new(),
-            headers: String::new(),
+            headers: vec![blank_conn_secret_field()],
+            env: secret_fields_from_entries(env),
             auth: "none".into(),
             enabled: row.enabled,
         },
@@ -1193,11 +1421,8 @@ pub(crate) fn conn_form_from_row(row: &ConnRow) -> ConnForm {
             command: String::new(),
             args: String::new(),
             url: url.clone(),
-            headers: headers
-                .iter()
-                .map(|(k, v)| format!("{k}: {v}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
+            headers: secret_fields_from_entries(headers),
+            env: vec![blank_conn_secret_field()],
             auth: if auth == "oauth" {
                 "oauth".into()
             } else {
@@ -1205,5 +1430,89 @@ pub(crate) fn conn_form_from_row(row: &ConnRow) -> ConnForm {
             },
             enabled: row.enabled,
         },
+    }
+}
+
+#[cfg(test)]
+mod mcp_secret_form_tests {
+    use super::{blank_conn_secret_field, build_conn_json, conn_form_from_row, new_conn_form};
+    use crate::dto::{ConnForm, ConnRow, ConnSecretField, ConnTransport, McpSecretEntry};
+
+    #[test]
+    fn build_conn_json_omits_empty_secret_values() {
+        let json = build_conn_json(
+            &ConnForm {
+                id: Some("conn-1".into()),
+                name: "remote".into(),
+                kind: "http".into(),
+                url: "https://example.test/mcp".into(),
+                headers: vec![ConnSecretField {
+                    name: "Authorization".into(),
+                    value: String::new(),
+                    has_value: true,
+                    ..ConnSecretField::default()
+                }],
+                enabled: true,
+                ..ConnForm::default()
+            },
+            false,
+        );
+        assert_eq!(
+            json["transport"]["headers"],
+            serde_json::json!([{ "name": "Authorization" }])
+        );
+        assert!(json["transport"]["headers"][0].get("value").is_none());
+    }
+
+    #[test]
+    fn conn_form_from_row_never_copies_listed_values() {
+        let row = ConnRow {
+            id: "conn-1".into(),
+            name: "remote".into(),
+            enabled: true,
+            transport: ConnTransport::Http {
+                url: "https://example.test/mcp".into(),
+                headers: vec![McpSecretEntry::plaintext("Authorization", "secret-value")],
+                auth: "none".into(),
+            },
+        };
+        let form = conn_form_from_row(&row);
+        assert_eq!(form.headers[0].name, "Authorization");
+        assert!(form.headers[0].value.is_empty());
+        assert!(form.headers[0].has_value);
+        assert_ne!(form.headers[0].row_id, 0);
+    }
+
+    #[test]
+    fn secret_rows_get_unique_ids() {
+        let a = blank_conn_secret_field();
+        let b = blank_conn_secret_field();
+        assert_ne!(a.row_id, 0);
+        assert_ne!(b.row_id, 0);
+        assert_ne!(a.row_id, b.row_id);
+
+        let form = new_conn_form();
+        assert_eq!(form.env.len(), 1);
+        assert_eq!(form.headers.len(), 1);
+        assert_ne!(form.env[0].row_id, form.headers[0].row_id);
+
+        let row = ConnRow {
+            id: "conn-1".into(),
+            name: "local".into(),
+            enabled: true,
+            transport: ConnTransport::Stdio {
+                command: "npx".into(),
+                args: vec![],
+                env: vec![
+                    McpSecretEntry::plaintext("A", "1"),
+                    McpSecretEntry::plaintext("B", "2"),
+                ],
+                cwd: None,
+            },
+        };
+        let form = conn_form_from_row(&row);
+        assert_eq!(form.env.len(), 2);
+        assert_ne!(form.env[0].row_id, form.env[1].row_id);
+        assert_ne!(form.env[0].row_id, 0);
     }
 }

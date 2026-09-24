@@ -31,10 +31,16 @@ impl Tool for WriteTool {
         arg_str(args, "path").unwrap_or_default()
     }
     async fn run(&self, args: &serde_json::Value, env: &dyn ToolEnv) -> ToolResult {
+        if env.is_cancelled() {
+            return ToolResult::fail("interrupted by user");
+        }
         let path = match arg_str(args, "path") {
             Ok(p) => p,
             Err(e) => return ToolResult::fail(e),
         };
+        if !env.artifact_requested() && crate::presentation::query_only_forbids_path(&path) {
+            return ToolResult::fail(crate::presentation::query_only_write_error(&path));
+        }
         let content = match arg_str(args, "content") {
             Ok(c) => c,
             Err(e) => return ToolResult::fail(e),
@@ -50,7 +56,7 @@ impl Tool for WriteTool {
                 ));
             }
         }
-        if let Err(e) = std::fs::write(&real, &content) {
+        if let Err(e) = crate::safety::write_no_follow(&real, content.as_bytes()) {
             return ToolResult::fail(format!("write {path} error: {e}"));
         }
         env.emit(ToolEvent::FileChanged { path: path.clone() })
@@ -104,6 +110,107 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| matches!(event, ToolEvent::FileChanged { path } if path == "new.R")));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_through_a_dangling_outbound_symlink_is_blocked() {
+        let base = std::env::temp_dir().join(format!("wisp_write_dangling_{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        let root = base.join("project");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // Project-local link to a nonexistent file outside the root: following
+        // it would create /outside/escape.txt.
+        std::os::unix::fs::symlink(outside.join("escape.txt"), root.join("sneaky.txt")).unwrap();
+        let env = RecordingEnv {
+            root: root.clone(),
+            events: Mutex::new(Vec::new()),
+        };
+
+        let result = WriteTool
+            .run(&json!({ "path": "sneaky.txt", "content": "pwned" }), &env)
+            .await;
+
+        assert!(!result.success, "{}", result.content);
+        assert!(
+            !outside.join("escape.txt").exists(),
+            "the escape target must not be created"
+        );
+        assert!(env.events.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    struct CancelledEnv(PathBuf);
+
+    #[async_trait::async_trait]
+    impl ToolEnv for CancelledEnv {
+        fn project_root(&self) -> &Path {
+            &self.0
+        }
+        async fn confirm(&self, _message: &str) -> bool {
+            true
+        }
+        async fn emit(&self, _event: ToolEvent) {}
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_write_does_not_touch_the_file() {
+        let tmp = std::env::temp_dir().join(format!("wisp_write_cancel_{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let env = CancelledEnv(tmp.clone());
+
+        let result = WriteTool
+            .run(&json!({ "path": "skip.txt", "content": "nope" }), &env)
+            .await;
+
+        assert!(!result.success, "{}", result.content);
+        assert!(result.content.contains("interrupted by user"));
+        assert!(!tmp.join("skip.txt").exists());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    struct QueryOnlyEnv {
+        root: PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolEnv for QueryOnlyEnv {
+        fn project_root(&self) -> &Path {
+            &self.root
+        }
+        fn artifact_requested(&self) -> bool {
+            false
+        }
+        async fn confirm(&self, _message: &str) -> bool {
+            true
+        }
+        async fn emit(&self, _event: ToolEvent) {}
+    }
+
+    #[tokio::test]
+    async fn query_only_turn_writes_zero_report_files() {
+        let tmp = std::env::temp_dir().join(format!("wisp_query_only_{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let env = QueryOnlyEnv { root: tmp.clone() };
+        let result = WriteTool
+            .run(
+                &json!({
+                    "path": "results/reports/depmap.md",
+                    "content": "should not land"
+                }),
+                &env,
+            )
+            .await;
+        assert!(!result.success, "{}", result.content);
+        assert!(!tmp.join("results/reports/depmap.md").exists());
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

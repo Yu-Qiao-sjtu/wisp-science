@@ -1,6 +1,22 @@
-use super::{save_approval_grants, AppState, ApprovalGrantKey};
+use super::{save_approval_grants, AppState, ApprovalGrantKey, ConfirmRequest, PendingConfirm};
 use serde::Serialize;
+use std::collections::HashMap;
 use tauri::State;
+
+const MIN_REMOTE_APPROVAL_PREFIX: usize = 6;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteConfirmationSource {
+    Native,
+    Acp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteConfirmationResolution {
+    pub(crate) approval_id: String,
+    pub(crate) frame_id: String,
+    pub(crate) source: RemoteConfirmationSource,
+}
 
 async fn ensure_project_frame(
     state: &AppState,
@@ -39,13 +55,115 @@ pub(super) fn cancel_pending_confirmation(state: &AppState, session_id: &str) {
     state.device_hub.resolve_needs_user(session_id);
 }
 
+pub(crate) fn pending_confirmation_requests(state: &AppState) -> Vec<ConfirmRequest> {
+    let mut requests = state
+        .confirms
+        .lock()
+        .unwrap()
+        .values()
+        .map(|pending| pending.request.clone())
+        .collect::<Vec<_>>();
+    requests.sort_by(|left, right| left.approval_id.cmp(&right.approval_id));
+    requests
+}
+
+fn remote_confirmation_session(
+    pending: &HashMap<String, PendingConfirm>,
+    selector: &str,
+) -> Result<String, String> {
+    let selector = selector.trim().to_ascii_lowercase();
+    if selector.len() < MIN_REMOTE_APPROVAL_PREFIX
+        || !selector.chars().all(|ch| ch.is_ascii_hexdigit())
+    {
+        return Err(format!(
+            "审批编号至少需要 {MIN_REMOTE_APPROVAL_PREFIX} 位十六进制字符。"
+        ));
+    }
+
+    let matches = pending
+        .iter()
+        .filter(|(_, value)| value.request.approval_id.starts_with(&selector))
+        .map(|(session_id, _)| session_id.clone())
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Err("未找到该待审批请求；它可能已经处理或失效。".into()),
+        [session_id] => Ok(session_id.clone()),
+        _ => Err("审批编号前缀不唯一，请输入更多位。".into()),
+    }
+}
+
+fn take_remote_confirmation(
+    state: &AppState,
+    selector: &str,
+) -> Result<(String, PendingConfirm), String> {
+    let mut pending = state.confirms.lock().unwrap();
+    let session_id = remote_confirmation_session(&pending, selector)?;
+    let value = pending
+        .remove(&session_id)
+        .expect("matched pending confirmation must still exist");
+    Ok((session_id, value))
+}
+
+async fn settle_confirmation(
+    state: &AppState,
+    session_id: &str,
+    pending: PendingConfirm,
+    decision: wisp_tools::ConfirmDecision,
+    scope: Option<&str>,
+) -> Result<(), String> {
+    state.awaiting_confirm.lock().unwrap().remove(session_id);
+    state.device_hub.resolve_needs_user(session_id);
+    if decision.approved() {
+        let scope = scope.unwrap_or("once");
+        if matches!(scope, "session" | "project" | "global") {
+            if let Some(grant) = pending.grant.clone() {
+                let snapshot = {
+                    let mut grants = state.approval_grants.lock().unwrap();
+                    grants.grant(scope, session_id, &pending.project_id, grant);
+                    grants.clone()
+                };
+                if scope != "session" {
+                    save_approval_grants(&state.store, &snapshot).await?;
+                }
+            }
+        }
+    }
+    let _ = pending.tx.send(decision);
+    Ok(())
+}
+
+pub(crate) async fn respond_remote_confirmation(
+    state: &AppState,
+    selector: &str,
+    approved: bool,
+    feedback: Option<String>,
+) -> Result<RemoteConfirmationResolution, String> {
+    let (session_id, pending) = take_remote_confirmation(state, selector)?;
+    let resolution = RemoteConfirmationResolution {
+        approval_id: pending.request.approval_id.clone(),
+        frame_id: session_id.clone(),
+        source: RemoteConfirmationSource::Native,
+    };
+    let decision = if approved {
+        wisp_tools::ConfirmDecision::Approved
+    } else {
+        wisp_tools::ConfirmDecision::Denied {
+            feedback: feedback
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+        }
+    };
+    settle_confirmation(state, &session_id, pending, decision, Some("once")).await?;
+    Ok(resolution)
+}
+
 #[tauri::command]
 pub(super) async fn get_session_full_permission(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     session_id: String,
 ) -> Result<bool, String> {
-    let project = state.active(window.label());
+    let project = state.require_active(window.label())?;
     ensure_project_frame(&state, &project.id, &session_id).await?;
     Ok(session_full_permission(&state, &session_id))
 }
@@ -53,11 +171,11 @@ pub(super) async fn get_session_full_permission(
 #[tauri::command]
 pub(super) async fn set_session_full_permission(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     session_id: String,
     enabled: bool,
 ) -> Result<bool, String> {
-    let project = state.active(window.label());
+    let project = state.require_active(window.label())?;
     ensure_project_frame(&state, &project.id, &session_id).await?;
     {
         let mut sessions = state
@@ -104,27 +222,43 @@ pub(super) async fn confirm_response(
     };
     let pending = state.confirms.lock().unwrap().remove(&session_id);
     if let Some(pending) = pending {
-        state.device_hub.resolve_needs_user(&session_id);
-        if approved {
-            let scope = scope.unwrap_or_else(|| "once".into());
-            if matches!(scope.as_str(), "session" | "project" | "global") {
-                if let Some(grant) = pending.grant.clone() {
-                    let snapshot = {
-                        let mut grants = state.approval_grants.lock().unwrap();
-                        grants.grant(&scope, &session_id, &pending.project_id, grant);
-                        grants.clone()
-                    };
-                    if scope != "session" {
-                        save_approval_grants(&state.store, &snapshot).await?;
-                    }
-                }
-            }
-        }
-        let _ = pending.tx.send(decision);
-        Ok(())
+        settle_confirmation(&state, &session_id, pending, decision, scope.as_deref()).await
     } else {
         Err("no pending confirmation".into())
     }
+}
+
+/// An approval ID must match while removing the pending entry: a stale native
+/// button must never approve a newer request in the same conversation.
+pub(crate) async fn respond_native_confirmation(
+    state: &AppState,
+    project: &str,
+    request: &wisp_dto::native_conversations::ApprovalRequest,
+) -> Result<(), String> {
+    ensure_project_frame(state, project, &request.session_id).await?;
+    let pending = take_native_confirmation(&mut state.confirms.lock().unwrap(), project, request)?;
+    let decision = if request.approved {
+        wisp_tools::ConfirmDecision::Approved
+    } else {
+        wisp_tools::ConfirmDecision::Denied {
+            feedback: request.feedback.clone().filter(|s| !s.trim().is_empty()),
+        }
+    };
+    settle_confirmation(state, &request.session_id, pending, decision, Some("once")).await
+}
+
+fn take_native_confirmation(
+    pending: &mut HashMap<String, PendingConfirm>,
+    project: &str,
+    request: &wisp_dto::native_conversations::ApprovalRequest,
+) -> Result<PendingConfirm, String> {
+    if !pending
+        .get(&request.session_id)
+        .is_some_and(|p| p.request.approval_id == request.approval_id && p.project_id == project)
+    {
+        return Err("Approval expired; refresh the conversation".into());
+    }
+    Ok(pending.remove(&request.session_id).unwrap())
 }
 
 #[derive(Serialize, Clone)]
@@ -219,4 +353,79 @@ pub(super) async fn revoke_all_approval_grants(state: State<'_, AppState>) -> Re
         grants.clone()
     };
     save_approval_grants(&state.store, &snapshot).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending(approval_id: &str) -> PendingConfirm {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let mut request = ConfirmRequest::new(
+            "session",
+            "Dangerous command detected".into(),
+            "shell",
+            "rm output.tmp".into(),
+        );
+        request.approval_id = approval_id.into();
+        PendingConfirm {
+            tx,
+            grant: None,
+            project_id: "project".into(),
+            request,
+        }
+    }
+
+    #[test]
+    fn native_approval_checks_exact_identity_and_scope_before_consuming() {
+        let mut entries = HashMap::from([("session".into(), pending("new-approval"))]);
+        let mut request = wisp_dto::native_conversations::ApprovalRequest {
+            session_id: "session".into(),
+            approval_id: "old-approval".into(),
+            approved: true,
+            feedback: None,
+        };
+        assert!(take_native_confirmation(&mut entries, "project", &request).is_err());
+        assert_eq!(entries.len(), 1);
+        request.approval_id = "new-approval".into();
+        assert!(take_native_confirmation(&mut entries, "other-project", &request).is_err());
+        assert_eq!(entries.len(), 1);
+        assert!(take_native_confirmation(&mut entries, "project", &request).is_ok());
+        assert!(take_native_confirmation(&mut entries, "project", &request).is_err());
+    }
+
+    #[test]
+    fn remote_approval_selector_is_case_insensitive_and_requires_safe_prefix() {
+        let requests = HashMap::from([(
+            "session-a".into(),
+            pending("abcdef1234567890abcdef1234567890"),
+        )]);
+        assert_eq!(
+            remote_confirmation_session(&requests, "ABCDEF12").as_deref(),
+            Ok("session-a")
+        );
+        assert!(remote_confirmation_session(&requests, "abc").is_err());
+        assert!(remote_confirmation_session(&requests, "not-hex").is_err());
+        assert!(remote_confirmation_session(&requests, "ffffff").is_err());
+    }
+
+    #[test]
+    fn remote_approval_selector_rejects_ambiguous_prefixes() {
+        let requests = HashMap::from([
+            (
+                "session-a".into(),
+                pending("abcdef1234567890abcdef1234567890"),
+            ),
+            (
+                "session-b".into(),
+                pending("abcdef9876543210abcdef9876543210"),
+            ),
+        ]);
+        let error = remote_confirmation_session(&requests, "abcdef").unwrap_err();
+        assert!(error.contains("不唯一"));
+        assert_eq!(
+            remote_confirmation_session(&requests, "abcdef12").as_deref(),
+            Ok("session-a")
+        );
+    }
 }

@@ -3,12 +3,15 @@ use super::*;
 #[component]
 pub(crate) fn ProjectsScreen(
     locale: RwSignal<Locale>,
+    calendar_open: RwSignal<bool>,
+    dialog_open: RwSignal<bool>,
     running: RwSignal<HashSet<String>>,
     approval_pending: ReadSignal<HashSet<String>>,
     sync_actions_available: ReadSignal<bool>,
     open_error: RwSignal<Option<String>>,
     on_open: Callback<String>,
     on_open_session: Callback<(String, String)>,
+    on_open_journey: Callback<(String, i64)>,
     on_open_artifact: Callback<(String, String, String)>,
     on_open_settings: Callback<()>,
     on_open_library: Callback<()>,
@@ -25,6 +28,7 @@ pub(crate) fn ProjectsScreen(
     menu_import_project: RwSignal<bool>,
 ) -> impl IntoView {
     let projects = create_rw_signal(Vec::<ProjectSummary>::new());
+    let starring_projects = create_rw_signal(HashSet::<String>::new());
     let recent = create_rw_signal(Vec::<RecentSession>::new());
     let artifact_hits = create_rw_signal(Vec::<ArtifactInfo>::new());
     let search_open = create_rw_signal(false);
@@ -41,6 +45,11 @@ pub(crate) fn ProjectsScreen(
     let new_ctx = create_rw_signal(String::new());
     let import_options_open = create_rw_signal(false);
     let opening_in_place = create_rw_signal(false);
+    let workspace_projects = create_rw_signal(None::<Vec<ProjectSummary>>);
+    let recovery_preview = create_rw_signal(None::<WorkspaceSessionRecoveryPreview>);
+    let recovery_name = create_rw_signal(String::new());
+    let recovery_busy = create_rw_signal(false);
+    let recovery_error = create_rw_signal(None::<String>);
     // Off by default: pointing at an existing repo must not litter it. Checking
     // the box reveals the convention text, which doubles as a worked example of
     // what Agent Context is for.
@@ -57,6 +66,7 @@ pub(crate) fn ProjectsScreen(
     let settings_project_id = create_rw_signal(None::<String>);
     let settings_form = create_rw_signal(ProjectSettings::default());
     let settings_baseline = create_rw_signal(ProjectSettings::default());
+    let settings_specialists = create_rw_signal(Vec::<Specialist>::new());
     let settings_busy = create_rw_signal(false);
     let settings_confirm_context = create_rw_signal(false);
     let delete_data_countdown = create_rw_signal(0_u8);
@@ -145,6 +155,11 @@ pub(crate) fn ProjectsScreen(
     create_effect(move |_| {
         if settings_project_id.get().is_some() && !settings_confirm_context.get() {
             focus_and_select_soon("project-home-settings-name");
+        }
+    });
+    create_effect(move |_| {
+        if recovery_preview.get().is_some() {
+            focus_and_select_soon("workspace-recovery-name");
         }
     });
 
@@ -370,6 +385,7 @@ pub(crate) fn ProjectsScreen(
                 "name": form.name,
                 "description": form.description,
                 "agentContext": form.agent_context,
+                "defaultSpecialistId": form.default_specialist_id,
             }))
             .unwrap();
             match invoke_checked("update_project", arg).await {
@@ -431,6 +447,23 @@ pub(crate) fn ProjectsScreen(
             let Ok(Some(path)) = serde_wasm_bindgen::from_value::<Option<String>>(value) else {
                 return;
             };
+            let args = to_value(&serde_json::json!({ "workspaceDir": path })).unwrap();
+            let matches = match invoke_checked("list_workspace_projects", args).await {
+                Ok(value) => serde_wasm_bindgen::from_value::<Vec<ProjectSummary>>(value)
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(js_error_text(error)),
+            };
+            match matches {
+                Ok(matches) if !matches.is_empty() => {
+                    workspace_projects.set(Some(matches));
+                    return;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    open_error.set(Some(localize_backend(locale.get_untracked(), &error)));
+                    return;
+                }
+            }
             let name = path
                 .trim_end_matches(['/', '\\'])
                 .rsplit(['/', '\\'])
@@ -444,6 +477,79 @@ pub(crate) fn ProjectsScreen(
             new_layout.set(false);
             opening_in_place.set(true);
             creating.set(true);
+        });
+    });
+
+    let recover_from_workspace = Callback::new(move |_: ()| {
+        import_options_open.set(false);
+        open_error.set(None);
+        recovery_error.set(None);
+        spawn_local(async move {
+            let value = invoke("pick_directory", JsValue::UNDEFINED).await;
+            let Ok(Some(path)) = serde_wasm_bindgen::from_value::<Option<String>>(value) else {
+                return;
+            };
+            let args = to_value(&serde_json::json!({ "workspaceDir": path })).unwrap();
+            match invoke_checked("preview_workspace_session_recovery", args).await {
+                Ok(value) => {
+                    if let Ok(preview) =
+                        serde_wasm_bindgen::from_value::<WorkspaceSessionRecoveryPreview>(value)
+                    {
+                        recovery_name.set(preview.suggested_name.clone());
+                        recovery_preview.set(Some(preview));
+                    }
+                }
+                Err(error) => {
+                    open_error.set(Some(localize_backend(
+                        locale.get_untracked(),
+                        &js_error_text(error),
+                    )));
+                }
+            }
+        });
+    });
+
+    let confirm_workspace_recovery = Callback::new(move |_: ()| {
+        if recovery_busy.get_untracked() {
+            return;
+        }
+        let Some(preview) = recovery_preview.get_untracked() else {
+            return;
+        };
+        let name = recovery_name.get_untracked();
+        if name.trim().is_empty() || preview.recoverable_session_count == 0 {
+            return;
+        }
+        recovery_busy.set(true);
+        recovery_error.set(None);
+        spawn_local(async move {
+            let args = to_value(&serde_json::json!({
+                "workspaceDir": preview.workspace_dir,
+                "name": name,
+            }))
+            .unwrap();
+            match invoke_checked("recover_workspace_sessions", args).await {
+                Ok(value) => {
+                    if let Ok(result) =
+                        serde_wasm_bindgen::from_value::<WorkspaceSessionRecoveryResult>(value)
+                    {
+                        recovery_preview.set(None);
+                        recovery_name.set(String::new());
+                        recovery_busy.set(false);
+                        recovery_error.set(None);
+                        on_open.call(result.project_id);
+                    } else {
+                        recovery_busy.set(false);
+                    }
+                }
+                Err(error) => {
+                    recovery_busy.set(false);
+                    recovery_error.set(Some(localize_backend(
+                        locale.get_untracked(),
+                        &js_error_text(error),
+                    )));
+                }
+            }
         });
     });
 
@@ -499,6 +605,24 @@ pub(crate) fn ProjectsScreen(
         });
     });
 
+    // The root Escape stack closes the calendar only after these visually
+    // higher, component-owned dialogs have had their turn.
+    create_effect(move |_| {
+        dialog_open.set(
+            confirm_delete_data.get()
+                || settings_confirm_context.get()
+                || settings_project_id.get().is_some()
+                || workspace_projects.get().is_some()
+                || recovery_preview.get().is_some()
+                || import_options_open.get()
+                || pending_delete.get().is_some()
+                || sync_conflict_project.get().is_some()
+                || search_open.get()
+                || creating.get(),
+        );
+    });
+    on_cleanup(move || dialog_open.set(false));
+
     // Local Escape stack — ProjectsScreen owns its own modals, so the App
     // window listener cannot see `creating` / `pending_delete`. Opening a
     // project disposes this component, so the listener has to go with it:
@@ -526,6 +650,21 @@ pub(crate) fn ProjectsScreen(
             ev.prevent_default();
             settings_confirm_context.set(false);
             settings_project_id.set(None);
+            return;
+        }
+        if workspace_projects.get().is_some() {
+            ev.prevent_default();
+            ev.stop_propagation();
+            workspace_projects.set(None);
+            return;
+        }
+        if recovery_preview.get().is_some() {
+            ev.prevent_default();
+            if !recovery_busy.get() {
+                recovery_preview.set(None);
+                recovery_name.set(String::new());
+                recovery_error.set(None);
+            }
             return;
         }
         if import_options_open.get() {
@@ -563,12 +702,21 @@ pub(crate) fn ProjectsScreen(
             }
             ev.prevent_default();
         }>
-            <div class="projects-head">
+            <div class="projects-head" prop:inert=move ||calendar_open.get()>
                 <div class="projects-brand">
-                    <span class="projects-brand-mark" aria-hidden="true"></span>
-                    <div class="projects-title">"Wisp Science"</div>
+                    <h1 class="projects-title">
+                        <span class="projects-brand-mark brand-wordmark" role="img" aria-label="wisp-depmap"></span>
+                    </h1>
+                    <p class="projects-tagline">
+                        <span>{move || t(locale.get(), "projects.tagline_lead")}</span>
+                        <span>{move || t(locale.get(), "projects.tagline_brand")}</span>
+                    </p>
                 </div>
                 <div class="projects-actions">
+                    <button type="button" class="projects-icon-btn" data-testid="open-research-calendar"
+                        title=move || crate::research_journey::j(locale.get(), "Research calendar", "研究日历")
+                        aria-label=move || crate::research_journey::j(locale.get(), "Research calendar", "研究日历")
+                        on:click=move |_| calendar_open.set(true)>{compose_icon("calendar")}</button>
                     <button type="button" class="projects-icon-btn"
                         title=move || t(locale.get(), "sidebar.library")
                         aria-label=move || t(locale.get(), "sidebar.library")
@@ -789,10 +937,152 @@ pub(crate) fn ProjectsScreen(
                                 <strong>{move || t(locale.get(), "projects.import_zip")}</strong>
                                 <span>{move || t(locale.get(), "projects.import_zip_hint")}</span>
                             </button>
+                            <button type="button" class="project-import-option"
+                                on:click=move |_| recover_from_workspace.call(())>
+                                <strong>{move || t(locale.get(), "projects.recover_workspace")}</strong>
+                                <span>{move || t(locale.get(), "projects.recover_workspace_hint")}</span>
+                            </button>
                         </div>
                         <div class="row">
                             <button type="button" on:click=move |_| import_options_open.set(false)>
                                 {move || t(locale.get(), "settings.cancel")}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            })}
+            {move || recovery_preview.get().map(|preview| {
+                let range = match (preview.earliest_message_at, preview.latest_message_at) {
+                    (Some(start), Some(end)) => tf(
+                        locale.get(),
+                        "projects.recover_range",
+                        &[
+                            ("start", &format_message_datetime(start, locale.get())),
+                            ("end", &format_message_datetime(end, locale.get())),
+                        ],
+                    ),
+                    _ => t(locale.get(), "projects.recover_range_unknown").into(),
+                };
+                view! {
+                    <div class="overlay" data-testid="workspace-session-recovery">
+                        <div class="modal proj-settings-modal workspace-recovery-modal"
+                            role="dialog" aria-modal="true"
+                            aria-label=move || t(locale.get(), "projects.recover_title")>
+                            <div class="ps-head">
+                                <h2>{move || t(locale.get(), "projects.recover_title")}</h2>
+                                <button type="button" class="ps-close"
+                                    title=move || t(locale.get(), "projects.cancel")
+                                    disabled=move || recovery_busy.get()
+                                    on:click=move |_| {
+                                        recovery_preview.set(None);
+                                        recovery_name.set(String::new());
+                                        recovery_error.set(None);
+                                    }>{compose_icon("close")}</button>
+                            </div>
+                            <p class="project-in-place-hint">
+                                {move || t(locale.get(), "projects.recover_notice")}
+                            </p>
+                            <label>
+                                {move || t(locale.get(), "proj_settings.name")}
+                                <input id="workspace-recovery-name"
+                                    prop:value=move || recovery_name.get()
+                                    on:input=move |event| recovery_name.set(event_target_value(&event)) />
+                            </label>
+                            <div class="workspace-recovery-path" title=preview.workspace_dir.clone()>
+                                {preview.workspace_dir.clone()}
+                            </div>
+                            <div class="workspace-recovery-stats">
+                                <div><strong>{preview.recoverable_session_count}</strong><span>{move || t(locale.get(), "projects.recover_sessions")}</span></div>
+                                <div><strong>{preview.message_count}</strong><span>{move || t(locale.get(), "projects.recover_messages")}</span></div>
+                                <div><strong>{preview.valid_archive_count}</strong><span>{move || t(locale.get(), "projects.recover_archives")}</span></div>
+                            </div>
+                            <p class="workspace-recovery-range">{range}</p>
+                            {(preview.invalid_archive_count > 0 || preview.duplicate_archive_count > 0).then(|| view! {
+                                <p class="workspace-recovery-warning">
+                                    {tf(
+                                        locale.get(),
+                                        "projects.recover_skipped",
+                                        &[
+                                            ("invalid", &preview.invalid_archive_count.to_string()),
+                                            ("duplicate", &preview.duplicate_archive_count.to_string()),
+                                        ],
+                                    )}
+                                </p>
+                            })}
+                            {(preview.recoverable_session_count == 0).then(|| view! {
+                                <div class="workspace-recovery-error" role="alert">
+                                    {move || t(locale.get(), "projects.recover_empty")}
+                                </div>
+                            })}
+                            {move || recovery_error.get().map(|message| view! {
+                                <div class="workspace-recovery-error" role="alert">{message}</div>
+                            })}
+                            <div class="row">
+                                <button type="button"
+                                    disabled=move || recovery_busy.get()
+                                    on:click=move |_| {
+                                        recovery_preview.set(None);
+                                        recovery_name.set(String::new());
+                                        recovery_error.set(None);
+                                    }>{move || t(locale.get(), "projects.cancel")}</button>
+                                <button type="button" class="primary"
+                                    disabled=move || recovery_busy.get()
+                                        || recovery_name.get().trim().is_empty()
+                                        || preview.recoverable_session_count == 0
+                                    on:click=move |_| confirm_workspace_recovery.call(())>
+                                    {move || t(
+                                        locale.get(),
+                                        if recovery_busy.get() {
+                                            "projects.recovering"
+                                        } else {
+                                            "projects.recover_action"
+                                        },
+                                    )}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                }
+            })}
+            {move || workspace_projects.get().map(|matches| view! {
+                <div class="overlay" data-testid="workspace-project-picker">
+                    <div class="modal proj-settings-modal" role="dialog" aria-modal="true"
+                        aria-label=move || t(locale.get(), "projects.existing_title")>
+                        <div class="ps-head">
+                            <h2>{move || t(locale.get(), "projects.existing_title")}</h2>
+                            <button type="button" class="ps-close"
+                                title=move || t(locale.get(), "projects.cancel")
+                                on:click=move |_| workspace_projects.set(None)>
+                                {compose_icon("close")}
+                            </button>
+                        </div>
+                        <p class="project-in-place-hint">
+                            {move || t(locale.get(), "projects.existing_hint")}
+                        </p>
+                        <div class="workspace-project-options">
+                            {matches.into_iter().filter(|project| !project_is_hidden(&project.id)).map(|project| {
+                                let id = project.id.clone();
+                                view! {
+                                    <button type="button" class="project-import-option"
+                                        data-project-id=project.id.clone()
+                                        on:click=move |_| {
+                                            workspace_projects.set(None);
+                                            on_open.call(id.clone());
+                                        }>
+                                        <strong>{project.name}</strong>
+                                        <span>{project.workspace_dir}</span>
+                                        <span class="workspace-project-id">{format!("ID: {}", project.id)}</span>
+                                        <span>{move || tf(locale.get(), "projects.sessions_n", &[("n", &project.session_count.to_string())])}</span>
+                                    </button>
+                                }
+                            }).collect_view()}
+                        </div>
+                        {move || privacy_mode_active.get().then(|| view! {
+                            <p class="ps-hint">{move || t(locale.get(), "projects.existing_privacy")}</p>
+                        })}
+                        <div class="row">
+                            <button type="button" on:click=move |_| workspace_projects.set(None)>
+                                {move || t(locale.get(), "projects.cancel")}
                             </button>
                         </div>
                     </div>
@@ -918,6 +1208,23 @@ pub(crate) fn ProjectsScreen(
                                     }></textarea>
                             </label>
                             <label>
+                                <span class="ps-label">{move || t(locale.get(), "proj_settings.default_specialist")}</span>
+                                <span class="ps-hint">{move || t(locale.get(), "proj_settings.default_specialist_hint")}</span>
+                                <select data-testid="project-home-default-specialist"
+                                    prop:value=move || settings_form.get().default_specialist_id
+                                    on:change=move |ev| {
+                                        let value = event_target_value(&ev);
+                                        settings_form.update(|settings| settings.default_specialist_id = value);
+                                    }>
+                                    <option value="">{move || t(locale.get(), "proj_settings.default_specialist_none")}</option>
+                                    <For each=move || settings_specialists.get() key=|specialist| specialist.id.clone()
+                                        children=move |specialist| view! {
+                                            <option value=specialist.id>{specialist.name}</option>
+                                        }
+                                    />
+                                </select>
+                            </label>
+                            <label>
                                 <span class="ps-label">{move || t(locale.get(), "proj_settings.agent_context")}</span>
                                 <span class="ps-hint">{move || t(locale.get(), "proj_settings.agent_context_hint")}</span>
                                 <textarea class="ps-textarea ps-ctx" rows="8"
@@ -959,18 +1266,18 @@ pub(crate) fn ProjectsScreen(
                     </div>
                 </div>
             })}
-            <div class="projects-cols">
+            {move || calendar_open.get().then(|| view! {<div class="home-calendar-page">
+            <crate::research_calendar::ResearchCalendar
+                locale=locale
+                projects=Signal::derive(move || projects.get().into_iter().filter(|p| !project_is_hidden(&p.id)).collect())
+                on_open_journey=on_open_journey
+                on_close=Callback::new(move |_|calendar_open.set(false))
+                project_transfer=project_transfer.read_only()
+            />
+            </div>})}
+            <div class="projects-cols" prop:inert=move ||calendar_open.get()>
                 <div class="projects-col">
                     <h2>{move || t(locale.get(), "projects.title")}</h2>
-                    <button type="button" class="proj-card proj-example" on:click=move |_| on_open_demo.call(())>
-                        <div>
-                            <div class="pc-name">
-                                {move || t(locale.get(), "projects.example")}
-                                <span class="pc-tag">{move || t(locale.get(), "projects.example_tag")}</span>
-                            </div>
-                            <div class="pc-meta">{move || tf(locale.get(), "projects.sessions_n", &[("n", &demo_count.get().to_string())])}</div>
-                        </div>
-                    </button>
                     {move || {
                         let loc = locale.get();
                         let list = projects
@@ -979,10 +1286,10 @@ pub(crate) fn ProjectsScreen(
                             .filter(|project| !project_is_hidden(&project.id))
                             .collect::<Vec<_>>();
                         let show_sync_actions = sync_actions_available.get();
-                        if list.is_empty() && !creating.get() {
-                            return view! {}.into_view();
-                        }
-                        list.into_iter().map(|p| {
+                        let pinned_count = list.iter().take_while(|p| p.starred).count();
+                        let mut cards = list.into_iter().map(|p| {
+                            let id_star = p.id.clone();
+                            let id_star_busy = p.id.clone();
                             let id_open = p.id.clone();
                             let id_open_locked = p.id.clone();
                             let id_card_locked = p.id.clone();
@@ -1017,7 +1324,7 @@ pub(crate) fn ProjectsScreen(
                                 None
                             };
                             view! {
-                                <div class="proj-card"
+                                <div class="proj-card" class:project-starred=p.starred
                                     class:project-exporting=move || project_transfer.get().is_some_and(|transfer| transfer.is_exporting_project(&id_card_locked))>
                                     <button type="button" class="proj-card-main"
                                         disabled=move || project_transfer.get().is_some_and(|transfer| transfer.is_exporting_project(&id_open_locked))
@@ -1051,6 +1358,27 @@ pub(crate) fn ProjectsScreen(
                                     </div>
                                     </button>
                                     <div class="pc-actions">
+                                    <button type="button" class="pc-star" data-testid="project-card-star"
+                                        class:starred=p.starred
+                                        aria-pressed=p.starred.to_string()
+                                        title=t(loc, if p.starred { "projects.unstar" } else { "projects.star" })
+                                        aria-label=t(loc, if p.starred { "projects.unstar" } else { "projects.star" })
+                                        disabled=move || starring_projects.with(|ids| ids.contains(&id_star_busy))
+                                        on:click=move |e| {
+                                            e.stop_propagation();
+                                            let id = id_star.clone();
+                                            if starring_projects.with_untracked(|ids| ids.contains(&id)) { return; }
+                                            starring_projects.update(|ids| { ids.insert(id.clone()); });
+                                            open_error.set(None);
+                                            spawn_local(async move {
+                                                let args = to_value(&serde_json::json!({"id": id, "starred": !p.starred})).unwrap();
+                                                match invoke_checked("set_project_starred", args).await {
+                                                    Ok(_) => reload(),
+                                                    Err(error) => open_error.set(Some(localize_backend(locale.get_untracked(), &js_error_text(error)))),
+                                                }
+                                                starring_projects.update(|ids| { ids.remove(&id); });
+                                            });
+                                        }>{compose_icon(if p.starred { "star-filled" } else { "star" })}</button>
                                     <button type="button" class="pc-settings" data-testid="project-card-settings"
                                         title=t(loc, "projects.settings")
                                         aria-label=t(loc, "projects.settings")
@@ -1062,6 +1390,11 @@ pub(crate) fn ProjectsScreen(
                                             settings_busy.set(false);
                                             open_error.set(None);
                                             spawn_local(async move {
+                                                if let Ok(value) = invoke_checked("list_specialists", wasm_bindgen::JsValue::UNDEFINED).await {
+                                                    if let Ok(list) = serde_wasm_bindgen::from_value::<Vec<Specialist>>(value) {
+                                                        settings_specialists.set(list);
+                                                    }
+                                                }
                                                 let arg = to_value(&serde_json::json!({ "id": id.clone() })).unwrap();
                                                 match invoke_checked("get_project_settings", arg).await {
                                                     Ok(value) => {
@@ -1180,7 +1513,19 @@ pub(crate) fn ProjectsScreen(
                                     </div>
                                 </div>
                             }
-                        }).collect_view()
+                        }).map(IntoView::into_view).collect::<Vec<_>>();
+                        cards.insert(pinned_count, view! {
+                            <button type="button" class="proj-card proj-example" on:click=move |_| on_open_demo.call(())>
+                                <div>
+                                    <div class="pc-name">
+                                        {move || t(locale.get(), "projects.example")}
+                                        <span class="pc-tag">{move || t(locale.get(), "projects.example_tag")}</span>
+                                    </div>
+                                    <div class="pc-meta">{move || tf(locale.get(), "projects.sessions_n", &[("n", &demo_count.get().to_string())])}</div>
+                                </div>
+                            </button>
+                        }.into_view());
+                        cards.collect_view()
                     }}
                 </div>
                 <div class="projects-col">
@@ -1206,10 +1551,10 @@ pub(crate) fn ProjectsScreen(
                     }).collect_view()}
                 </div>
             </div>
-            <div class="projects-footer">
+            <div class="projects-footer" prop:inert=move ||calendar_open.get()>
                 <span>{move || t(locale.get(), "projects.star_hint")}</span>
                 <button type="button" class="projects-star-link"
-                    on:click=move |_| open_external_url("https://github.com/xuzhougeng/wisp-science".into())>
+                    on:click=move |_| open_external_url("https://github.com/Yu-Qiao-sjtu/wisp-science-depmap".into())>
                     {move || t(locale.get(), "projects.star_link")}
                 </button>
             </div>

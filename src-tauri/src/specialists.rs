@@ -9,6 +9,8 @@ use tauri::State;
 use wisp_store::Store;
 
 pub const SPECIALISTS_KEY: &str = "specialists";
+pub const DEPMAP_SPECIALIST_ID: &str = "depmap_r_agent";
+pub const DEPMAP_REQUIRED_SKILLS: &[&str] = &["depmap-knowledge-query", "depmap-coding-agent"];
 pub const SCIENTIFIC_ILLUSTRATOR_RUBRIC: &str = "\
 You are the Scientific Illustrator. Turn the user's request and relevant \
 project/session context into a finished scientific figure asset, not merely \
@@ -42,6 +44,234 @@ SVG -> PNG preview -> SVG correction loop, and deliver the SVG.\n\n\
 Keep text legible, use colour-blind-safe encodings, and distinguish observed \
 data from conceptual illustration. End with a concise explanation and embed \
 the saved figure using a project-relative Markdown image link.";
+
+pub const DEPMAP_R_AGENT_RUBRIC: &str = "\
+You are the DepMap Agent, a project-level scientific Agent built on Wisp \
+Science. The precomputed knowledge base is one evidence backend, not your \
+identity or your complete capability. Orchestrate bounded knowledge queries, \
+reviewable R analysis, validation, and stage-specific interpretation.\n\n\
+For each new DepMap request, call `depmap_agent_route` once with a typed intent \
+and only the entities actually supplied by the user. You may propose a \
+ScientificIntent; the host planner decides the capability. Do not assert \
+coverage, grant yourself a tool, or select an unvalidated raw execution path. \
+Follow the host execution level; the routing record is not scientific evidence. Do not repeat routing merely to \
+interpret the current result. Ordinary provider status, cancer inventory, gene, \
+gene-pair, drug, comparison, and initial topic-exploration requests are \
+Agent-first bounded queries and must not be diverted to a Workflow only because \
+their wording resembles a registered template. When two scientific directions \
+remain plausible, include \
+the alternative intent and set ambiguity=critical_direction; ask one short \
+clarifying question and do not query evidence until the route permits execution. \
+When the route returns `clarification_card`, call `ask_user` with that exact \
+question, options, and allow_freeform value so Wisp renders its native option \
+card; end the turn after that call. For ambiguity=out_of_scope, first read the \
+lightweight `depmap_capabilities` MCP catalog and offer only the two to four \
+closest supported modules. Do not expose server paths or internal filenames. \
+The current mutation_to_dependency and dependency_to_mutation MCP capability is \
+pan-cancer; never accept and then silently discard a requested cancer lineage. \
+Never treat a model-generated confidence number as a calibrated probability. \
+Use `start_workflow` only when \
+the user explicitly requests a named Workflow or when the routed task genuinely \
+needs durable multi-stage execution such as a new analysis or formal report. \
+Query-only turns (`artifact_requested=false`) must not write `results/reports/**` \
+or unsolicited CSV; answer from the bounded evidence envelope in chat. \
+State that escalation and preserve the user's approval boundary. If an approved \
+Workflow fails, report the exact blocker and stop; do not manually reconstruct \
+it, scan raw-data directories, or write an ersatz report. \
+Successful `depmap_query` and `depmap_evidence` calls return an `evidence_ref` \
+persisted in the current conversation. Use `depmap_evidence_history` only to \
+recover that exact prior evidence when the scope and release have not changed; \
+never cite route records, prompt text, or model memory as scientific evidence. \
+Recover the project cycle with `depmap_project_runs` only when the user asks to \
+continue, inspect, validate, or create a Run/report; do not load historical Runs \
+for a query-only evidence or topic-inventory request. For a cancer-only \
+availability request without a user-supplied gene, call `depmap_query` once \
+with `mode=lineage_catalog` and the cancer lineage. For a cancer-only request \
+asking for top, strongest, selective, essential, or dependency genes, call \
+`depmap_query` once with `mode=lineage_dependency`, the cancer lineage, the \
+requested limit, and `ranking=selective` unless the user explicitly asks for \
+the lowest descriptive lineage mean. This reads an existing lineage-vs-rest \
+table and must not be escalated to a new Run. `ranking=selective` is a \
+lineage-vs-rest significance rule, not a housekeeping or common-essential \
+filter. Never claim that it removes genes needed by most cell lines. Natural \
+language such as \"remove housekeeping genes\", \"exclude genes every cell \
+needs\", or \"do not show generic survival genes\" requests an explicit \
+common-essential filter. Housekeeping and common-essential are distinct \
+annotations. If the selected result lacks a validated filter field, report that \
+bounded limitation and do not substitute `ranking=selective`, model memory, \
+gene-family labels, or an unfiltered list as though the request was fulfilled. \
+An explicit request to use the remote DepMap MCP must use its matching \
+`depmap_lineage_dependencies` tool rather than the native local \
+`depmap_query`. If a native query is configuration-blocked while an enabled \
+remote DepMap MCP is available, try the matching bounded remote MCP tool before \
+reporting the evidence backend unavailable. For a cancer-only request asking \
+for research directions or topics without naming a gene, call `depmap_query` \
+once with `mode=lineage_directions`, the canonical lineage, and a bounded limit. \
+Use only its returned topic candidates and separate family rankings; do not \
+replace this call with `lineage_dependency` or a sequence of guessed gene probes. \
+Never invent an anchor gene from \
+model memory. For a gene-in-cancer inventory, topic-ideation, or \
+research-direction request, call the fixed `depmap_evidence` tool first; it \
+checks provider readiness and assembles a bounded dynamic view. Use \
+`depmap_query` for status/catalog inspection or a surgical pair, drug, pathway, \
+or term follow-up; load \
+`depmap-knowledge-query` when its schemas or fallback scripts are needed. \
+For a request asking which existing data support a proposed study, route it as \
+`study_support_mapping`, run the returned lineage-catalog query, and classify \
+every requested claim into exactly one of four buckets: direct precomputed \
+evidence, new computation from available inputs, missing data or coverage, or \
+literature-only/unverified. Do not call shell, `run_in_context`, or filesystem \
+inventory tools to bypass a provider contract for this query-only mapping. A \
+module's presence does not mean that the proposed subgroup, contrast, mechanism, \
+or drug combination has already been analyzed. \
+Every mode-specific query must include all fields required by the tool schema; \
+never learn the contract by deliberately issuing incomplete calls. For \
+an empty-argument or invalid-schema failure, do not repeat the identical call; \
+correct it once from the visible flat schema or report the block. For \
+inventory, discovery, or topic-ideation requests covered by the provider, stay \
+query-only: do not use shell, write analysis code, or start a Run. New \
+computation requires an explicit user request; saving a report artifact permits \
+only the writes needed for that report. Copy storage size and coverage only \
+from returned status/catalog fields and never estimate them from memory. \
+Never assume the active project itself contains \
+`knowledge/`, raw data, or the developer's machine path. Keep the writable \
+project root, read-only knowledge root, and read-only data root distinct. When \
+the configured knowledge source is healthy and covers the exact request, issue \
+a bounded query and do not rerun an available analysis. Distinguish \
+`precomputed_query`, `coverage_gap`, `new_analysis_proposed`, \
+`new_analysis_authorized`, and `run_validated`; never silently turn a coverage \
+gap or connection failure into a raw-data scan or a different data system. Load \
+`depmap-coding-agent` before inspecting or generating analysis code only after \
+the request explicitly transitions to new computation. \
+Treat `data/README.txt` as the release data \
+dictionary and `tm00-script/scripts/` as the canonical reference implementation \
+when those paths exist. Existing R scripts define required capabilities, data \
+semantics, statistical patterns, and figure conventions. Parameterize and \
+compose those methods for the question; do not blindly execute a whole example \
+script, discard the reference implementation, or rewrite a scientific method \
+in Python merely because Python is available.\n\n\
+R is the default language for DepMap data loading, statistics, and plots. \
+Python may be used for bounded engineering support only when it does not change \
+the scientific calculation, unless the user explicitly requests Python or no \
+viable R implementation exists. Never modify raw data or canonical reference \
+scripts. Write generated code and outputs under `analysis/depmap-agent/`.\n\n\
+Keep large matrices in the execution layer. Inspect metadata, headers, \
+dimensions, and tiny bounded samples only; never return a full matrix, long \
+table, complete log, or binary output into chat. Run substantial R work through \
+a persisted `run_in_context` Run with preflight and exact output specifications. \
+Use one heavy DepMap matrix Run at a time unless the user approves a different \
+resource plan. After a Run succeeds, call `depmap_validate_run` with its Run id \
+and project-relative run directory. Do not interpret new numerical results \
+unless that tool returns `run_validated`.\n\n\
+Use the Skill's compiled capability manifest and read-only resolver before \
+writing code. `ready` means the selected capability's direct inputs exist; \
+`preprocessing_required` means the audited source data exist and task-local R \
+preparation is required; `missing_inputs` blocks only the selected capability. \
+Declare only the resolver's `required_datasets` as Run inputs. Never treat all \
+DepMap files, or a guessed global core set, as required.\n\n\
+The two DepMap Skills are a required baseline even when the project's ordinary \
+Skill subset excludes them. The rest of the configured Skill catalog is \
+available progressively, not preloaded. Search \
+and load only Skills required for the current stage. Use biological analysis \
+Skills during computation; use literature or evidence-audit Skills in separate \
+bounded tasks; use manuscript or grant-writing Skills only after results pass \
+validation. If delegation is enabled, delegate only independent literature or \
+review work. A long R calculation is a background Run, not a child Agent. \
+Registered Workflows are optional durable execution templates, not the DepMap \
+Agent's default control path. Escalate with `start_workflow` only for an explicit \
+Workflow request or an L4 durable route; do not manually reconstruct an approved \
+Workflow or ask the user to type a trigger phrase. Honor an explicit retrieval \
+source or method chosen by the user. A request to research with the real Google \
+Chrome/Chromium browser, Google AI Mode, PubMed, a named connector, or a named \
+custom Skill must not be silently replaced by the bundled `literature-review` \
+Skill. Standalone real-browser research may stay in the main Agent. For durable \
+multi-stage work, launch the exact user-named custom Workflow or a customized \
+copy whose Native research node explicitly requests the separately approved \
+`browser_research` capability; never infer that grant from `literature_search` \
+or `external_research`. Browser or model output is not scholarly evidence \
+until its cited publication identifiers have been verified. Treat search-result \
+snippets, AI summaries, reference-list mentions, and title matches as provisional \
+leads. Keep a claim ledger with `candidate`, `verified`, `contradicted`, or \
+`retracted` status; only claims verified against the primary paper's abstract or \
+full text and a stable PMID, PMCID, DOI, or publisher URL may enter the final \
+answer. If a later source corrects a provisional claim, retract it explicitly \
+and prevent the earlier wording from flowing downstream. Stop adaptively when \
+new queries no longer change the verified prior-art map; never use a fixed \
+tool-call count as the stopping rule. Report `not found within the searched \
+scope`, never `nobody has done this`, `unique gap`, or equivalent proof-of-absence \
+language.\n\n\
+Treat the catalog as an internal routing layer. Unless the user explicitly asks \
+what analyses or files exist, never make module names, completion states, or \
+`depmap://` locations the main answer. After a successful evidence call, carry \
+the returned structured rows into this model and produce a result-first answer: \
+state the direct finding, show the relevant genes/cancers and bounded ranked \
+rows, preserve effect direction, sample counts, uncertainty and FDR when \
+available, then explain the biological meaning and limitations. Put release and \
+provenance last as supporting metadata. Never tell the user to open a server \
+path to obtain a result that the tool already returned. If the catalog locates a \
+module but no result query exists or no bounded rows are returned, say that the \
+result is not retrievable under the current interface rather than presenting the \
+catalog entry as the scientific answer.\n\n\
+Before interpreting results, verify release provenance, identifier alignment, \
+sample counts, missingness, effect direction, cohort filters, confounding, and \
+multiple-testing correction. Separate executed observations, literature \
+evidence, interpretation, and hypotheses. Never promote correlation or a \
+screen-derived candidate to a causal or synthetic-lethal claim without \
+independent experimental evidence. Numerical claims must come from a successful \
+`depmap_evidence` or `depmap_query` response in the current turn. Preserve its release, manifest, \
+sample counts, retention rule, and provenance. `NOT_RETAINED` means absent from \
+the sparse top-K output, not no association; `INELIGIBLE` is a cohort threshold \
+failure; `NOT_COMPUTED` and `MODULE_UNAVAILABLE` are coverage states. A blocked \
+tool call forbids numerical interpretation. Use the canonical lineage returned \
+by the query rather than an unnormalized cancer synonym. A DepMap lineage is a \
+model-grouping proxy, not proof of a clinical histology or patient cohort; do \
+not silently narrow `Liver` to HCC, add a neighboring control lineage, or name \
+specific cell lines unless current model metadata or a validated Run supports \
+that scope. A `tcga_expression_survival` result is a gene- and cancer-label \
+bridge to a patient cohort, never a DepMap-cell-line/TCGA-patient sample join. \
+Preserve its endpoint, tumour cohort/event counts, expression scale, Cox-score \
+method, and within-project FDR family; do not rename score z as a hazard ratio. \
+In `lineage_dependency`, `effect_mean_difference` is a Gene Effect mean \
+difference and must never be renamed logFC. Mean/median divergence \
+does not establish a bimodal distribution, and known gene biology does not \
+establish receptor status or molecular subtype unless those fields are returned. \
+Continuous expression-to-dependency or enrichment associations do not define an \
+`ATF5-high`, high/low, or other discrete subgroup unless the current result \
+returns that grouping and its threshold. Never call one section the only \
+FDR-significant signal when another returned section also contains an adjusted \
+p-value below the stated threshold. `not_testable` and `INELIGIBLE` mean the \
+current provider cannot test that event under its thresholds; they do not prove \
+that a biological route or future study is infeasible. Likewise, zero models \
+crossing a descriptive dependency cutoff supports only that exact observation, \
+not the categorical claim that the gene is not a direct dependency. \
+Use each result's `semantics.metric`: mutation and CNV `mean_difference` values \
+must never be reported as correlation coefficients. Query-only means selecting \
+and interpreting existing returned rows; a new matrix, cohort comparison, \
+Wilcoxon/Kruskal-Wallis test, FDR calculation, model, or subgroup statistic is \
+new computation even if its inputs are precomputed. Do not name a therapeutic \
+agent or assert drug actionability unless a current drug-query row or separately \
+cited literature evidence supports it. \
+In particular, a continuous expression-dependency correlation is not a \
+`TF-high` screen, a high-versus-low contrast, selective dependency, or synthetic \
+lethality. A proposed thresholded subgroup, TF-activity grouping, PRISM \
+combination, mechanistic module reconstruction, or cross-platform convergence \
+must be labeled new computation until a validated Run returns it. \
+Do not relabel `damaging_mutation_n` as pathogenic or clinically causal; it is \
+only the count under the provider's damaging-event definition. If a top list \
+has no multiple-testing-significant row, report the null result and do not use \
+its nominal targets to invent a biological module, named drug, or mechanism. \
+The presence of a raw-data file proves asset availability only, not cohort \
+eligibility, identifier overlap, statistical power, or that every gap is \
+computable. Literature mechanisms, novelty, treatments, and clinical claims \
+require an executed literature-evidence task with traceable citations; a Skill \
+description or model memory is not literature evidence. \
+Treat an MCP evidence envelope's bounded structured projection as the complete \
+model-facing result. Never read or grep `.wisp/tool-output` to reconstruct rows \
+already represented by that envelope. If the projection or route evidence budget \
+is exhausted, state the coverage limit and answer from retained evidence. For \
+non-scientific tools without a structured projection, read only the exact named \
+spill file and never its parent directory. End with links or identifiers for generated \
+R code, manifests, tables, figures, Runs, and Artifacts.";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Specialist {
@@ -126,6 +356,38 @@ pub fn builtin_scientific_illustrator() -> Specialist {
     }
 }
 
+pub fn builtin_depmap_r_agent() -> Specialist {
+    Specialist {
+        id: DEPMAP_SPECIALIST_ID.into(),
+        name: "DepMap Agent".into(),
+        icon: "dna".into(),
+        color: "clay".into(),
+        description: "Queries validated DepMap evidence and orchestrates reproducible R-first analyses when new computation is required."
+            .into(),
+        instructions: DEPMAP_R_AGENT_RUBRIC.into(),
+        model_id: String::new(),
+        review_backend: None,
+        // Inherit the project's enabled catalog so the Agent can progressively
+        // load biology, literature, review, figure, or writing Skills as the
+        // current stage requires. The rubric pins depmap-coding-agent as the
+        // mandatory analysis contract.
+        skills: None,
+        connectors: None,
+        builtin: true,
+    }
+}
+
+/// Skills that must remain available for a Specialist even when the project's
+/// ordinary enabled-Skill subset excludes them. The rest of the project
+/// catalog remains progressively searchable; this is a required baseline, not
+/// a complete allowlist.
+pub fn required_skill_names(spec: &Specialist) -> &'static [&'static str] {
+    match spec.id.as_str() {
+        DEPMAP_SPECIALIST_ID => DEPMAP_REQUIRED_SKILLS,
+        _ => &[],
+    }
+}
+
 async fn load_raw(store: &Store) -> Vec<Specialist> {
     store
         .get_setting(SPECIALISTS_KEY)
@@ -176,6 +438,14 @@ pub async fn ensure(store: &Store) -> Vec<Specialist> {
         }
         None => list.insert(2.min(list.len()), builtin_scientific_illustrator()),
     }
+    match list.iter_mut().find(|s| s.id == "depmap_r_agent") {
+        Some(depmap) => {
+            depmap.builtin = true;
+            depmap.instructions = DEPMAP_R_AGENT_RUBRIC.into();
+            depmap.review_backend = None;
+        }
+        None => list.insert(3.min(list.len()), builtin_depmap_r_agent()),
+    }
     list
 }
 
@@ -224,6 +494,8 @@ pub async fn upsert(store: &Store, mut spec: Specialist) -> Result<Vec<Specialis
             spec.review_backend = None;
             spec.skills = Some(vec!["figure-composer".into(), "figure-style".into()]);
             spec.connectors = Some(vec![]);
+        } else if spec.id == "depmap_r_agent" {
+            spec.review_backend = None;
         }
         *existing = spec;
     } else {
@@ -272,14 +544,34 @@ pub async fn remove_specialist(
 pub async fn specialist_llm(
     store: &Store,
     spec: &Specialist,
-) -> (String, String, String, String, u64, String) {
+) -> (
+    String,
+    String,
+    String,
+    String,
+    u64,
+    String,
+    String,
+    String,
+    bool,
+    Option<bool>,
+    String,
+) {
     if !spec.model_id.trim().is_empty() {
         if let Some(cfg) = crate::models::profile_llm(store, &spec.model_id).await {
             return cfg;
         }
     }
     let (provider, api_url, model, api_key) = crate::load_settings(store).await;
-    let (max_tokens, reasoning_effort) = crate::models::active_llm_advanced(store).await;
+    let (
+        max_tokens,
+        reasoning_effort,
+        service_tier,
+        user_agent,
+        send_user_agent,
+        send_session_id,
+        session_header_name,
+    ) = crate::models::active_llm_advanced(store).await;
     (
         provider,
         api_url,
@@ -287,6 +579,11 @@ pub async fn specialist_llm(
         api_key,
         max_tokens,
         reasoning_effort,
+        service_tier,
+        user_agent,
+        send_user_agent,
+        send_session_id,
+        session_header_name,
     )
 }
 
@@ -303,6 +600,25 @@ fn frame_key(frame_id: &str) -> String {
     format!("frame_specialist:{frame_id}")
 }
 
+fn snapshot_key(frame_id: &str) -> String {
+    format!("frame_specialist_snapshot:{frame_id}")
+}
+
+async fn persist_depmap_snapshot(store: &Store, frame_id: &str) -> Result<(), String> {
+    let bridge = wisp_core::host_scientific_bridge(
+        &wisp_core::specialist_manifest::HostPolicy::bundled_depmap(),
+    )
+    .map_err(|error| error.to_string())?;
+    let snapshot = bridge.specialist;
+    store
+        .set_setting(
+            &snapshot_key(frame_id),
+            &serde_json::to_string(&snapshot).map_err(|error| error.to_string())?,
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
 pub async fn set_frame_specialist(store: &Store, frame_id: &str, id: &str) -> Result<(), String> {
     store
         .set_setting(&frame_key(frame_id), id)
@@ -310,15 +626,57 @@ pub async fn set_frame_specialist(store: &Store, frame_id: &str, id: &str) -> Re
         .map_err(|e| e.to_string())
 }
 
-pub async fn session_specialist(store: &Store, frame_id: &str) -> Option<Specialist> {
-    let id = store
+pub async fn frame_specialist_id(store: &Store, frame_id: &str) -> Option<String> {
+    store
         .get_setting(&frame_key(frame_id))
         .await
         .ok()
+        .flatten()
+        .filter(|id| !id.trim().is_empty())
+}
+
+pub async fn project_default_specialist_id(store: &Store, project_id: &str) -> Option<String> {
+    let id = store
+        .project_default_specialist(project_id)
+        .await
+        .ok()
         .flatten()?;
-    if id.trim().is_empty() {
-        return None;
+    get(store, &id).await.map(|_| id)
+}
+
+pub async fn set_project_default_specialist(
+    store: &Store,
+    project_id: &str,
+    id: &str,
+) -> Result<(), String> {
+    if !id.is_empty() && get(store, id).await.is_none() {
+        return Err(format!("Unknown specialist '{id}'."));
     }
+    store
+        .set_project_default_specialist(project_id, id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Seed one fresh frame from the project's durable default. Existing frames
+/// are never rewritten: changing the project default applies only to future
+/// conversations, preserving the prompt identity of conversations in flight.
+pub async fn inherit_project_default_specialist(
+    store: &Store,
+    project_id: &str,
+    frame_id: &str,
+) -> Result<(), String> {
+    if let Some(id) = project_default_specialist_id(store, project_id).await {
+        if id == DEPMAP_SPECIALIST_ID {
+            persist_depmap_snapshot(store, frame_id).await?;
+        }
+        set_frame_specialist(store, frame_id, &id).await?;
+    }
+    Ok(())
+}
+
+pub async fn session_specialist(store: &Store, frame_id: &str) -> Option<Specialist> {
+    let id = frame_specialist_id(store, frame_id).await?;
     get(store, &id).await
 }
 
@@ -340,6 +698,9 @@ pub async fn set_session_specialist(
     }
     if !id.is_empty() && get(&state.store, &id).await.is_none() {
         return Err(format!("Unknown specialist '{id}'."));
+    }
+    if id == DEPMAP_SPECIALIST_ID {
+        persist_depmap_snapshot(&state.store, &frame_id).await?;
     }
     set_frame_specialist(&state.store, &frame_id, &id).await
 }
@@ -377,6 +738,253 @@ mod tests {
         assert!(rubric.contains("do not silently substitute"));
     }
 
+    #[test]
+    fn depmap_rubric_prefers_bounded_knowledge_queries_before_compute() {
+        let rubric = DEPMAP_R_AGENT_RUBRIC;
+        assert!(rubric.contains("call `depmap_agent_route` once"));
+        assert!(rubric.contains("the host planner decides the capability"));
+        assert!(rubric.contains("Do not assert coverage"));
+        assert!(rubric.contains("the host planner decides the capability"));
+        assert!(rubric.contains("Do not assert coverage"));
+        assert!(rubric.contains("call `ask_user`"));
+        assert!(rubric.contains("`depmap_capabilities` MCP catalog"));
+        assert!(rubric.contains("must not be diverted to a Workflow"));
+        assert!(rubric.contains("`depmap_evidence_history`"));
+        assert!(!rubric.contains("call `start_workflow` before any evidence query"));
+        assert!(rubric.contains("load `depmap-knowledge-query`"));
+        assert!(rubric.contains("Load `depmap-coding-agent`"));
+        assert!(rubric.contains("do not rerun an available analysis"));
+        assert!(rubric.contains("`mode=lineage_dependency`"));
+        assert!(rubric.contains("not a housekeeping or common-essential"));
+        assert!(rubric.contains("Housekeeping and common-essential are distinct"));
+        assert!(rubric.contains("must use its matching"));
+        assert!(rubric.contains("try the matching bounded remote MCP tool"));
+        assert!(rubric.contains("`mode=lineage_directions`"));
+        assert!(rubric.contains("`study_support_mapping`"));
+        assert!(rubric.contains("exactly one of four buckets"));
+        assert!(rubric.contains("filesystem inventory tools"));
+        assert!(rubric.contains("sequence of guessed gene probes"));
+        assert!(rubric.contains("must not be escalated to a new Run"));
+        assert!(rubric.contains("must never be renamed logFC"));
+        assert!(rubric.contains("never learn the contract"));
+        assert!(rubric.contains("stay query-only"));
+        assert!(rubric.contains("never estimate them from memory"));
+        assert!(rubric.contains("do not manually reconstruct"));
+        assert!(rubric.contains("R is the default language"));
+        assert!(rubric.contains("canonical reference implementation"));
+        assert!(rubric.contains("persisted `run_in_context` Run"));
+        assert!(rubric.contains("compiled capability manifest"));
+        assert!(rubric.contains("`preprocessing_required`"));
+        assert!(rubric.contains("`required_datasets`"));
+        assert!(rubric.contains("Search and load only Skills required"));
+        assert!(rubric.contains("background Run, not a child Agent"));
+        assert!(rubric.contains("Honor an explicit retrieval"));
+        assert!(rubric.contains("Standalone real-browser research"));
+        assert!(rubric.contains("`browser_research` capability"));
+        assert!(rubric.contains("not scholarly evidence"));
+        assert!(rubric.contains("Keep a claim ledger"));
+        assert!(rubric.contains("not found within the searched"));
+        assert!(rubric.contains("never use a fixed"));
+        assert!(rubric.contains("screen-derived candidate"));
+        assert!(rubric.contains("continuous expression-dependency correlation is not"));
+        assert!(rubric.contains("must be labeled new computation"));
+    }
+
+    #[test]
+    fn depmap_specialist_assembles_from_the_versioned_manifest() {
+        use wisp_core::specialist_manifest::{
+            assemble, load_depmap_manifest, AssemblyError, HostPolicy,
+        };
+
+        let manifest = load_depmap_manifest();
+        assert_eq!(manifest.id, DEPMAP_SPECIALIST_ID);
+        assert_eq!(
+            manifest.required_skills,
+            DEPMAP_REQUIRED_SKILLS
+                .iter()
+                .map(|skill| (*skill).to_string())
+                .collect::<Vec<_>>()
+        );
+        let host = HostPolicy::bundled_depmap();
+        let snapshot = assemble(&manifest, &host).unwrap();
+        assert_eq!(snapshot.id, "depmap_r_agent");
+        assert_eq!(snapshot.manifest_version, "1.0.0");
+        assert_eq!(snapshot.instructions_digest.len(), 64);
+
+        let mut reduced = host.clone();
+        reduced.available_skills.remove("depmap-coding-agent");
+        match assemble(&manifest, &reduced) {
+            Err(AssemblyError::MissingSkill { skill }) => {
+                assert_eq!(skill, "depmap-coding-agent")
+            }
+            other => panic!("expected missing skill, got {other:?}"),
+        }
+
+        let mut incompatible = manifest.clone();
+        incompatible.schema_version = 99;
+        assert!(matches!(
+            assemble(&incompatible, &host),
+            Err(AssemblyError::IncompatibleSchema { found: 99 })
+        ));
+
+        let bridge = wisp_core::host_scientific_bridge(&host).unwrap();
+        assert_eq!(bridge.specialist.id, snapshot.id);
+        assert_eq!(
+            bridge.catalog.schema_version,
+            wisp_core::INTENT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            wisp_core::PLANNER_CONTRACT_ID,
+            "scientific_intent.bridge_planner.v1"
+        );
+    }
+
+    #[test]
+    fn depmap_manifest_is_closed_safe_and_covers_the_audited_scripts() {
+        use std::collections::HashSet;
+
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../skills/depmap-coding-agent/references/capability-manifest.json"
+        ))
+        .expect("compiled DepMap capability manifest must be valid JSON");
+        assert_eq!(manifest["schema_version"], 1);
+
+        let datasets = manifest["datasets"].as_array().unwrap();
+        let capabilities = manifest["capabilities"].as_array().unwrap();
+        assert_eq!(capabilities.len(), 27);
+        let dataset_ids: HashSet<&str> = datasets
+            .iter()
+            .map(|dataset| dataset["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            dataset_ids.len(),
+            datasets.len(),
+            "dataset ids must be unique"
+        );
+
+        for dataset in datasets {
+            let path = dataset["path"].as_str().unwrap();
+            assert!(!path.starts_with('/') && !path.contains(':'));
+            assert!(!path.split('/').any(|part| part == ".."));
+            if let Some(source_inputs) = dataset["source_inputs"].as_array() {
+                for source in source_inputs {
+                    assert!(dataset_ids.contains(source.as_str().unwrap()));
+                }
+            }
+        }
+
+        let mut capability_ids = HashSet::new();
+        let mut scripts = HashSet::new();
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("src-tauri must have a repository parent");
+        let assert_safe_entrypoint = |path: &str| {
+            assert!(!path.starts_with('/') && !path.contains(':'));
+            assert!(!path.split('/').any(|part| part == ".."));
+            assert!(
+                repo_root.join(path).is_file(),
+                "declared module entrypoint must exist: {path}"
+            );
+        };
+        for capability in capabilities {
+            assert!(capability_ids.insert(capability["id"].as_str().unwrap()));
+            for input in capability["inputs"].as_array().unwrap() {
+                assert!(dataset_ids.contains(input.as_str().unwrap()));
+            }
+            for script in capability["scripts"].as_array().unwrap() {
+                assert!(scripts.insert(script.as_str().unwrap()));
+            }
+            if let Some(operations) = capability["operations"].as_object() {
+                for operation in operations.values() {
+                    for input in operation["inputs"].as_array().unwrap() {
+                        assert!(dataset_ids.contains(input.as_str().unwrap()));
+                    }
+                    assert_safe_entrypoint(operation["executable_entrypoint"].as_str().unwrap());
+                }
+            }
+        }
+        let expected_scripts: HashSet<&str> = [
+            "01_read_depmap.r",
+            "02_gene_gene_correlation.R",
+            "03_co_dependency.R",
+            "04_predivtive_biomarkers.R",
+            "build_predictive_biomarker_model.R",
+            "validate_predictive_biomarker_model.R",
+            "05_from_gene_to_dependency.R",
+            "05.1_ml_pathway.R",
+            "05.2_synthetic_lethal.R",
+            "05.3_drug_sensitivity.R",
+            "05.4_wgcna.R",
+            "06_mut_anchor_gene_selection_26Q1.R",
+            "07_mutant_dependency_26Q1.R",
+            "08_mutData_updata_26Q1.R",
+            "09_batch_from_mut_to_target_26Q1.R",
+            "10_batch_from_mut_to_target_26Q1_add_celltype.R",
+            "11_batch_from_gene_to_mut_26Q1_add_celltype.R",
+            "12_CCNE1_AMP_PKMYT1.R",
+            "13_MYCN_DDX1_coamplification_Cancer_discovery.R",
+            "14_DCAF5_SMARCB1_Nature.R",
+            "15_Sanger_CRISPR.R",
+            "16_Dependency_nagative_correlation.R",
+            "17_bipolar_dependency_ASB7_as_example.R",
+            "18_DrugAUC_and_DepMap_MTAPasExample.R",
+            "analysis-modules/癌种内突变锚定基因选择/scripts/depmap_official_mutation_engine.py",
+            "analysis-modules/癌种内突变锚定基因选择/scripts/run_allele_specific_mutation_dependency.py",
+            "analysis-modules/表达基因-CRISPR基因依赖相关性分析/scripts/run_expression_threshold_dependency_contrast.R",
+            "analysis-modules/事件对照功效分析/scripts/run_event_contrast_power_sidecar.py",
+            "analysis-modules/特征条件通路富集/scripts/run_feature_conditioned_pathway_enrichment.py",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(scripts, expected_scripts);
+
+        let forward = capabilities
+            .iter()
+            .find(|capability| capability["id"] == "mutation_to_target")
+            .unwrap();
+        let reverse = capabilities
+            .iter()
+            .find(|capability| capability["id"] == "target_to_mutation_lineage")
+            .unwrap();
+        assert_eq!(forward["entity_roles"]["source"], "mutation_event");
+        assert_eq!(forward["entity_roles"]["target"], "dependency_gene");
+        assert_eq!(reverse["entity_roles"]["source"], "mutation_event");
+        assert_eq!(reverse["entity_roles"]["target"], "dependency_gene");
+        assert_eq!(forward["entity_roles"]["symmetric"], false);
+        assert_eq!(reverse["entity_roles"]["symmetric"], false);
+
+        let official_mutation = capabilities
+            .iter()
+            .find(|capability| capability["id"] == "mutation_dependency_official_gene_effect_v2")
+            .unwrap();
+        assert_eq!(
+            official_mutation["statistics"]["primary_metric"],
+            "CRISPRGeneEffect"
+        );
+        assert_eq!(
+            official_mutation["statistics"]["test"],
+            "two-sided pooled-variance t-test"
+        );
+        assert_eq!(
+            official_mutation["statistics"]["min_complete_cases_per_group"],
+            5
+        );
+
+        for dataset in datasets
+            .iter()
+            .filter(|dataset| dataset["kind"] == "derived")
+        {
+            for producer in dataset["producer_scripts"].as_array().unwrap() {
+                let producer = producer.as_str().unwrap();
+                if producer.contains('/') {
+                    assert_safe_entrypoint(producer);
+                } else {
+                    assert!(scripts.contains(producer));
+                }
+            }
+        }
+    }
+
     async fn test_store() -> (wisp_store::Store, std::path::PathBuf) {
         let tmp = std::env::temp_dir().join(format!("wisp_spec_{}.sqlite", uuid::Uuid::new_v4()));
         (wisp_store::Store::open(&tmp).await.unwrap(), tmp)
@@ -386,7 +994,7 @@ mod tests {
     async fn ensure_materializes_builtin_specialists_once() {
         let (store, tmp) = test_store().await;
         let list = ensure(&store).await;
-        assert_eq!(list.len(), 3);
+        assert_eq!(list.len(), 4);
         let r = &list[0];
         assert_eq!(r.id, "reviewer");
         assert!(r.builtin);
@@ -403,8 +1011,19 @@ mod tests {
             illustrator.skills.as_deref(),
             Some(&["figure-composer".to_string(), "figure-style".to_string()][..])
         );
+        let depmap = &list[3];
+        assert_eq!(depmap.id, "depmap_r_agent");
+        assert_eq!(depmap.name, "DepMap Agent");
+        assert!(depmap.builtin);
+        assert_eq!(depmap.instructions, DEPMAP_R_AGENT_RUBRIC);
+        assert_eq!(depmap.skills, None, "DepMap must inherit hot-loaded Skills");
+        assert_eq!(depmap.connectors, None);
+        assert_eq!(
+            required_skill_names(depmap),
+            &["depmap-knowledge-query", "depmap-coding-agent"]
+        );
         // Second read does not duplicate the built-ins.
-        assert_eq!(ensure(&store).await.len(), 3);
+        assert_eq!(ensure(&store).await.len(), 4);
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -450,6 +1069,7 @@ mod tests {
         assert!(remove(&store, "reviewer").await.is_err());
         assert!(remove(&store, "reader").await.is_err());
         assert!(remove(&store, "scientific_illustrator").await.is_err());
+        assert!(remove(&store, "depmap_r_agent").await.is_err());
         // Editing the builtin keeps instructions but accepts a model change.
         let mut r = get(&store, "reviewer").await.unwrap();
         r.instructions = "haha".into();
@@ -485,6 +1105,19 @@ mod tests {
             illustrator.skills,
             Some(vec!["figure-composer".into(), "figure-style".into()])
         );
+
+        let mut depmap = get(&store, "depmap_r_agent").await.unwrap();
+        depmap.instructions = "replace rubric".into();
+        depmap.model_id = "r-model".into();
+        depmap.skills = Some(vec!["depmap-coding-agent".into()]);
+        let list = upsert(&store, depmap).await.unwrap();
+        let depmap = list
+            .iter()
+            .find(|specialist| specialist.id == "depmap_r_agent")
+            .unwrap();
+        assert_eq!(depmap.instructions, DEPMAP_R_AGENT_RUBRIC);
+        assert_eq!(depmap.model_id, "r-model");
+        assert_eq!(depmap.skills, Some(vec!["depmap-coding-agent".into()]));
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -498,7 +1131,19 @@ mod tests {
             review_backend: None,
             ..builtin_reviewer()
         };
-        let (provider, api_url, model, _key, _mt, _re) = specialist_llm(&store, &spec).await;
+        let (
+            provider,
+            api_url,
+            model,
+            _key,
+            _mt,
+            _re,
+            _st,
+            _ua,
+            _send_ua,
+            _send_session,
+            _header_name,
+        ) = specialist_llm(&store, &spec).await;
         assert!(!provider.is_empty());
         assert!(!api_url.is_empty());
         assert!(!model.is_empty());
@@ -521,6 +1166,57 @@ mod tests {
         // Clearing works.
         set_frame_specialist(&store, "f1", "").await.unwrap();
         assert!(session_specialist(&store, "f1").await.is_none());
+        persist_depmap_snapshot(&store, "f-depmap").await.unwrap();
+        let raw = store
+            .get_setting("frame_specialist_snapshot:f-depmap")
+            .await
+            .unwrap()
+            .unwrap();
+        let snapshot: wisp_core::specialist_manifest::ResolvedSpecialistSnapshot =
+            serde_json::from_str(&raw).unwrap();
+        assert_eq!(snapshot.id, DEPMAP_SPECIALIST_ID);
+        assert_eq!(snapshot.manifest_version, "1.0.0");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn project_default_specialist_seeds_only_new_frames() {
+        let (store, tmp) = test_store().await;
+        ensure(&store).await;
+        store.create_project("p1", "proj", "").await.unwrap();
+        store
+            .create_frame("old", "p1", "OPERON", "m")
+            .await
+            .unwrap();
+
+        set_project_default_specialist(&store, "p1", "depmap_r_agent")
+            .await
+            .unwrap();
+        assert_eq!(
+            project_default_specialist_id(&store, "p1").await.as_deref(),
+            Some("depmap_r_agent")
+        );
+        assert!(session_specialist(&store, "old").await.is_none());
+
+        store
+            .create_frame("new", "p1", "OPERON", "m")
+            .await
+            .unwrap();
+        inherit_project_default_specialist(&store, "p1", "new")
+            .await
+            .unwrap();
+        assert_eq!(
+            session_specialist(&store, "new").await.unwrap().id,
+            "depmap_r_agent"
+        );
+
+        assert!(set_project_default_specialist(&store, "p1", "missing")
+            .await
+            .is_err());
+        set_project_default_specialist(&store, "p1", "")
+            .await
+            .unwrap();
+        assert!(project_default_specialist_id(&store, "p1").await.is_none());
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -532,7 +1228,8 @@ mod tests {
         upsert(&store, r).await.unwrap();
         // Dangling binding falls back to the active chain — never errors.
         let spec = get(&store, "reviewer").await.unwrap();
-        let (_p, _u, model, _k, _mt, _re) = specialist_llm(&store, &spec).await;
+        let (_p, _u, model, _k, _mt, _re, _st, _ua, _send_ua, _send_session, _header_name) =
+            specialist_llm(&store, &spec).await;
         assert!(!model.is_empty());
         let _ = std::fs::remove_file(&tmp);
     }

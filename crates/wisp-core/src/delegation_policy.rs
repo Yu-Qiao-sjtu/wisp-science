@@ -44,6 +44,7 @@ pub enum ExecutorFeature {
     CodeExecution,
     NetworkAccess,
     LiteratureAccess,
+    BrowserAccess,
     Vision,
     Isolation,
     Delegation,
@@ -164,6 +165,10 @@ pub struct DelegatedTaskProposal {
     pub executor: Option<AgentExecutorRef>,
     #[serde(default)]
     pub budget: Option<AgentBudget>,
+    /// Per-task wall timeout. Omit to use the host default, set to zero for no
+    /// timeout, or use a positive number of seconds.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
     #[serde(default = "empty_object")]
     pub input: Value,
 }
@@ -292,7 +297,7 @@ impl CapabilityRegistry {
             .find(|definition| definition.id == "code_run")
             .expect("code_run capability")
             .revision = 3;
-        Self::new("wisp-capabilities-v4", definitions)
+        Self::new("wisp-capabilities-v6", definitions)
             .expect("built-in capability definitions must be valid")
     }
 
@@ -368,7 +373,7 @@ impl CapabilityRegistry {
             proposal.budget.as_ref(),
             &grant.budget_ceiling,
         )?;
-        let timeout_secs = select_timeout(host)?;
+        let timeout_secs = select_timeout(proposal.timeout_secs, host)?;
         let mut approval_reasons = approval_reasons(
             &grant,
             model,
@@ -437,6 +442,7 @@ impl CapabilityRegistry {
                 executor: proposal.executor.clone(),
                 isolated: proposal.isolated,
                 budget: proposal.budget.clone(),
+                timeout_secs: proposal.timeout_secs,
             }),
             workspace_policy: Some(workspace_policy),
             output_schema_source,
@@ -593,6 +599,15 @@ impl CapabilityRegistry {
         plan: &DelegationPlan,
         host: &DelegationHostPolicy,
     ) -> Result<(), ResolutionError> {
+        if plan
+            .steps
+            .iter()
+            .any(|step| !step.spec.skill_bindings.is_empty())
+        {
+            return Err(ResolutionError::InvalidProposal(
+                crate::workflow_conversion::LEGACY_WORKFLOW_ERROR.into(),
+            ));
+        }
         if plan.schema_version != DYNAMIC_DELEGATION_SCHEMA_VERSION {
             return Err(ResolutionError::InvalidProposal(
                 "resolved policy validation requires a v2 plan".into(),
@@ -1046,12 +1061,37 @@ fn clamp_budget_limit<T: Ord + Copy + Into<u64>>(
     }
 }
 
-fn select_timeout(host: &DelegationHostPolicy) -> Result<Option<u64>, ResolutionError> {
-    match (host.default_timeout_secs, host.timeout_ceiling_secs) {
-        (Some(default), Some(ceiling)) if default > ceiling => Err(
-            ResolutionError::InvalidProposal("default timeout exceeds host ceiling".into()),
-        ),
-        (default, _) => Ok(default),
+fn select_timeout(
+    requested: Option<u64>,
+    host: &DelegationHostPolicy,
+) -> Result<Option<u64>, ResolutionError> {
+    if matches!(
+        (host.default_timeout_secs, host.timeout_ceiling_secs),
+        (Some(default), Some(ceiling)) if default > ceiling
+    ) {
+        return Err(ResolutionError::InvalidProposal(
+            "default timeout exceeds host ceiling".into(),
+        ));
+    }
+    match requested {
+        // This is an explicit user choice, distinct from an omitted value that
+        // inherits the policy default.
+        Some(0) if host.timeout_ceiling_secs.is_some() => Err(ResolutionError::InvalidProposal(
+            "unlimited timeout is not allowed by the host ceiling".into(),
+        )),
+        Some(0) => Ok(None),
+        Some(value)
+            if host
+                .timeout_ceiling_secs
+                .is_some_and(|ceiling| value > ceiling) =>
+        {
+            Err(ResolutionError::InvalidProposal(format!(
+                "timeout_secs {value} exceeds host ceiling {}",
+                host.timeout_ceiling_secs.unwrap_or_default()
+            )))
+        }
+        Some(value) => Ok(Some(value)),
+        None => Ok(host.default_timeout_secs),
     }
 }
 
@@ -1149,6 +1189,9 @@ fn proposal_from_spec(spec: &AgentSpec) -> Result<DelegatedTaskProposal, Resolut
         budget: preferences
             .map(|preferences| preferences.budget.clone())
             .unwrap_or_else(|| Some(spec.budget.clone())),
+        timeout_secs: preferences
+            .map(|preferences| preferences.timeout_secs)
+            .unwrap_or(spec.timeout_secs),
         input: json!({}),
     })
 }
@@ -1304,6 +1347,21 @@ fn builtin_capabilities() -> Vec<CapabilityDefinition> {
             CONTEXT_TOKEN_CEILING,
         ),
         capability(
+            "depmap_read",
+            "DepMap read",
+            "Query the active project's bounded, precomputed DepMap evidence provider.",
+            CapabilityRisk::Network,
+            &["depmap_query", "depmap_evidence"],
+            false,
+            true,
+            false,
+            &[ExecutorFeature::NetworkAccess],
+            &["depmap-knowledge-query"],
+            &[],
+            AgentWorkspacePolicy::SharedReadOnly,
+            CONTEXT_TOKEN_CEILING,
+        ),
+        capability(
             "project_read",
             "Project read",
             "Read and search project files.",
@@ -1361,7 +1419,7 @@ fn builtin_capabilities() -> Vec<CapabilityDefinition> {
             "Literature search",
             "Search configured scholarly sources.",
             CapabilityRisk::Network,
-            &["literature_search"],
+            &["literature_search", "report_research_progress"],
             false,
             true,
             false,
@@ -1379,7 +1437,7 @@ fn builtin_capabilities() -> Vec<CapabilityDefinition> {
             "External research",
             "Use configured external research sources.",
             CapabilityRisk::External,
-            &["web_search"],
+            &["web_search", "report_research_progress"],
             false,
             true,
             false,
@@ -1389,6 +1447,7 @@ fn builtin_capabilities() -> Vec<CapabilityDefinition> {
             AgentWorkspacePolicy::SharedReadOnly,
             CONTEXT_TOKEN_CEILING,
         ),
+        browser_research_capability(),
         capability(
             "visualization",
             "Visualization",
@@ -1455,6 +1514,37 @@ fn delegation_capability() -> CapabilityDefinition {
     );
     definition.approval_reason =
         Some("Task may create a bounded nested Agent batch within root-wide limits".into());
+    definition
+}
+
+fn browser_research_capability() -> CapabilityDefinition {
+    let mut definition = capability(
+        "browser_research",
+        "Real browser research",
+        "Research with the user's connected, persistent Chrome/Chromium session.",
+        CapabilityRisk::External,
+        &[
+            "browser_setup",
+            "web_scan",
+            "web_execute_js",
+            "web_open_tab",
+            "report_research_progress",
+        ],
+        false,
+        true,
+        false,
+        &[
+            ExecutorFeature::NetworkAccess,
+            ExecutorFeature::BrowserAccess,
+        ],
+        &[],
+        &[],
+        AgentWorkspacePolicy::SharedReadOnly,
+        CONTEXT_TOKEN_CEILING,
+    );
+    definition.approval_reason = Some(
+        "Task may read and interact with the user's connected real Chrome/Chromium session".into(),
+    );
     definition
 }
 
@@ -1582,6 +1672,7 @@ mod tests {
                         ExecutorFeature::CodeExecution,
                         ExecutorFeature::NetworkAccess,
                         ExecutorFeature::LiteratureAccess,
+                        ExecutorFeature::BrowserAccess,
                         ExecutorFeature::Vision,
                         ExecutorFeature::Isolation,
                     ],
@@ -1643,8 +1734,43 @@ mod tests {
             model_id: None,
             executor: None,
             budget: None,
+            timeout_secs: None,
             input: json!({}),
         }
+    }
+
+    #[test]
+    fn task_timeout_supports_policy_default_finite_override_and_unlimited() {
+        let mut host = host_policy();
+        assert_eq!(select_timeout(None, &host).unwrap(), Some(600));
+        assert_eq!(select_timeout(Some(1_200), &host).unwrap(), Some(1_200));
+        assert!(select_timeout(Some(0), &host).is_err());
+        host.timeout_ceiling_secs = None;
+        assert_eq!(select_timeout(Some(0), &host).unwrap(), None);
+
+        host.timeout_ceiling_secs = Some(1_800);
+        let error = select_timeout(Some(1_801), &host).unwrap_err();
+        assert!(error.to_string().contains("exceeds host ceiling"));
+    }
+
+    #[test]
+    fn resolved_task_preserves_explicit_unlimited_timeout_preference() {
+        let registry = CapabilityRegistry::builtins();
+        let mut host = host_policy();
+        host.timeout_ceiling_secs = None;
+        let mut task = proposal("reason", &["reasoning"]);
+        task.timeout_secs = Some(0);
+        let resolved = registry.resolve_task(task, &host).unwrap();
+
+        assert_eq!(resolved.spec().timeout_secs, None);
+        assert_eq!(
+            resolved
+                .spec()
+                .request_preferences
+                .as_ref()
+                .and_then(|preferences| preferences.timeout_secs),
+            Some(0)
+        );
     }
 
     #[test]
@@ -1684,12 +1810,31 @@ mod tests {
             ),
             (
                 "literature_search",
-                vec!["literature_search"],
+                vec!["literature_search", "report_research_progress"],
                 false,
                 true,
                 false,
             ),
-            ("external_research", vec!["web_search"], false, true, false),
+            (
+                "external_research",
+                vec!["web_search", "report_research_progress"],
+                false,
+                true,
+                false,
+            ),
+            (
+                "browser_research",
+                vec![
+                    "browser_setup",
+                    "web_scan",
+                    "web_execute_js",
+                    "web_open_tab",
+                    "report_research_progress",
+                ],
+                false,
+                true,
+                false,
+            ),
             (
                 "visualization",
                 vec!["read", "search", "grep", "write", "edit", "python", "r"],
@@ -1724,6 +1869,30 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    #[test]
+    fn real_browser_research_requires_native_browser_authority() {
+        let registry = CapabilityRegistry::builtins();
+        let host = host_policy();
+        let mut task = proposal("browser", &["browser_research"]);
+        task.executor = Some(AgentExecutorRef::Acp {
+            profile_id: "acp-general".into(),
+        });
+        assert!(matches!(
+            registry.resolve_task(task, &host),
+            Err(ResolutionError::UnknownExecutor(_))
+        ));
+
+        let resolved = registry
+            .resolve_task(proposal("browser", &["browser_research"]), &host)
+            .unwrap();
+        assert_eq!(resolved.spec().executor, Some(AgentExecutorRef::Native));
+        assert!(resolved
+            .spec()
+            .approval_reasons
+            .iter()
+            .any(|reason| reason.contains("connected real Chrome/Chromium session")));
     }
 
     #[test]
@@ -1916,7 +2085,10 @@ mod tests {
         restricted.specialist.as_mut().unwrap().connectors =
             Some(vec!["literature".into(), "untrusted-extra".into()]);
         let resolved = registry.resolve_task(restricted, &host).unwrap();
-        assert_eq!(resolved.spec().permissions.tools, vec!["literature_search"]);
+        assert_eq!(
+            resolved.spec().permissions.tools,
+            vec!["literature_search", "report_research_progress"]
+        );
         assert!(!resolved
             .spec()
             .permissions
@@ -2182,5 +2354,39 @@ mod tests {
         let mut budget = original;
         budget.steps[0].spec.budget.max_tokens = Some(9_000);
         assert!(registry.validate_resolved_plan(&budget, &host).is_err());
+    }
+    #[test]
+    fn legacy_skill_bound_plans_are_rejected_before_execution() {
+        let registry = CapabilityRegistry::builtins();
+        let host = host_policy();
+        let mut plan = registry
+            .resolve_plan(
+                "legacy",
+                DelegationMode::Manual,
+                1,
+                vec![proposal("task", &["reasoning"])],
+                &host,
+            )
+            .unwrap()
+            .into_plan();
+        plan.steps[0].spec.skill_bindings.push(AgentSkillBinding {
+            id: "old".into(),
+            name: "old".into(),
+            scope: "project".into(),
+            path: "old/SKILL.md".into(),
+            declared_version: None,
+            skill_md_sha256: "a".repeat(64),
+            package_id: None,
+            package_version: None,
+            package_source: None,
+        });
+        let error = registry
+            .validate_resolved_plan(&plan, &host)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Skill-bound Workflow nodes are retired"),
+            "{error}"
+        );
     }
 }

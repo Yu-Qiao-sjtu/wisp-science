@@ -88,7 +88,13 @@ fn secret_name(connection_id: &str) -> String {
 }
 
 fn http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+    let builder = reqwest::Client::builder();
+    let builder = match crate::network::mcp_proxy().as_str() {
+        "" => builder,
+        "none" => builder.no_proxy(),
+        proxy => builder.proxy(reqwest::Proxy::all(proxy)?),
+    };
+    builder
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -236,8 +242,8 @@ pub async fn begin_authorization(
             .post(registration_endpoint)
             .header("accept", "application/json")
             .json(&json!({
-                "client_name": "Wisp Science",
-                "client_uri": "https://github.com/xuzhougeng/wisp-science",
+                "client_name": "wisp-depmap",
+                "client_uri": "https://github.com/Yu-Qiao-sjtu/wisp-science-depmap",
                 "redirect_uris": [redirect_uri],
                 "grant_types": ["authorization_code", "refresh_token"],
                 "response_types": ["code"],
@@ -531,11 +537,25 @@ pub async fn connect(
         "Authorization".to_string(),
         format!("Bearer {}", credential.access_token),
     ));
-    wisp_mcp::McpClient::connect_http(resource_url, &authorized_headers).await
+    wisp_mcp::McpClient::connect_http_with_proxy(
+        resource_url,
+        &authorized_headers,
+        &crate::network::mcp_proxy(),
+    )
+    .await
 }
 
 pub fn has_credential(connection_id: &str) -> bool {
     wisp_store::secrets::Secret::get(&secret_name(connection_id)).is_ok()
+}
+
+/// One-way, non-secret revision used only to isolate connector cache entries.
+/// Token rotation may conservatively invalidate hits; credential replacement
+/// must always do so.
+pub fn credential_revision(connection_id: &str) -> Option<String> {
+    wisp_store::secrets::Secret::get(&secret_name(connection_id))
+        .ok()
+        .map(|credential| hex::encode(Sha256::digest(credential.as_bytes())))
 }
 
 pub fn forget(connection_id: &str) {

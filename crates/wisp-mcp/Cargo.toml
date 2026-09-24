@@ -1,6 +1,6 @@
 [package]
 name = "wisp-mcp"
-description = "Minimal stdio JSON-RPC MCP client; launches vendored bio-tools servers via uv."
+description = "Stdio and HTTP JSON-RPC MCP client for user-configured servers."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,21 +11,20 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = "0.1"
 anyhow = { workspace = true }
+base64 = { workspace = true }
+regex = { workspace = true }
 tracing = { workspace = true }
 wisp-llm = { workspace = true }
 wisp-tools = { workspace = true }
-wisp-paths = { workspace = true }
 reqwest = { workspace = true }
 
-[target.'cfg(unix)'.dependencies]
+# Only the process-tree regression fixture inspects PIDs directly.
+[target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
 
-[target.'cfg(windows)'.dependencies]
+[target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
-    "Win32_Security",
-    "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
 
@@ -38,3 +37,9 @@ harness = false
 name = "mcp_transport"
 path = "tests/mcp_transport.rs"
 harness = false
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+tokio = { workspace = true, features = ["test-util"] }
+axum = { workspace = true }
+futures-util = { workspace = true }

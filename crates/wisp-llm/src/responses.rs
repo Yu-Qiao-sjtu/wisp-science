@@ -63,17 +63,40 @@ impl OpenAiResponsesProvider {
         if !tools_json.is_empty() {
             body["tools"] = json!(tools_json);
         }
-        if let Some(effort) = &self.cfg.reasoning_effort {
+        if self.cfg.thinking_enabled == Some(false)
+            && crate::provider::is_deepseek_endpoint(&self.cfg.base_url, &self.cfg.model)
+        {
+            body["reasoning"] = json!({ "effort": "none" });
+        } else if let Some(effort) = &self.cfg.reasoning_effort {
             body["reasoning"] = json!({ "effort": effort });
+        }
+        if let Some(tier) = &self.cfg.service_tier {
+            body["service_tier"] = json!(tier);
         }
         body
     }
 
     async fn request(&self, body: Value) -> Result<Value> {
+        let endpoint = self.endpoint();
+        let included = body.get("service_tier").is_some();
+        let service_tier = body
+            .get("service_tier")
+            .and_then(Value::as_str)
+            .unwrap_or("omitted");
+        tracing::info!(
+            target: "wisp",
+            provider = "openai_responses",
+            model = %self.cfg.model,
+            endpoint_kind = "responses",
+            endpoint_host = %endpoint_host(&endpoint),
+            service_tier,
+            service_tier_in_body = included,
+            stream = false,
+            "llm_request_dispatch"
+        );
         let resp = self
-            .client
-            .post(self.endpoint())
-            .headers(self.headers())
+            .cfg
+            .request_headers(self.client.post(endpoint).headers(self.headers()))
             .json(&body)
             .send()
             .await?;
@@ -86,6 +109,13 @@ impl OpenAiResponsesProvider {
     }
 }
 
+fn endpoint_host(endpoint: &str) -> String {
+    url::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".into())
+}
+
 /// Keep only tool-call pairings that Responses endpoints accept.
 ///
 /// A turn interrupted after the assistant emitted `function_call` but before
@@ -94,23 +124,7 @@ impl OpenAiResponsesProvider {
 /// chat-completions path already strips these (#74). Symmetrically drop tool
 /// outputs with no preceding call.
 fn sanitize_messages(messages: &[Message]) -> Vec<Message> {
-    let mut answered = std::collections::HashSet::new();
-    let mut requested = std::collections::HashSet::new();
-    for m in messages {
-        match m.role {
-            Role::Tool => {
-                if let Some(id) = &m.tool_call_id {
-                    answered.insert(id.clone());
-                }
-            }
-            Role::Assistant => {
-                for tc in &m.tool_calls {
-                    requested.insert(tc.id.clone());
-                }
-            }
-            _ => {}
-        }
-    }
+    let (answered, requested) = crate::tool_call_pairing(messages);
     messages
         .iter()
         .filter_map(|m| match m.role {
@@ -166,7 +180,11 @@ fn message_to_input(m: &Message) -> Vec<Value> {
         Role::Tool => vec![json!({
             "type": "function_call_output",
             "call_id": m.tool_call_id.clone().unwrap_or_default(),
-            "output": m.content.as_text(),
+            // Responses accepts text, image, and file input parts directly in
+            // a function output. Preserve multipart view_image results here;
+            // flattening with `as_text()` silently hid the image from the
+            // vision-capable primary.
+            "output": content_to_responses(&m.content),
         })],
     }
 }
@@ -363,6 +381,23 @@ mod tests {
             .collect()
     }
 
+    fn image_tool_result(id: &str) -> Message {
+        let mut message = Message::tool(id, "view_image", "plot.png");
+        message.content = Content::Parts(vec![
+            Part::Text {
+                kind: "text".into(),
+                text: "plot.png".into(),
+            },
+            Part::Image {
+                kind: "image_url".into(),
+                image_url: crate::ImageUrl {
+                    url: "data:image/png;base64,AAAA".into(),
+                },
+            },
+        ]);
+        message
+    }
+
     /// Regression: a tool-call turn must be replayed as a `function_call` item so
     /// the following `function_call_output` has a matching `call_id`. Without it
     /// the Responses API rejects with "No tool call found for function call output".
@@ -392,6 +427,26 @@ mod tests {
             output["call_id"], "call_abc",
             "output must match the emitted call_id"
         );
+    }
+
+    #[test]
+    fn native_tool_image_is_serialized_in_function_call_output() {
+        let messages = vec![
+            Message::user("inspect"),
+            assistant_with_call("", "call_image", "view_image", "{\"path\":\"plot.png\"}"),
+            image_tool_result("call_image"),
+        ];
+        let input = wire_input(&messages);
+        let output = input
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .expect("function output");
+        assert_eq!(output["call_id"], "call_image");
+        let content = output["output"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "plot.png");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "data:image/png;base64,AAAA");
     }
 
     /// History arguments can be invalid JSON (compaction truncates oversized
@@ -596,5 +651,49 @@ mod tests {
             }]
         }));
         assert_eq!(comp.tool_calls[0].function.name, "python");
+    }
+
+    #[test]
+    fn fast_service_tier_is_top_level_priority_and_independent_of_effort() {
+        let mut cfg = crate::provider::ProviderConfig::openai_responses(
+            "https://api.openai.com/v1",
+            "sk-test",
+            "gpt-5.6-sol",
+        );
+        cfg.reasoning_effort = Some("high".into());
+        cfg.service_tier = Some("priority".into());
+        let provider = OpenAiResponsesProvider::new(cfg);
+        let body = provider.build_body(&[Message::user("hi")], &[]);
+        assert_eq!(body["model"], "gpt-5.6-sol");
+        assert_eq!(body["service_tier"], "priority");
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn deepseek_reader_sets_reasoning_effort_none() {
+        let mut cfg = crate::provider::ProviderConfig::openai_responses(
+            "https://api.deepseek.com",
+            "sk-test",
+            "deepseek-v4-flash",
+        );
+        cfg.thinking_enabled = Some(false);
+        cfg.reasoning_effort = Some("high".into());
+        let provider = OpenAiResponsesProvider::new(cfg);
+        let body = provider.build_body(&[Message::user("hi")], &[]);
+        assert_eq!(body["reasoning"]["effort"], "none");
+    }
+
+    #[test]
+    fn default_service_tier_is_omitted_from_responses_body() {
+        let mut cfg = crate::provider::ProviderConfig::openai_responses(
+            "https://api.openai.com/v1",
+            "sk-test",
+            "gpt-5.6-sol",
+        );
+        cfg.reasoning_effort = Some("low".into());
+        let provider = OpenAiResponsesProvider::new(cfg);
+        let body = provider.build_body(&[Message::user("hi")], &[]);
+        assert!(body.get("service_tier").is_none());
+        assert_eq!(body["reasoning"]["effort"], "low");
     }
 }

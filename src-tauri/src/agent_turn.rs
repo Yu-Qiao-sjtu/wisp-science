@@ -9,11 +9,90 @@
 
 use super::*;
 
+/// Where a user-visible turn originated. IM turns share the desktop approval
+/// UI but must not inherit an unattended Allow default for mutating tools.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TurnOrigin {
+    #[default]
+    Desktop,
+    Im,
+    Queued(u64),
+}
+
+impl TurnOrigin {
+    fn force_ask_mutations(self) -> bool {
+        matches!(self, Self::Im)
+    }
+
+    fn queue_id(self) -> Option<u64> {
+        match self {
+            Self::Queued(id) => Some(id),
+            Self::Desktop | Self::Im => None,
+        }
+    }
+}
+
+/// Persist the agent's compacted context as a new context epoch and return
+/// its number. The previous head rows are left frozen; `context_epochs`
+/// records what the compaction did (`ContextManager::last_compaction`).
+///
+/// `aligned` says whether the list the compaction started from was
+/// row-aligned with the head epoch (true for `/compact` and for a single
+/// mid-turn compaction). Only then can `kept_from_index` be mapped to the
+/// durable seq of the first retained-tail message; otherwise the UI-only
+/// `first_kept_seq` is left unknown.
+pub(crate) async fn persist_compaction_epoch(
+    store: &Store,
+    frame_id: &str,
+    ctx: &wisp_core::ContextManager,
+    strategy: &str,
+    aligned: bool,
+) -> Result<i64, String> {
+    let outcome = ctx.last_compaction();
+    let first_kept_seq = match outcome.and_then(|outcome| outcome.kept_from_index) {
+        Some(index) if aligned => store
+            .load_messages_with_seq(frame_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .get(index)
+            .map(|(seq, _)| *seq),
+        _ => None,
+    };
+    let epoch = store
+        .open_context_epoch(
+            frame_id,
+            wisp_store::OpenContextEpoch {
+                messages: &ctx.messages,
+                strategy,
+                kind: outcome.map_or("prune_only", |outcome| outcome.kind.as_str()),
+                before_tokens: outcome.map_or(0, |outcome| outcome.before),
+                after_tokens: outcome.map_or(0, |outcome| outcome.after),
+                checkpoint_index: outcome.and_then(|outcome| outcome.checkpoint_index),
+                first_kept_seq,
+                archive_ref: outcome.map(|outcome| outcome.archive_reference.as_str()),
+                ui_event_seq: None,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    // Mid-turn compactions emit their Compaction event before the epoch
+    // exists; attach the newest one now. `/compact` appends its own event
+    // afterwards and links it itself.
+    if strategy != "manual" {
+        if let Ok(Some(seq)) = store.latest_compaction_ui_event_seq(frame_id).await {
+            if let Err(error) = store.set_context_epoch_ui_event(frame_id, epoch, seq).await {
+                tracing::warn!("link compaction event to epoch failed: {error}");
+            }
+        }
+    }
+    Ok(epoch)
+}
+
 #[tauri::command]
 pub(crate) async fn send_message(
     state: State<'_, AppState>,
     app: AppHandle,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     session_id: Option<String>,
     message: String,
     attachments: Option<Vec<String>>,
@@ -24,7 +103,27 @@ pub(crate) async fn send_message(
     guide: Option<bool>,
     replace: Option<bool>,
 ) -> Result<String, String> {
-    send_message_inner(
+    let mut replacement_guard = None;
+    let mut workflow_guard = None;
+    if replace.unwrap_or(false) {
+        if let Some(session_id) = session_id.as_deref().filter(|id| !id.is_empty()) {
+            let runtime = state.sessions.lock().await.get(session_id).cloned();
+            if let Some(rt) = runtime {
+                replacement_guard = Some(ReplacementReservation::new(rt.clone()));
+                stop_agent(state.clone(), Some(session_id.to_string())).await?;
+                workflow_guard = Some(rt.workflow.clone().lock_owned().await);
+                for id in supersede_duplicate_queued(
+                    &rt,
+                    &message,
+                    attachments.as_deref().unwrap_or_default(),
+                    references.as_deref().unwrap_or_default(),
+                ) {
+                    emit_queued_turn_state(&app, session_id, id, "superseded");
+                }
+            }
+        }
+    }
+    let result = send_message_inner(
         state.inner(),
         app,
         window.label(),
@@ -37,9 +136,114 @@ pub(crate) async fn send_message(
         progress_observer_id,
         guide,
         replace,
-        None,
+        workflow_guard,
+        TurnOrigin::Desktop,
     )
-    .await
+    .await;
+    drop(replacement_guard);
+    result
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManualCompactCommand {
+    intent: wisp_core::CompactIntent,
+    instruction: Option<String>,
+}
+
+fn parse_manual_compact_command(message: &str) -> Option<ManualCompactCommand> {
+    let command = message.trim();
+    let Some(rest) = command.strip_prefix("/compact") else {
+        return None;
+    };
+    if rest.is_empty() {
+        return Some(ManualCompactCommand {
+            intent: wisp_core::CompactIntent::PruneOnly,
+            instruction: None,
+        });
+    }
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Some(ManualCompactCommand {
+            intent: wisp_core::CompactIntent::PruneOnly,
+            instruction: None,
+        });
+    }
+    if rest == "--semantic" {
+        return Some(ManualCompactCommand {
+            intent: wisp_core::CompactIntent::Semantic,
+            instruction: None,
+        });
+    }
+    if let Some(instruction) = rest.strip_prefix("--semantic") {
+        if instruction.chars().next().is_some_and(char::is_whitespace) {
+            let instruction = instruction.trim();
+            return Some(ManualCompactCommand {
+                intent: wisp_core::CompactIntent::Semantic,
+                instruction: (!instruction.is_empty()).then(|| instruction.to_string()),
+            });
+        }
+        return None;
+    }
+    Some(ManualCompactCommand {
+        intent: wisp_core::CompactIntent::Semantic,
+        instruction: Some(rest.to_string()),
+    })
+}
+
+struct ReplacementReservation(Arc<SessionRuntime>);
+
+impl ReplacementReservation {
+    fn new(rt: Arc<SessionRuntime>) -> Self {
+        rt.replacing.fetch_add(1, Ordering::SeqCst);
+        Self(rt)
+    }
+}
+
+impl Drop for ReplacementReservation {
+    fn drop(&mut self) {
+        self.0.replacing.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+// Called while owning the workflow, after the cancelled loop has persisted.
+fn supersede_duplicate_queued(
+    rt: &SessionRuntime,
+    replacement: &str,
+    attachments: &[String],
+    references: &[ComposerReferenceArg],
+) -> Vec<u64> {
+    let matches = |item: &QueuedItem| {
+        item.message == replacement
+            && item.attachments == attachments
+            && item.references == references
+    };
+    let mut queued = rt.queued.lock().unwrap();
+    let mut ids = Vec::new();
+    queued.retain(|item| {
+        let duplicate = matches(item);
+        if duplicate {
+            ids.push(item.id);
+        }
+        !duplicate
+    });
+    let mut cutins = rt.queued_cutins.lock().unwrap();
+    let mut removed_guidance = Vec::new();
+    cutins.retain(|(guidance_id, item)| {
+        let duplicate = matches(item);
+        if duplicate {
+            ids.push(item.id);
+            removed_guidance.push(*guidance_id);
+        }
+        !duplicate
+    });
+    if !removed_guidance.is_empty() {
+        let mut pending = rt.pending_guidance.lock().unwrap();
+        pending.retain(|(guidance_id, _)| !removed_guidance.contains(guidance_id));
+    }
+    ids
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -50,7 +254,7 @@ pub(crate) async fn send_message_inner(
     session_id: Option<String>,
     message: String,
     attachments: Option<Vec<String>>,
-    references: Option<Vec<ComposerReferenceArg>>,
+    mut references: Option<Vec<ComposerReferenceArg>>,
     resume: Option<bool>,
     acp_agent_id: Option<String>,
     progress_observer_id: Option<u64>,
@@ -61,6 +265,7 @@ pub(crate) async fn send_message_inner(
     // started before running this message ("replace the current task").
     replace: Option<bool>,
     mut workflow_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    origin: TurnOrigin,
 ) -> Result<String, String> {
     let resume = resume.unwrap_or(false);
     // Automatic delegation resume carries an owned workflow guard and uses the
@@ -70,7 +275,7 @@ pub(crate) async fn send_message_inner(
     if !resume && message.trim().is_empty() {
         return Err("message is empty".into());
     }
-    let mut ap = state.active(window_label);
+    let mut ap = state.require_active(window_label)?;
     let mut explicit_scope = None;
     // A session belongs to one project for life, but the per-window active slot
     // can drift while it keeps running (another project opened in this window,
@@ -78,6 +283,11 @@ pub(crate) async fn send_message_inner(
     // run the turn in the owner project — never error out on a mismatch or,
     // worse, run tools in a stranger's workspace (#182, #194).
     if let Some(id) = session_id.as_deref().filter(|id| !id.is_empty()) {
+        state
+            .store
+            .require_unarchived_session(id)
+            .await
+            .map_err(|e| e.to_string())?;
         if matches!(
             state
                 .store
@@ -96,6 +306,14 @@ pub(crate) async fn send_message_inner(
         explicit_scope = Some(scope);
     }
     let _project_activity = state.begin_project_activity(&ap.id)?;
+    if let Some(id) = session_id.as_deref().filter(|id| !id.is_empty()) {
+        state
+            .store
+            .require_unarchived_session(id)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    ensure_project_live_approvals(state, &ap.id).await;
     let frame_scope = explicit_scope
         .clone()
         .unwrap_or_else(|| wisp_store::StateScope::mainline(ap.id.clone()));
@@ -174,8 +392,20 @@ pub(crate) async fn send_message_inner(
         let skills = active_skill_index(&state.store, &ap).await;
         let mut injected_context =
             resolve_composer_references(&state.store, refs, &frame_id, &ap.root, &skills).await?;
+        let package_guidance = network::package_guidance(&network::load(&state.store).await?);
+        if !package_guidance.is_empty() {
+            injected_context.push(package_guidance);
+        }
         if let Some(memory) = memory_commands::global_memory_runtime_injection(&state.store).await {
             injected_context.push(memory);
+        }
+        let archive_index = state
+            .store
+            .research_archive_index(&ap.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if !archive_index.is_empty() {
+            injected_context.push(archive_index);
         }
         if let Some(context) = runtime.mcp_app_context_injection() {
             injected_context.push(context);
@@ -209,9 +439,8 @@ pub(crate) async fn send_message_inner(
             .map(|delivery| delivery.id.clone())
             .collect::<Vec<_>>();
         let artifact_references = resolve_acp_artifact_references(&state.store, refs).await?;
-        // Record the destination before waiting for a busy session. A user can
-        // therefore send a queued desktop follow-up and immediately continue
-        // that same conversation from Feishu or WeChat.
+        // Record this project's last session. Desktop sends never move the IM
+        // target project; Feishu/WeChat keep their own `/project` destination.
         channels::record_last_message_session(&state.store, &frame_id)
             .await
             .map_err(|error| format!("Failed to update the shared last-message route: {error}"))?;
@@ -241,6 +470,7 @@ pub(crate) async fn send_message_inner(
                 attachments.as_deref().unwrap_or_default(),
                 &injected_context,
                 &artifact_references,
+                origin.queue_id(),
             )
             .await
         };
@@ -252,7 +482,7 @@ pub(crate) async fn send_message_inner(
                         .mark_agent_workflow_deliveries_presented(&completion_delivery_ids)
                         .await;
                 }
-                if !resume && load_auto_review_enabled(&state.store).await {
+                if !resume && load_auto_review_enabled(&state.store, &frame_id).await {
                     automatic_review_acp(state, &app, &ap, &frame_id, &runtime.cancel, turn_start)
                         .await;
                 }
@@ -314,6 +544,21 @@ pub(crate) async fn send_message_inner(
     if user_routed_turn {
         state.set_notification_window(&frame_id, window_label);
     }
+    if !resume
+        && !references.as_ref().is_some_and(|references| {
+            references
+                .iter()
+                .any(|reference| matches!(reference, ComposerReferenceArg::Workflow { .. }))
+        })
+    {
+        if let Some(id) =
+            quick_actions::explicitly_requested_workflow_id(&state.store, &message).await
+        {
+            references
+                .get_or_insert_with(Vec::new)
+                .push(ComposerReferenceArg::Workflow { id });
+        }
+    }
     // Deliberately no set_active_frame here: see the `AppState::active_frame`
     // doc — a turn writing view state races the user's session/project switch.
     // A workflow reference is itself an accepted capability request. Persist it
@@ -328,8 +573,8 @@ pub(crate) async fn send_message_inner(
             .await?;
     }
 
-    // Route on accepted send, not on eventual execution. In particular, a
-    // follow-up queued behind a long turn must become the target immediately.
+    // Record this project's last session on accepted send. Desktop traffic
+    // must not steal the Feishu/WeChat IM project.
     channels::record_last_message_session(&state.store, &frame_id)
         .await
         .map_err(|error| format!("Failed to update the shared last-message route: {error}"))?;
@@ -380,6 +625,12 @@ pub(crate) async fn send_message_inner(
     }
     let mut guard = rt.agent.lock().await;
     rt.discard_stale_agent(&mut guard);
+    if crate::mcp_connections::host()
+        .needs_catalog_refresh(&frame_id)
+        .await
+    {
+        *guard = None;
+    }
     let _progress_subscription =
         progress_observer_id.and_then(|id| channels::activate_progress_observer(id, &frame_id));
     if rt.deleted.load(Ordering::SeqCst) {
@@ -389,7 +640,7 @@ pub(crate) async fn send_message_inner(
     // session. A queued follow-up may have been accepted before the previous
     // turn ended; reading its profile earlier would rebuild the invalidated
     // Agent with the model that was selected at enqueue time.
-    let vision_cfg = build_vision_provider_config(&state.store).await;
+    let vision_cfg = build_vision_provider_config(&state.store, &frame_id).await;
     let fallback_max_context = state
         .store
         .get_setting("max_context")
@@ -406,7 +657,11 @@ pub(crate) async fn send_message_inner(
         .flatten()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(DEFAULT_MAX_ITER);
-    let session_profile_id = models::session_profile_id(&state.store, &frame_id).await;
+    let (session_profile_id, rebound_model) =
+        models::resolve_session_profile(&state.store, &frame_id).await;
+    if rebound_model {
+        *guard = None;
+    }
     let model_label = models::session_label(&state.store, &frame_id).await;
     let specialist = specialists::session_specialist(&state.store, &frame_id).await;
     let max_context = match &specialist {
@@ -420,7 +675,19 @@ pub(crate) async fn send_message_inner(
     let delegation_enabled =
         delegation_runtime::session_delegation_enabled(&state.store, &frame_id).await;
     let plan_mode_enabled = plan_mode::session_plan_mode(&state.store, &frame_id).await;
-    let (provider, api_url, model, api_key, max_tokens, reasoning_effort) = match &specialist {
+    let (
+        provider,
+        api_url,
+        model,
+        api_key,
+        max_tokens,
+        reasoning_effort,
+        service_tier,
+        user_agent,
+        send_user_agent,
+        send_session_id,
+        session_header_name,
+    ) = match &specialist {
         Some(spec) if !spec.model_id.trim().is_empty() => {
             specialists::specialist_llm(&state.store, spec).await
         }
@@ -433,6 +700,12 @@ pub(crate) async fn send_message_inner(
         &model,
         max_tokens,
         &reasoning_effort,
+        &service_tier,
+        &user_agent,
+        send_user_agent,
+        send_session_id,
+        &session_header_name,
+        Some(&frame_id),
     )?;
     let primary_supports_vision = models::supports_vision(
         &state.store,
@@ -459,7 +732,7 @@ pub(crate) async fn send_message_inner(
     if guard.is_some()
         && state
             .store
-            .message_count(&frame_id)
+            .max_message_seq(&frame_id)
             .await
             .map_err(|error| error.to_string())?
             > rt.last_seq()
@@ -485,15 +758,10 @@ pub(crate) async fn send_message_inner(
     }
     let reused_agent = guard.is_some();
     if guard.is_none() {
-        let skills = active_skill_index(&state.store, &ap).await;
-        let skills = match specialist.as_ref().and_then(|s| s.skills.as_ref()) {
-            Some(names) => {
-                let set: HashSet<String> = names.iter().cloned().collect();
-                Arc::new(skills.filtered_by_names(Some(&set)))
-            }
-            None => skills,
-        };
-        let mut agent = Agent::new(
+        let skills = specialist_skill_index(&state.store, &ap, specialist.as_ref()).await;
+        // Desktop history lives in SQLite. Do not hydrate the project-shared
+        // `.wisp/session.json` (CLI leftover / other session) into model context.
+        let mut agent = Agent::new_without_session_file(
             cfg.clone(),
             skills.clone(),
             ap.memory.clone(),
@@ -516,11 +784,13 @@ pub(crate) async fn send_message_inner(
             &mut agent,
             models::image_generation_config(&state.store).await,
             llm_proxy(),
+            &frame_id,
         );
         add_configured_video_generation_tool(
             &mut agent,
             models::video_generation_config(&state.store).await,
             llm_proxy(),
+            &frame_id,
         );
         agent.add_tool(Box::new(browser_bridge::BrowserSetupTool::new(
             state.browser_bridge.clone(),
@@ -610,6 +880,35 @@ pub(crate) async fn send_message_inner(
             ap.id.clone(),
             frame_id.clone(),
         )));
+        if specialist
+            .as_ref()
+            .is_some_and(|specialist| specialist.id == specialists::DEPMAP_SPECIALIST_ID)
+        {
+            agent.add_tool(Box::new(depmap_agent::DepMapEvidenceHistoryTool::new(
+                state.store.clone(),
+                ap.id.clone(),
+                frame_id.clone(),
+            )));
+            if let Some(tool) = depmap_agent::DepMapQueryTool::from_project(
+                ap.root.clone(),
+                skills.as_ref(),
+                state.store.clone(),
+                ap.id.clone(),
+                frame_id.clone(),
+            ) {
+                agent.add_tool(Box::new(tool.evidence_tool()));
+                agent.add_tool(Box::new(tool));
+            }
+            agent.add_tool(Box::new(depmap_agent::DepMapProjectRunsTool::new(
+                state.store.clone(),
+                frame_scope.clone(),
+            )));
+            agent.add_tool(Box::new(depmap_agent::DepMapValidateRunTool::new(
+                state.store.clone(),
+                frame_scope.clone(),
+                ap.root.clone(),
+            )));
+        }
         agent.add_tool(Box::new(research_graph::ResearchGraphTool::new_in_scope(
             state.store.clone(),
             frame_scope.clone(),
@@ -620,10 +919,22 @@ pub(crate) async fn send_message_inner(
         agent.add_tool(Box::new(quick_actions::SearchModelsTool::new(
             state.store.clone(),
         )));
-        agent.add_tool(Box::new(quick_actions::CreateWorkflowTool::new(
-            state.store.clone(),
-            skills.clone(),
-        )));
+        agent.add_tool(Box::new(
+            quick_actions::CreateWorkflowTool::new(state.store.clone(), skills.clone()).in_project(
+                ap.clone(),
+                frame_id.clone(),
+                state.app_data.clone(),
+            ),
+        ));
+        agent.add_tool(Box::new(
+            quick_actions::StartWorkflowTool::new(
+                state.store.clone(),
+                ap.clone(),
+                frame_id.clone(),
+                state.app_data.clone(),
+            )
+            .await,
+        ));
         agent.add_tool(Box::new(specialist_tool::SaveSpecialistTool {
             store: state.store.clone(),
         }));
@@ -643,13 +954,14 @@ pub(crate) async fn send_message_inner(
         }
         if delegation_enabled {
             agent.add_tool(Box::new(
-                delegation_tool::DelegateTasksTool::new(
+                delegation_tool::DelegateTasksTool::new_with_browser(
                     state.store.clone(),
                     ap.clone(),
                     frame_id.clone(),
                     state.run_manager.clone(),
                     state.runtime_manager.clone(),
                     state.app_data.clone(),
+                    Some(state.browser_bridge.clone()),
                 )
                 .await?,
             ));
@@ -659,23 +971,31 @@ pub(crate) async fn send_message_inner(
                 frame_id.clone(),
             )));
         }
-        match state.store.load_messages(&frame_id).await {
-            Ok(msgs) => {
-                agent.ctx.messages = msgs;
-                if let Some(message) = agent.ctx.messages.first_mut() {
-                    if let wisp_llm::Content::Text(prompt) = &mut message.content {
-                        ssh_hosts::strip_legacy_compute_section(prompt);
-                    }
-                }
+        let mut msgs =
+            wisp_core::require_sqlite_session_messages(state.store.load_messages(&frame_id).await)?;
+        wisp_core::bound_tool_results_in_history(&ap.root, &mut msgs);
+        agent.ctx.messages = msgs;
+        if let Some(message) = agent.ctx.messages.first_mut() {
+            if let wisp_llm::Content::Text(prompt) = &mut message.content {
+                ssh_hosts::strip_legacy_compute_section(prompt);
             }
-            Err(e) => tracing::warn!("load session from sqlite failed: {e}"),
         }
-        rt.set_last_seq(agent.ctx.messages.len() as i64);
+        // last_seq is durable MAX(seq). Repair after this so the incremental
+        // flush writes synthetic tool results the same way a skipped-batch
+        // result is persisted (#979).
+        rt.sync_last_seq_from_store(&state.store, &frame_id).await?;
+        if agent.ctx.repair_unpaired_tool_calls() > 0 {
+            tracing::warn!(
+                "repaired unpaired tool_calls in {frame_id} so the provider transcript stays paired"
+            );
+        }
         agent.seed_system_prompt(&skills, None);
+        let workflow_templates = quick_actions::ensure_templates(&state.store).await;
         if let Some(message) = agent.ctx.messages.first_mut() {
             if let wisp_llm::Content::Text(prompt) = &mut message.content {
                 delegation_runtime::sync_delegation_prompt(prompt, delegation_enabled);
                 plan_mode::sync_plan_prompt(prompt, plan_mode_enabled);
+                quick_actions::sync_workflow_catalog_prompt(prompt, &workflow_templates);
             }
         }
         if let Some(spec) = &specialist {
@@ -698,12 +1018,34 @@ pub(crate) async fn send_message_inner(
             &ap.id,
             frame_scope.scope_key(),
             &frame_id,
-            &state.app_data,
             &state.store,
             None,
             connector_allow.as_ref(),
         )
         .await;
+        if specialist
+            .as_ref()
+            .is_some_and(|specialist| specialist.id == specialists::DEPMAP_SPECIALIST_ID)
+        {
+            // Identify the intended remote server by its canonical read-only
+            // capability tool, then grant exact tools from that same connector
+            // only. Multiple candidates fail closed instead of trusting a
+            // spoofable `depmap_*` name prefix.
+            let remote_read_only_tools =
+                depmap_agent::validated_remote_depmap_tools(&agent.tools, &wiring.added_tools);
+            let tool_catalog = wisp_core::ToolCatalog::from_registry_and_names(
+                &agent.tools,
+                &remote_read_only_tools,
+            );
+            agent.add_tool(Box::new(
+                depmap_agent::DepMapAgentRouteTool::with_contract(
+                    remote_read_only_tools,
+                    wiring.depmap_contract.clone(),
+                )
+                .with_tool_catalog(tool_catalog),
+            ));
+            wisp_core::install_scientific_intent_planner_in(&mut agent.tools, &ap.id, &frame_id);
+        }
         {
             let mut observed = state.plugin_runtime_errors.lock().unwrap();
             let project_errors = observed.entry(ap.id.clone()).or_default();
@@ -720,7 +1062,14 @@ pub(crate) async fn send_message_inner(
         }
         *guard = Some(agent);
     }
-    let agent = guard.as_mut().unwrap();
+    let agent = guard
+        .as_mut()
+        .ok_or_else(|| "Failed to prepare the session agent.".to_string())?;
+    if let Some(message) = agent.ctx.messages.first_mut() {
+        if let wisp_llm::Content::Text(prompt) = &mut message.content {
+            network::sync_package_guidance(prompt, &network::load(&state.store).await?);
+        }
+    }
     let (auto_continue, auto_continue_limit) = load_auto_continue_settings(&state.store).await;
     apply_live_agent_settings(
         agent,
@@ -741,13 +1090,28 @@ pub(crate) async fn send_message_inner(
         let interrupted = rt.interrupted_turn_start.lock().unwrap().take();
         if let Some(start) = interrupted {
             if start < agent.ctx.messages.len() {
+                // The in-memory list is row-aligned with the head epoch, so
+                // the row before `start` gives the durable seq to keep.
+                // Frozen epochs sit below every head seq and stay intact.
+                let rows = state
+                    .store
+                    .load_messages_with_seq(&frame_id)
+                    .await
+                    .map_err(|e| format!("replace: loading the context failed: {e}"))?;
+                let keep_seq = match start {
+                    0 => rows.first().map_or(0, |(seq, _)| seq - 1),
+                    _ => rows
+                        .get(start - 1)
+                        .map(|(seq, _)| *seq)
+                        .ok_or_else(|| "replace: interrupted turn is out of range".to_string())?,
+                };
                 agent.ctx.messages.truncate(start);
                 state
                     .store
-                    .replace_messages(&frame_id, &agent.ctx.messages)
+                    .truncate_model_context(&frame_id, keep_seq)
                     .await
                     .map_err(|e| format!("replace: rolling back the context failed: {e}"))?;
-                rt.set_last_seq(agent.ctx.messages.len() as i64);
+                rt.sync_last_seq_from_store(&state.store, &frame_id).await?;
             }
         }
     }
@@ -755,59 +1119,104 @@ pub(crate) async fn send_message_inner(
         .device_hub
         .mark_working(&frame_id, Some(ap.id.as_str()));
     // User-triggered /compact — never part of a model turn. Archive + fold the
-    // in-memory context, rewrite only the persisted message rows (the visual
-    // transcript in session_ui_events keeps the full history), and report via
-    // the existing Compaction event.
-    if !resume && message.trim() == "/compact" {
-        match agent.compact().await {
-            Ok((before, after, _archive)) => {
-                state
-                    .store
-                    .replace_messages(&frame_id, &agent.ctx.messages)
+    // in-memory context, persist the compacted working set as a new context
+    // epoch (the previous rows and the visual transcript in session_ui_events
+    // stay intact), and report via the existing Compaction event.
+    if !resume {
+        if let Some(command) = parse_manual_compact_command(&message) {
+            match agent
+                .compact_with_intent(command.instruction.as_deref(), command.intent)
+                .await
+            {
+                Ok((before, after, _archive)) => {
+                    let epoch = persist_compaction_epoch(
+                        &state.store,
+                        &frame_id,
+                        &agent.ctx,
+                        "manual",
+                        true,
+                    )
                     .await
                     .map_err(|e| {
-                        format!("compact: persisting the rewritten context failed: {e}")
+                        format!("compact: persisting the compacted context failed: {e}")
                     })?;
-                rt.set_last_seq(agent.ctx.messages.len() as i64);
-                let event = AgentEvent::Compaction {
-                    frame_id: frame_id.clone(),
-                    before,
-                    after,
-                    strategy: "manual".into(),
-                };
-                let mut event_seq = state
-                    .store
-                    .next_session_ui_event_seq(&frame_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                append_ui_event(&state.store, &frame_id, &mut event_seq, event.clone()).await;
-                emit_agent_event(&app, event);
-                persist_and_emit_terminal_event(
-                    state,
-                    &app,
-                    &frame_id,
-                    AgentEvent::Done {
+                    rt.sync_last_seq_from_store(&state.store, &frame_id).await?;
+                    let event = AgentEvent::Compaction {
                         frame_id: frame_id.clone(),
-                        stop_reason: Some("compact".into()),
-                        effective_max_iter: None,
-                    },
-                )
-                .await;
-                return Ok(frame_id);
-            }
-            Err(e) => {
-                persist_and_emit_terminal_event(
-                    state,
-                    &app,
-                    &frame_id,
-                    AgentEvent::Error {
+                        before,
+                        after,
+                        strategy: "manual".into(),
+                        epoch: Some(epoch as u64),
+                    };
+                    let mut event_seq = state
+                        .store
+                        .next_session_ui_event_seq(&frame_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let compaction_event_seq = event_seq;
+                    append_ui_event(&state.store, &frame_id, &mut event_seq, event.clone()).await;
+                    if event_seq > compaction_event_seq {
+                        if let Err(error) = state
+                            .store
+                            .set_context_epoch_ui_event(&frame_id, epoch, compaction_event_seq)
+                            .await
+                        {
+                            tracing::warn!("link compaction event to epoch failed: {error}");
+                        }
+                    }
+                    emit_agent_event_in(&app, event, Some(ap.id.as_str()));
+                    let (schemas, origins) = agent.tools.schemas_with_origins();
+                    let context_usage = agent.ctx.context_usage(&schemas, &origins);
+                    let usage_event = AgentEvent::Usage {
                         frame_id: frame_id.clone(),
-                        message: e.clone(),
-                        effective_max_iter: None,
-                    },
-                )
-                .await;
-                return Err(e);
+                        round: 0,
+                        model: model_label.clone(),
+                        created_at: chrono::Utc::now().timestamp(),
+                        input: 0,
+                        output: 0,
+                        reasoning: 0,
+                        cached: 0,
+                        ctx_tokens: agent.ctx.request_tokens_with_reserve(
+                            wisp_core::ContextManager::estimated_tool_tokens(&schemas),
+                        ),
+                        max_context,
+                        context_usage,
+                    };
+                    let mut usage_seq = state
+                        .store
+                        .next_session_ui_event_seq(&frame_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    append_ui_event(&state.store, &frame_id, &mut usage_seq, usage_event.clone())
+                        .await;
+                    emit_agent_event_in(&app, usage_event, Some(ap.id.as_str()));
+                    persist_and_emit_terminal_event(
+                        state,
+                        &app,
+                        &frame_id,
+                        AgentEvent::Done {
+                            frame_id: frame_id.clone(),
+                            stop_reason: Some("compact".into()),
+                            effective_max_iter: None,
+                        },
+                    )
+                    .await;
+                    return Ok(frame_id);
+                }
+                Err(e) => {
+                    persist_and_emit_terminal_event(
+                        state,
+                        &app,
+                        &frame_id,
+                        AgentEvent::Error {
+                            frame_id: frame_id.clone(),
+                            message: e.clone(),
+                            effective_max_iter: None,
+                        },
+                    )
+                    .await;
+                    return Err(e);
+                }
             }
         }
     }
@@ -828,6 +1237,35 @@ pub(crate) async fn send_message_inner(
         .map(|delivery| delivery.id)
         .collect::<Vec<_>>();
     agent.ctx.clear_runtime_injections();
+    if let Some(pending) = wisp_core::latest_pending_checkpoint(&ap.root) {
+        agent
+            .ctx
+            .inject_user(wisp_core::checkpoint_resume_injection(&pending));
+        if let Ok(payload) = serde_json::to_string(&pending) {
+            let _ = state
+                .store
+                .persist_bridge_checkpoint(
+                    &pending.checkpoint_id,
+                    &pending.operation_id,
+                    &ap.id,
+                    &frame_id,
+                    pending.state.as_str(),
+                    pending.schema_version as i64,
+                    &payload,
+                )
+                .await;
+        }
+    }
+    if matches!(&frame_scope, wisp_store::StateScope::Mainline { .. }) {
+        let archive_index = state
+            .store
+            .research_archive_index(&ap.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if !archive_index.is_empty() {
+            agent.ctx.inject_user(archive_index);
+        }
+    }
     if let Some(memory) = memory_commands::global_memory_runtime_injection(&state.store).await {
         agent.ctx.inject_user(memory);
     }
@@ -877,62 +1315,78 @@ pub(crate) async fn send_message_inner(
     //
     // First flush any messages already in the context but not yet persisted
     // (e.g. a system prompt seeded here), so the incremental seq lines up with
-    // what a later reload expects.
+    // what a later reload expects. Stop at the first append failure so later
+    // rows cannot be written after a hole.
     let start_seq = {
-        let start = rt.last_seq() as usize;
+        // Compare against the head-epoch row count, not `last_seq`: after a
+        // compaction the seq space runs ahead of the row count.
+        let start = state
+            .store
+            .message_count(&frame_id)
+            .await
+            .map_err(|error| format!("incremental persist failed: {error}"))?
+            as usize;
         if start < agent.ctx.messages.len() {
             let mut seq = rt.last_seq();
             for m in &agent.ctx.messages[start..] {
                 seq += 1;
-                let _ = state.store.append_message(&frame_id, seq, m).await;
+                if let Err(error) = state.store.append_message(&frame_id, seq, m).await {
+                    let _ = rt.sync_last_seq_from_store(&state.store, &frame_id).await;
+                    return Err(format!("incremental persist failed: {error}"));
+                }
             }
-            rt.set_last_seq(agent.ctx.messages.len() as i64);
+            rt.sync_last_seq_from_store(&state.store, &frame_id).await?;
         }
         rt.last_seq()
     };
 
     let (persist_handle, persist_tx) = {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
         let store = state.store.clone();
         let fid = frame_id.clone();
         let resource_root = ap.root.clone();
         let resource_project_id = ap.id.clone();
         let resource_app = app.clone();
         let stamp = model_label.clone();
-        let mut seq = start_seq;
         let handle = tokio::spawn(async move {
-            while let Some(mut msg) = rx.recv().await {
-                if msg.role == wisp_llm::Role::Assistant && msg.model_name.is_none() {
-                    msg.model_name = Some(stamp.clone());
-                }
-                seq += 1;
-                if let Err(e) = store.append_message(&fid, seq, &msg).await {
-                    tracing::warn!("incremental persist seq {seq} failed: {e}");
-                    continue;
-                }
-                if message_uses_resource_bindings(&msg) {
-                    let resources = resource_refs::bind_new_message_resources(
-                        &store,
-                        &resource_root,
-                        &resource_project_id,
-                        &fid,
-                        seq,
-                        &msg.content.as_text(),
-                    )
-                    .await;
-                    if !resources.is_empty() {
-                        emit_agent_event(
-                            &resource_app,
-                            AgentEvent::Resources {
-                                frame_id: fid.clone(),
-                                seq,
-                                resources: resources.iter().map(Into::into).collect(),
-                            },
-                        );
+            wisp_store::persist_seq_loop(start_seq, rx, move |seq, mut msg| {
+                let store = store.clone();
+                let fid = fid.clone();
+                let stamp = stamp.clone();
+                let resource_root = resource_root.clone();
+                let resource_project_id = resource_project_id.clone();
+                let resource_app = resource_app.clone();
+                async move {
+                    if msg.role == wisp_llm::Role::Assistant && msg.model_name.is_none() {
+                        msg.model_name = Some(stamp);
                     }
+                    store.append_message(&fid, seq, &msg).await?;
+                    if message_uses_resource_bindings(&msg) {
+                        let resources = resource_refs::bind_new_message_resources(
+                            &store,
+                            &resource_root,
+                            &resource_project_id,
+                            &fid,
+                            seq,
+                            &msg.content.as_text(),
+                        )
+                        .await;
+                        if !resources.is_empty() {
+                            emit_agent_event_in(
+                                &resource_app,
+                                AgentEvent::Resources {
+                                    frame_id: fid,
+                                    seq,
+                                    resources: resources.iter().map(Into::into).collect(),
+                                },
+                                Some(resource_project_id.as_str()),
+                            );
+                        }
+                    }
+                    Ok::<(), anyhow::Error>(())
                 }
-            }
-            seq
+            })
+            .await
         });
         (handle, tx)
     };
@@ -1015,7 +1469,8 @@ pub(crate) async fn send_message_inner(
     };
 
     let (ui_event_handle, ui_event_tx) = {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SessionUiMessage>();
+        *rt.ui_event_writer.lock().unwrap() = Some(tx.downgrade());
         let store = state.store.clone();
         let fid = frame_id.clone();
         let seq = store
@@ -1033,21 +1488,28 @@ pub(crate) async fn send_message_inner(
     };
 
     let (live_event_handle, live_event_tx) = {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SessionUiMessage>();
+        *rt.live_event_writer.lock().unwrap() = Some(tx.downgrade());
         let app = app.clone();
+        let live_project_id = ap.id.clone();
         let handle = tokio::spawn(coalesce_live_agent_events(
             rx,
             LIVE_EVENT_FLUSH_INTERVAL,
-            move |event| emit_agent_event_to_surfaces(&app, event),
+            move |event| {
+                emit_agent_event_to_surfaces_in(&app, event, Some(live_project_id.as_str()))
+            },
         ));
         (handle, tx)
     };
 
     let provenance_scope =
         crate::native_delegation::conversation_scope(&state.store, &frame_id).await;
+    let browser_turn_id = Uuid::new_v4().to_string();
     let output = TauriOutput {
         app: app.clone(),
         frame_id: frame_id.clone(),
+        queue_id: StdMutex::new(origin.queue_id()),
+        queue_runtime: rt.clone(),
         model: model.clone(),
         project_id: ap.id.clone(),
         project_root: ap.root.clone(),
@@ -1062,6 +1524,9 @@ pub(crate) async fn send_message_inner(
         approvals: state.approvals.clone(),
         plan_mode: plan_mode_enabled,
         project_write_locked,
+        artifact_requested: !specialist
+            .as_ref()
+            .is_some_and(|specialist| specialist.id == specialists::DEPMAP_SPECIALIST_ID),
         approval_grants: state.approval_grants.clone(),
         full_permission_sessions: state.full_permission_sessions.clone(),
         persist: Some(persist_tx),
@@ -1070,6 +1535,17 @@ pub(crate) async fn send_message_inner(
         message_seq: std::sync::atomic::AtomicI64::new(start_seq),
         prov: Some(prov_tx),
         provenance_scope,
+        turn_id: browser_turn_id.clone(),
+        force_ask_mutations: origin.force_ask_mutations(),
+        agent_trace: wisp_core::host_agent_observability(
+            wisp_core::HostObservabilityConfig::for_host(
+                wisp_core::ObservabilityHost::Desktop,
+                &ap.root,
+            )
+            .with_session(&frame_id)
+            .with_turn(&browser_turn_id),
+        ),
+        last_compaction_strategy: StdMutex::new(None),
     };
 
     let turn_start = agent.ctx.messages.len();
@@ -1078,6 +1554,13 @@ pub(crate) async fn send_message_inner(
     // model since the last one, and images already in history must follow the
     // model that is about to receive them, not the one that accepted them.
     agent.ctx.supports_vision = primary_supports_vision;
+    crate::claim_catalog::install_session_claim_grounding(
+        &mut agent.ctx,
+        &state.store,
+        &ap.id,
+        &frame_id,
+    )
+    .await;
     rt.effective_max_iter.store(max_iter, Ordering::SeqCst);
     rt.effective_max_iter_known.store(true, Ordering::SeqCst);
     state.running_turns.lock().await.insert(frame_id.clone());
@@ -1112,7 +1595,7 @@ pub(crate) async fn send_message_inner(
             let is_reviewer = specialist
                 .as_ref()
                 .is_some_and(|specialist| specialist.id == "reviewer");
-            if !resume && !is_reviewer && load_auto_review_enabled(&state.store).await {
+            if !resume && !is_reviewer && load_auto_review_enabled(&state.store, &frame_id).await {
                 automatic_review(
                     state,
                     &app,
@@ -1132,8 +1615,10 @@ pub(crate) async fn send_message_inner(
     agent.ctx.clear_runtime_injections();
     state.running_turns.lock().await.remove(&frame_id);
 
-    // Close the persist channel and wait for the task to flush; its final seq is
-    // the authoritative persisted count.
+    // Close the persist channel and wait for the task to flush (abort + join on
+    // timeout so a late INSERT cannot race replace/compaction). last_seq then
+    // comes from durable MAX(seq), never from the in-memory message count.
+    let compaction_strategy = output.take_last_compaction_strategy();
     drop(output);
     // Drain the live coalescer before the direct Done/Error emit below so the
     // final buffered deltas cannot arrive after the turn boundary.
@@ -1149,25 +1634,46 @@ pub(crate) async fn send_message_inner(
     {
         tracing::warn!("UI event persistence did not finish cleanly");
     }
-    match tokio::time::timeout(std::time::Duration::from_secs(5), persist_handle).await {
-        Ok(Ok(final_seq)) => rt.set_last_seq(final_seq),
-        other => {
-            tracing::warn!("persist task did not finish cleanly: {other:?}");
-            rt.set_last_seq(agent.ctx.messages.len() as i64);
-        }
+    match wisp_store::join_or_abort_persist(persist_handle, std::time::Duration::from_secs(5)).await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::warn!("incremental persist failed: {error}"),
+        Err(error) => tracing::warn!("persist task did not finish cleanly: {error}"),
+    }
+    if let Err(error) = rt.sync_last_seq_from_store(&state.store, &frame_id).await {
+        tracing::warn!("{error}");
     }
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), prov_handle).await;
+    // The epoch must not open until the persist task has finished or been
+    // aborted and joined — a late INSERT would land inside the new epoch's
+    // seq range. Rows appended during this turn stay in the old epoch, where
+    // their visual MessageBoundary anchors still resolve; the compacted
+    // working set becomes the new head epoch on top of them.
     if agent.ctx.compaction_revision() != compaction_revision {
-        if let Err(error) = state
-            .store
-            .replace_messages(&frame_id, &agent.ctx.messages)
-            .await
+        // `kept_from_index` indexes the list the compaction started from. That
+        // list is row-aligned with the old head epoch only for a single
+        // compaction; after two in one turn it indexes an already compacted
+        // list, so the (UI-only) tail origin is left unknown.
+        let single_compaction = agent.ctx.compaction_revision() == compaction_revision + 1;
+        match persist_compaction_epoch(
+            &state.store,
+            &frame_id,
+            &agent.ctx,
+            compaction_strategy.as_deref().unwrap_or("auto"),
+            single_compaction,
+        )
+        .await
         {
-            result = Err(anyhow::anyhow!(
-                "automatic compact: persisting the rewritten context failed: {error}"
-            ));
-        } else {
-            rt.set_last_seq(agent.ctx.messages.len() as i64);
+            Ok(_) => {
+                if let Err(error) = rt.sync_last_seq_from_store(&state.store, &frame_id).await {
+                    tracing::warn!("{error}");
+                }
+            }
+            Err(error) => {
+                result = Err(anyhow::anyhow!(
+                    "automatic compact: persisting the compacted context failed: {error}"
+                ));
+            }
         }
     }
     // Resume is already mid-turn. A normal send is mid-turn once the loop
@@ -1192,6 +1698,7 @@ pub(crate) async fn send_message_inner(
                 },
             )
             .await;
+            emit_browser_tab_cleanup(state, &app, &browser_turn_id, &ap.id).await;
             Ok(frame_id)
         }
         Err(e) => {
@@ -1211,8 +1718,29 @@ pub(crate) async fn send_message_inner(
                 },
             )
             .await;
+            emit_browser_tab_cleanup(state, &app, &browser_turn_id, &ap.id).await;
             Err(client_turn_error(turn_started, &message))
         }
+    }
+}
+
+async fn emit_browser_tab_cleanup(
+    state: &AppState,
+    app: &AppHandle,
+    turn_id: &str,
+    project_id: &str,
+) {
+    if let browser_bridge::TabCleanupAction::Prompt(prompt) =
+        state.browser_bridge.complete_turn(turn_id).await
+    {
+        emit_to_session_surfaces_filtered(
+            app,
+            &prompt.frame_id,
+            Some(project_id),
+            "browser-tab-cleanup",
+            &prompt,
+            false,
+        );
     }
 }
 
@@ -1228,11 +1756,24 @@ pub(crate) fn client_turn_error(turn_started: bool, message: &str) -> String {
     }
 }
 
-/// Queue (#433): drain a session's parked follow-ups FIFO. Each acquires the
-/// workflow lock (fair → runs in enqueue order) and runs as a fresh turn with
-/// the item's *current* text, so edits made while it waited take effect. The
+/// Queue (#433): reconcile cut-ins, then drain ordinary follow-ups FIFO. Each
+/// acquires the workflow lock and runs as a fresh turn with the item's
+/// *current* text, so edits made while it waited take effect. The
 /// `draining` flag is cleared under the `queued` lock so a concurrent enqueue
 /// can never leave an item stranded with no driver.
+async fn queued_workflow_guard(rt: &SessionRuntime) -> tokio::sync::OwnedMutexGuard<()> {
+    loop {
+        let guard = rt.workflow.clone().lock_owned().await;
+        // A replacement reserves priority before cancelling the current
+        // workflow. Yield even if the driver was already a mutex waiter.
+        if rt.replacing.load(Ordering::SeqCst) == 0 {
+            return guard;
+        }
+        drop(guard);
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 pub(crate) fn spawn_queue_driver(
     app: AppHandle,
     rt: Arc<SessionRuntime>,
@@ -1241,17 +1782,11 @@ pub(crate) fn spawn_queue_driver(
 ) {
     tauri::async_runtime::spawn(async move {
         loop {
-            let guard = rt.workflow.clone().lock_owned().await;
-            let item = {
-                let mut q = rt.queued.lock().unwrap();
-                match q.is_empty() {
-                    true => {
-                        rt.draining.store(false, Ordering::SeqCst);
-                        break;
-                    }
-                    false => q.remove(0),
-                }
+            let guard = queued_workflow_guard(&rt).await;
+            let Some(item) = take_next_queued_turn(&rt) else {
+                break;
             };
+            emit_queued_turn_state(&app, &session_id, item.id, "started");
             let state = app.state::<AppState>();
             if let Err(error) = send_message_inner(
                 state.inner(),
@@ -1267,13 +1802,29 @@ pub(crate) fn spawn_queue_driver(
                 None,
                 None,
                 Some(guard),
+                TurnOrigin::Queued(item.id),
             )
             .await
             {
+                emit_queued_turn_state(&app, &session_id, item.id, "failed");
                 tracing::warn!("queued turn failed: {error}");
             }
         }
     });
+}
+
+fn emit_queued_turn_state(app: &AppHandle, session_id: &str, id: u64, state: &str) {
+    emit_to_session_surfaces(
+        app,
+        session_id,
+        None,
+        "queued-turn-state",
+        &wisp_dto::QueuedTurnStateEvent {
+            session_id: session_id.to_string(),
+            id,
+            state: state.to_string(),
+        },
+    );
 }
 
 /// Queue (#433): park a follow-up behind the running turn instead of sending
@@ -1282,7 +1833,7 @@ pub(crate) fn spawn_queue_driver(
 pub(crate) async fn enqueue_turn(
     state: State<'_, AppState>,
     app: AppHandle,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     session_id: String,
     id: u64,
     message: String,
@@ -1320,6 +1871,7 @@ pub(crate) async fn enqueue_turn(
         // `draining` while holding this same lock on an empty queue.
         !rt.draining.swap(true, Ordering::SeqCst)
     };
+    emit_queued_turn_state(&app, &session_id, id, "queued");
     if spawn {
         spawn_queue_driver(app, rt, session_id, window.label().to_string());
     }
@@ -1329,16 +1881,14 @@ pub(crate) async fn enqueue_turn(
 /// Queue (#433): edit / cancel / cut-in a parked follow-up by id.
 /// - `edit`   → replace the item's text (runs with the latest when it drains).
 /// - `cancel` → drop it from the queue.
-/// - `cutin`  → pull it out and fold it into the *running* turn via the guide
-///   path (#410); if nothing is running it stays queued and runs normally.
-pub(crate) fn begin_queued_cutin(rt: &SessionRuntime, id: u64) -> Option<(u64, QueuedItem)> {
-    let item = {
-        let mut queued = rt.queued.lock().unwrap();
-        queued
-            .iter()
-            .position(|item| item.id == id)
-            .map(|index| queued.remove(index))?
-    };
+/// - `cutin`  → offer it to the current loop, retaining its payload for a
+///   priority handoff if that loop has already ended (or has not started yet).
+pub(crate) fn begin_queued_cutin(rt: &SessionRuntime, id: u64) -> Option<u64> {
+    // All transfers use the same lock order: queued → cut-ins → guidance.
+    let mut queued = rt.queued.lock().unwrap();
+    let index = queued.iter().position(|item| item.id == id)?;
+    let item = queued.remove(index);
+    let mut cutins = rt.queued_cutins.lock().unwrap();
     let guidance_id = rt
         .guidance_seq
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1346,7 +1896,8 @@ pub(crate) fn begin_queued_cutin(rt: &SessionRuntime, id: u64) -> Option<(u64, Q
         .lock()
         .unwrap()
         .push((guidance_id, item.message.clone()));
-    Some((guidance_id, item))
+    cutins.push((guidance_id, item));
+    Some(guidance_id)
 }
 
 /// Reorder within the queue (#433): swap the item with its neighbour (`up`
@@ -1365,27 +1916,34 @@ pub(crate) fn swap_queued_toward(q: &mut Vec<QueuedItem>, id: u64, up: bool) {
     }
 }
 
-pub(crate) fn reclaim_unconsumed_cutin(
-    rt: &SessionRuntime,
-    guidance_id: u64,
-    item: QueuedItem,
-) -> bool {
+/// Called only by the workflow-lock owner, before it starts any queued turn.
+/// Reconcile offered guidance here, not in a later mutex waiter: the FIFO
+/// driver may already be ahead of the cut-in command in the lock's wait list.
+pub(crate) fn take_next_queued_turn(rt: &SessionRuntime) -> Option<QueuedItem> {
+    let mut queued = rt.queued.lock().unwrap();
+    let mut cutins = rt.queued_cutins.lock().unwrap();
     let mut pending = rt.pending_guidance.lock().unwrap();
-    let before = pending.len();
-    pending.retain(|(pending_id, _)| *pending_id != guidance_id);
-    let unconsumed = pending.len() != before;
-    drop(pending);
-    if unconsumed {
-        rt.queued.lock().unwrap().insert(0, item);
+    let mut unconsumed = Vec::new();
+    for (guidance_id, item) in cutins.drain(..) {
+        if let Some(index) = pending.iter().position(|(id, _)| *id == guidance_id) {
+            pending.remove(index);
+            unconsumed.push(item);
+        }
     }
-    unconsumed
+    queued.splice(0..0, unconsumed);
+    if queued.is_empty() {
+        rt.draining.store(false, Ordering::SeqCst);
+        None
+    } else {
+        Some(queued.remove(0))
+    }
 }
 
 #[tauri::command]
 pub(crate) async fn queued_turn_action(
     state: State<'_, AppState>,
     app: AppHandle,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     session_id: String,
     id: u64,
     action: String,
@@ -1408,30 +1966,27 @@ pub(crate) async fn queued_turn_action(
             }
         }
         "cancel" => {
-            rt.queued.lock().unwrap().retain(|it| it.id != id);
+            let removed = {
+                let mut queued = rt.queued.lock().unwrap();
+                let before = queued.len();
+                queued.retain(|it| it.id != id);
+                queued.len() != before
+            };
+            if removed {
+                emit_queued_turn_state(&app, &session_id, id, "cancelled");
+            }
         }
         "cutin" => {
-            let running = state.running_turns.lock().await.contains(&session_id);
-            if running {
-                // ponytail: cut-in folds only text into the turn, matching the
-                // guide path; attachments on a cut-in item are dropped.
-                if let Some((guidance_id, item)) = begin_queued_cutin(&rt, id) {
-                    // Wait until the running turn reaches an iteration boundary
-                    // or ends. If it ended without consuming the guidance, put
-                    // the item back at the front and let the normal driver run it.
-                    let guard = rt.workflow.clone().lock_owned().await;
-                    let unconsumed = reclaim_unconsumed_cutin(&rt, guidance_id, item);
-                    drop(guard);
-                    if unconsumed {
-                        if !rt.draining.swap(true, Ordering::SeqCst) {
-                            spawn_queue_driver(
-                                app,
-                                rt.clone(),
-                                session_id,
-                                window.label().to_string(),
-                            );
-                        }
-                    }
+            if begin_queued_cutin(&rt, id).is_some() {
+                emit_queued_turn_state(&app, &session_id, id, "cutin_pending");
+                // A running_turns snapshot can be false during prompt setup or
+                // persistence. The loop/driver handoff works in both windows.
+                let spawn = {
+                    let _queued = rt.queued.lock().unwrap();
+                    !rt.draining.swap(true, Ordering::SeqCst)
+                };
+                if spawn {
+                    spawn_queue_driver(app, rt, session_id, window.label().to_string());
                 }
             }
         }
@@ -1440,6 +1995,15 @@ pub(crate) async fn queued_turn_action(
         "move_up" | "move_down" => {
             let mut q = rt.queued.lock().unwrap();
             swap_queued_toward(&mut q, id, action == "move_up");
+        }
+        // Interrupt-and-replace from a queued row: jump the item to the front so
+        // the caller's `stop_agent` hands the freed session straight to it.
+        "move_front" => {
+            let mut q = rt.queued.lock().unwrap();
+            if let Some(i) = q.iter().position(|it| it.id == id) {
+                let item = q.remove(i);
+                q.insert(0, item);
+            }
         }
         other => return Err(format!("unknown queued action: {other}")),
     }
@@ -1457,6 +2021,11 @@ pub(crate) async fn stop_agent(
     state: State<'_, AppState>,
     session_id: Option<String>,
 ) -> Result<(), String> {
+    if let Some(id) = session_id.as_deref().filter(|s| !s.is_empty()) {
+        state.mcp_app_tool_bridges.cancel_for_frame(id);
+    } else {
+        state.mcp_app_tool_bridges.cancel_all();
+    }
     // Cancel only the named session's turn; other conversations keep running.
     let targets: Vec<(String, Arc<SessionRuntime>)> =
         match session_id.as_deref().filter(|s| !s.is_empty()) {
@@ -1499,4 +2068,557 @@ pub(crate) async fn stop_agent(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    #[test]
+    fn compact_command_accepts_an_optional_instruction_without_matching_longer_names() {
+        assert_eq!(
+            parse_manual_compact_command("/compact"),
+            Some(ManualCompactCommand {
+                intent: wisp_core::CompactIntent::PruneOnly,
+                instruction: None,
+            })
+        );
+        assert_eq!(
+            parse_manual_compact_command("  /compact   --semantic  "),
+            Some(ManualCompactCommand {
+                intent: wisp_core::CompactIntent::Semantic,
+                instruction: None,
+            })
+        );
+        assert_eq!(
+            parse_manual_compact_command(
+                "  /compact   --semantic  preserve QC thresholds and blockers  "
+            ),
+            Some(ManualCompactCommand {
+                intent: wisp_core::CompactIntent::Semantic,
+                instruction: Some("preserve QC thresholds and blockers".into()),
+            })
+        );
+        assert_eq!(
+            parse_manual_compact_command("  /compact   preserve QC thresholds and blockers  "),
+            Some(ManualCompactCommand {
+                intent: wisp_core::CompactIntent::Semantic,
+                instruction: Some("preserve QC thresholds and blockers".into()),
+            })
+        );
+        assert_eq!(
+            parse_manual_compact_command("/compact   "),
+            Some(ManualCompactCommand {
+                intent: wisp_core::CompactIntent::PruneOnly,
+                instruction: None,
+            })
+        );
+        assert_eq!(parse_manual_compact_command("/compact2"), None);
+        assert_eq!(parse_manual_compact_command("/compact --semantic2"), None);
+        assert_eq!(parse_manual_compact_command("send /compact now"), None);
+    }
+
+    #[test]
+    fn replacement_only_supersedes_identical_payloads_including_cutins() {
+        let rt = SessionRuntime::new();
+        let item = QueuedItem {
+            id: 1,
+            message: "same".into(),
+            attachments: vec![],
+            references: vec![],
+        };
+        let mut attachment = item.clone();
+        attachment.id = 2;
+        attachment.attachments.push("uploads/a.png".into());
+        let mut context = item.clone();
+        context.id = 3;
+        context.message.push_str("\n\nProject context: keep");
+        let mut reference = item.clone();
+        reference.id = 4;
+        reference.references.push(ComposerReferenceArg::Artifact {
+            id: "report".into(),
+        });
+        rt.queued
+            .lock()
+            .unwrap()
+            .extend([item.clone(), attachment, context, reference]);
+        let mut cutin = item;
+        cutin.id = 5;
+        rt.queued.lock().unwrap().push(cutin);
+        begin_queued_cutin(&rt, 5).unwrap();
+        assert_eq!(
+            supersede_duplicate_queued(&rt, "same", &[], &[]),
+            vec![1, 5]
+        );
+        assert_eq!(
+            rt.queued
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        assert!(rt.pending_guidance.lock().unwrap().is_empty());
+        assert!(rt.queued_cutins.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn replacement_reservation_is_released_on_drop() {
+        let rt = Arc::new(SessionRuntime::new());
+        let first = ReplacementReservation::new(rt.clone());
+        let second = ReplacementReservation::new(rt.clone());
+        assert_eq!(rt.replacing.load(Ordering::SeqCst), 2);
+        drop(first);
+        assert_eq!(rt.replacing.load(Ordering::SeqCst), 1);
+        drop(second);
+        assert_eq!(rt.replacing.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn replacement_precedes_an_already_waiting_queue_driver() {
+        let rt = Arc::new(SessionRuntime::new());
+        let active = rt.workflow.clone().lock_owned().await;
+        let queued = queued_workflow_guard(&rt);
+        tokio::pin!(queued);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), &mut queued)
+                .await
+                .is_err()
+        );
+        let reservation = ReplacementReservation::new(rt.clone());
+        drop(active);
+        // Poll the FIFO waiter so it must explicitly yield to the replacement.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), &mut queued)
+                .await
+                .is_err()
+        );
+        let replacement = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            rt.workflow.clone().lock_owned(),
+        )
+        .await
+        .unwrap();
+        drop(reservation);
+        drop(replacement);
+        let _queued = tokio::time::timeout(std::time::Duration::from_secs(1), queued)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn queued_turn_origin_carries_the_backend_id() {
+        assert_eq!(TurnOrigin::Queued(42).queue_id(), Some(42));
+        assert_eq!(TurnOrigin::Desktop.queue_id(), None);
+    }
+}
+
+#[cfg(test)]
+mod context_epoch_tests {
+    use super::*;
+    use wisp_llm::{Completion, LlmError, Provider};
+
+    struct SummaryProvider(&'static str);
+
+    #[async_trait::async_trait]
+    impl Provider for SummaryProvider {
+        fn name(&self) -> &str {
+            "fake"
+        }
+        fn model(&self) -> &str {
+            "fake-summary"
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[wisp_llm::ToolSchema],
+        ) -> wisp_llm::Result<Completion> {
+            Ok(Completion {
+                content: self.0.to_string(),
+                finish_reason: Some("stop".into()),
+                ..Default::default()
+            })
+        }
+        async fn stream(
+            &self,
+            messages: &[Message],
+            tools: &[wisp_llm::ToolSchema],
+            _sink: &mut dyn wisp_llm::StreamSink,
+        ) -> wisp_llm::Result<Completion> {
+            self.complete(messages, tools).await
+        }
+    }
+
+    struct NoSummaryProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for NoSummaryProvider {
+        fn name(&self) -> &str {
+            "fake"
+        }
+        fn model(&self) -> &str {
+            "fake-none"
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[wisp_llm::ToolSchema],
+        ) -> wisp_llm::Result<Completion> {
+            Err(LlmError::Incomplete)
+        }
+        async fn stream(
+            &self,
+            messages: &[Message],
+            tools: &[wisp_llm::ToolSchema],
+            _sink: &mut dyn wisp_llm::StreamSink,
+        ) -> wisp_llm::Result<Completion> {
+            self.complete(messages, tools).await
+        }
+    }
+
+    async fn store_with_frame() -> Store {
+        let tmp =
+            std::env::temp_dir().join(format!("wisp_agent_turn_epoch_{}.sqlite", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.unwrap();
+        store.create_project("p", "proj", "").await.unwrap();
+        store.create_frame("f", "p", "OPERON", "m").await.unwrap();
+        store
+    }
+
+    /// Persist `messages` as the frame's epoch-0 rows and load them into a
+    /// context the way `send_message` builds the agent.
+    async fn seeded_context(
+        store: &Store,
+        messages: Vec<Message>,
+        max_context: usize,
+    ) -> wisp_core::ContextManager {
+        for (index, message) in messages.iter().enumerate() {
+            store
+                .append_message("f", index as i64 + 1, message)
+                .await
+                .unwrap();
+        }
+        let mut ctx = wisp_core::ContextManager::new(max_context);
+        ctx.messages = store.load_messages("f").await.unwrap();
+        ctx
+    }
+
+    fn long_turns(count: usize) -> Vec<Message> {
+        let mut messages = vec![Message::system("sys")];
+        for turn in 0..count {
+            messages.push(Message::user(format!(
+                "question {turn} {}",
+                "u".repeat(1_400)
+            )));
+            messages.push(Message::assistant(format!(
+                "answer {turn} {}",
+                "a".repeat(1_400)
+            )));
+        }
+        messages
+    }
+
+    fn archive(name: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join(format!("wisp-agent-turn-epoch-{}", std::process::id()))
+            .join(name)
+    }
+
+    #[tokio::test]
+    async fn semantic_compaction_opens_an_epoch_and_keeps_old_rows_and_undo() {
+        let store = store_with_frame().await;
+        let mut ctx = seeded_context(&store, long_turns(12), 10_000).await;
+        let original_rows = store.load_messages_with_seq("f").await.unwrap();
+        // A file change recorded against the third user turn (seq 6).
+        store
+            .save_turn_file_undo(
+                "f",
+                6,
+                "notes.md",
+                true,
+                None,
+                Some("a"),
+                Some("b"),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+
+        ctx.compact(
+            &SummaryProvider("Objective\nkeep going"),
+            &archive("semantic.json"),
+        )
+        .await
+        .unwrap();
+        let outcome = ctx.last_compaction().unwrap().clone();
+        assert_eq!(outcome.kind, wisp_core::CompactionKind::Semantic);
+
+        let epoch = persist_compaction_epoch(&store, "f", &ctx, "manual", true)
+            .await
+            .unwrap();
+        assert_eq!(epoch, 1);
+
+        // Old rows are frozen, not rewritten.
+        let epoch0 = store.load_messages_in_epoch("f", 0).await.unwrap();
+        assert_eq!(epoch0.len(), original_rows.len());
+        for ((seq, row), (original_seq, original)) in epoch0.iter().zip(&original_rows) {
+            assert_eq!(seq, original_seq);
+            assert_eq!(row.content.as_text(), original.content.as_text());
+        }
+        // The head epoch is exactly the compacted in-memory context.
+        let head = store.load_messages_with_seq("f").await.unwrap();
+        assert_eq!(head.len(), ctx.messages.len());
+        for ((_, row), message) in head.iter().zip(&ctx.messages) {
+            assert_eq!(row.content.as_text(), message.content.as_text());
+        }
+        assert_eq!(head[0].0, original_rows.len() as i64 + 1);
+
+        let record = store.context_epoch("f", 1).await.unwrap().unwrap();
+        assert_eq!(record.kind, "semantic");
+        assert_eq!(record.strategy, "manual");
+        assert_eq!(record.parent_epoch, 0);
+        assert_eq!(
+            (record.before_tokens, record.after_tokens),
+            (outcome.before as i64, outcome.after as i64)
+        );
+        assert!(record
+            .archive_ref
+            .as_deref()
+            .unwrap()
+            .ends_with("semantic.json"));
+        // Checkpoint follows the system row; the retained tail's origin is the
+        // epoch-0 row whose content reappears right after the checkpoint.
+        assert_eq!(record.checkpoint_seq, Some(head[0].0 + 1));
+        let kept_seq = record.first_kept_seq.expect("tail origin mapped");
+        let (_, kept_row) = original_rows
+            .iter()
+            .find(|(seq, _)| *seq == kept_seq)
+            .unwrap();
+        assert_eq!(kept_row.content.as_text(), head[2].1.content.as_text());
+        assert!(kept_row.content.as_text().starts_with("question 1"));
+
+        // Seq-anchored undo rows survive the compaction.
+        assert_eq!(store.list_turn_file_undo("f", 6).await.unwrap().len(), 1);
+        assert_eq!(store.resolve_message_epoch("f", 6).await.unwrap(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn prune_only_compaction_opens_an_epoch_without_checkpoint() {
+        let store = store_with_frame().await;
+        let mut messages = vec![Message::system("sys")];
+        for turn in 0..12 {
+            messages.push(Message::user(format!("question {turn}")));
+            messages.push(Message::assistant(format!("answer {turn}")));
+            messages.push(Message::tool(
+                format!("call{turn}"),
+                "shell",
+                format!("tool-output-{turn} {}", "x".repeat(50)),
+            ));
+        }
+        let mut ctx = seeded_context(&store, messages, 1_000_000).await;
+        ctx.compact(&NoSummaryProvider, &archive("prune.json"))
+            .await
+            .unwrap();
+
+        let epoch = persist_compaction_epoch(&store, "f", &ctx, "auto", true)
+            .await
+            .unwrap();
+        let record = store.context_epoch("f", epoch).await.unwrap().unwrap();
+        assert_eq!(record.kind, "prune_only");
+        assert_eq!(record.strategy, "auto");
+        assert_eq!(record.checkpoint_seq, None);
+        assert_eq!(record.first_kept_seq, None);
+        assert_eq!(
+            store.load_messages("f").await.unwrap().len(),
+            ctx.messages.len()
+        );
+        assert_eq!(
+            store.load_messages_in_epoch("f", 0).await.unwrap().len(),
+            37
+        );
+    }
+
+    #[tokio::test]
+    async fn unaligned_persist_leaves_the_tail_origin_unknown_but_links_the_event() {
+        let store = store_with_frame().await;
+        let mut ctx = seeded_context(&store, long_turns(12), 10_000).await;
+        ctx.compact(
+            &SummaryProvider("Objective\nkeep going"),
+            &archive("unaligned.json"),
+        )
+        .await
+        .unwrap();
+        // The turn already persisted its Compaction flag (mid-turn path).
+        let mut seq = store.next_session_ui_event_seq("f").await.unwrap();
+        let event_seq = seq;
+        append_ui_event(
+            &store,
+            "f",
+            &mut seq,
+            AgentEvent::Compaction {
+                frame_id: "f".into(),
+                before: 10,
+                after: 5,
+                strategy: "auto".into(),
+                epoch: None,
+            },
+        )
+        .await;
+        append_ui_event(
+            &store,
+            "f",
+            &mut seq,
+            AgentEvent::Compaction {
+                frame_id: "f".into(),
+                before: 1,
+                after: 3,
+                strategy: "auto_continue".into(),
+                epoch: None,
+            },
+        )
+        .await;
+
+        let epoch = persist_compaction_epoch(&store, "f", &ctx, "auto", false)
+            .await
+            .unwrap();
+        let record = store.context_epoch("f", epoch).await.unwrap().unwrap();
+        assert_eq!(record.first_kept_seq, None);
+        assert_eq!(record.ui_event_seq, Some(event_seq));
+    }
+
+    #[tokio::test]
+    async fn consecutive_compactions_form_a_parent_epoch_chain() {
+        let store = store_with_frame().await;
+        let mut ctx = seeded_context(&store, long_turns(12), 10_000).await;
+        let epoch0_len = store.load_messages_in_epoch("f", 0).await.unwrap().len();
+        ctx.compact(
+            &SummaryProvider("Objective\nfirst fold"),
+            &archive("chain-1.json"),
+        )
+        .await
+        .unwrap();
+        let first = persist_compaction_epoch(&store, "f", &ctx, "manual", true)
+            .await
+            .unwrap();
+        ctx.compact(
+            &SummaryProvider("Objective\nsecond fold"),
+            &archive("chain-2.json"),
+        )
+        .await
+        .unwrap();
+        let second = persist_compaction_epoch(&store, "f", &ctx, "auto", true)
+            .await
+            .unwrap();
+        assert_eq!((first, second), (1, 2));
+        let first_record = store.context_epoch("f", 1).await.unwrap().unwrap();
+        let second_record = store.context_epoch("f", 2).await.unwrap().unwrap();
+        assert_eq!(first_record.parent_epoch, 0);
+        assert_eq!(second_record.parent_epoch, 1);
+        assert_eq!(second_record.strategy, "auto");
+        assert_eq!(
+            store.load_messages_in_epoch("f", 0).await.unwrap().len(),
+            epoch0_len
+        );
+        assert_eq!(store.frame_head_epoch("f").await.unwrap(), 2);
+    }
+
+    async fn persist_visual_turn(store: &Store, event_seq: &mut i64, message_seq: i64, text: &str) {
+        store
+            .append_session_ui_event(
+                "f",
+                *event_seq,
+                &format!(r#"{{"kind":"User","frame_id":"f","text":"{text}"}}"#),
+            )
+            .await
+            .unwrap();
+        *event_seq += 1;
+        store
+            .append_session_ui_event(
+                "f",
+                *event_seq,
+                &format!(r#"{{"kind":"MessageBoundary","frame_id":"f","seq":{message_seq}}}"#),
+            )
+            .await
+            .unwrap();
+        *event_seq += 1;
+        store
+            .append_session_ui_event(
+                "f",
+                *event_seq,
+                &format!(r#"{{"kind":"Text","frame_id":"f","delta":"a {text}"}}"#),
+            )
+            .await
+            .unwrap();
+        *event_seq += 1;
+        store
+            .append_session_ui_event(
+                "f",
+                *event_seq,
+                &format!(
+                    r#"{{"kind":"MessageBoundary","frame_id":"f","seq":{}}}"#,
+                    message_seq + 1
+                ),
+            )
+            .await
+            .unwrap();
+        *event_seq += 1;
+    }
+
+    #[tokio::test]
+    async fn resolve_visual_keep_uses_pre_compact_anchors() {
+        let store = store_with_frame().await;
+        let mut ctx = seeded_context(&store, long_turns(4), 10_000).await;
+        let mut event_seq = 1i64;
+        // system + (user, assistant) * 4 → user seqs 2,4,6,8
+        persist_visual_turn(&store, &mut event_seq, 2, "q0").await;
+        persist_visual_turn(&store, &mut event_seq, 4, "q1").await;
+        persist_visual_turn(&store, &mut event_seq, 6, "q2").await;
+        persist_visual_turn(&store, &mut event_seq, 8, "q3").await;
+        ctx.compact(
+            &SummaryProvider("Objective\nkeep going"),
+            &archive("rewind.json"),
+        )
+        .await
+        .unwrap();
+        persist_compaction_epoch(&store, "f", &ctx, "manual", true)
+            .await
+            .unwrap();
+
+        let before = crate::session_commands::resolve_visual_keep(&store, "f", 1, false)
+            .await
+            .unwrap();
+        assert_eq!(before, (0, 3));
+        let after = crate::session_commands::resolve_visual_keep(&store, "f", 1, true)
+            .await
+            .unwrap();
+        assert_eq!(after, (0, 5));
+
+        store.rewind_to_seq("f", before.0, before.1).await.unwrap();
+        let head = store.load_messages("f").await.unwrap();
+        assert!(head
+            .iter()
+            .any(|m| m.content.as_text().starts_with("question 0")));
+        assert!(head
+            .iter()
+            .all(|m| !m.content.as_text().starts_with("question 1")));
+        assert!(!head
+            .iter()
+            .any(wisp_core::ContextManager::is_summary_checkpoint));
+    }
+
+    #[test]
+    fn head_keep_seq_maps_row_counts_onto_durable_seqs() {
+        let rows = vec![
+            (7, Message::system("sys")),
+            (8, Message::user("q")),
+            (9, Message::assistant("a")),
+        ];
+        assert_eq!(crate::session_commands::head_keep_seq(&rows, 0), 6);
+        assert_eq!(crate::session_commands::head_keep_seq(&rows, 1), 7);
+        assert_eq!(crate::session_commands::head_keep_seq(&rows, 3), 9);
+        assert_eq!(crate::session_commands::head_keep_seq(&rows, 9), 9);
+        assert_eq!(crate::session_commands::head_keep_seq(&[], 0), 0);
+    }
 }

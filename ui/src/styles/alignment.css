@@ -119,8 +119,21 @@
 /* Branch sessions nested under the session they were forked from (#531). */
 .side-branch-group { display: flex; flex-direction: column; gap: 1px; }
 .side-branch-kids { display: flex; flex-direction: column; gap: 1px; margin-left: 12px; padding-left: 8px; border-left: 1px solid var(--border); }
-.message-branch-links { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 7px; margin: 8px 0 4px; padding-left: 28px; }
-.message-branch-entry { display: flex; width: min(320px, 80vw); flex-direction: column; align-items: stretch; gap: 5px; }
+.message-branch-links { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; margin: 8px 0 4px; padding-left: 28px; }
+.message-nest-group { display: flex; width: min(320px, 80vw); flex-direction: column; align-items: stretch; gap: 5px; }
+.message-nest-toggle {
+  display: inline-flex; align-items: center; gap: 6px; width: fit-content; max-width: 100%;
+  padding: 2px 4px; border: 0; border-radius: var(--radius-xs);
+  background: transparent; color: var(--text-faint); font: inherit;
+  font-size: 11px; font-weight: 600; cursor: pointer; text-align: left;
+}
+.message-nest-toggle:hover { color: var(--text); background: var(--bg-elev); }
+.message-nest-caret { display: inline-flex; flex: 0 0 auto; transition: transform .15s ease; }
+.message-nest-caret.collapsed { transform: rotate(-90deg); }
+.message-nest-toggle svg { width: 13px; height: 13px; }
+.message-nest-count { font-variant-numeric: tabular-nums; color: var(--text-muted); }
+.message-nest-entries { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 7px; width: 100%; }
+.message-branch-entry { display: flex; width: 100%; flex-direction: column; align-items: stretch; gap: 5px; }
 .message-branch-link { display: inline-flex; width: 100%; min-width: 0; align-items: center; gap: 7px; padding: 7px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-elev); color: var(--text-muted); font-size: 11px; }
 .message-branch-link:hover { border-color: var(--border-active); color: var(--text); }
 .message-branch-link > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -157,12 +170,59 @@
   font-family: var(--font-mono); font-size: 12px; line-height: 1.6;
   position: sticky; left: 0;
 }
-.rp-code-body { flex: 1 1 auto; margin: 0; padding: 12px 14px; font-family: var(--font-mono); font-size: 12px; line-height: 1.6; }
+.rp-code-body { flex: 1 1 auto; min-width: 0; margin: 0; padding: 12px 14px; font-family: var(--font-mono); font-size: 12px; line-height: 1.6; }
 /* .rp-code (not just .rp-code-body) so this outranks the lazily-loaded
    highlight.js theme's `pre code.hljs { padding: 1em }`, which otherwise wins
-   once highlighting lands and shifts the body 1em off the line-number gutter. */
-.rp-code .rp-code-body code { display: block; white-space: pre; background: none; border: none; padding: 0; }
+   once highlighting lands and shifts the body 1em off the line-number gutter.
+   `white-space: pre` (not pre-wrap) keeps long source lines scrolling like
+   the workspace editor instead of wrapping mid-token. Inherit the font so the
+   browser's default code font cannot diverge from the textarea and gutter. */
+.rp-code .rp-code-body code { font: inherit; display: block; white-space: pre; overflow-wrap: normal; word-break: normal; background: none; border: none; padding: 0; }
 .rp-code-body .hljs { background: none; }
+
+/* --- Editable center source (R/Python): highlighted mirror under a
+   transparent textarea. The mirror and the input share identical mono
+   metrics, so the caret and selection line up with the colored text. --- */
+.rp-code-editor { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.rp-code-toolbar { display: flex; min-height: 34px; flex: 0 0 auto; align-items: center; gap: 8px; padding: 5px 8px 5px 12px; border: 1px solid var(--border); border-bottom: 0; border-radius: var(--radius-sm) var(--radius-sm) 0 0; background: var(--bg-sunken); }
+.rp-code-toolbar .spacer { flex: 1 1 auto; }
+.rp-code-toolbar .center-file-btn { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; }
+.rp-code-toolbar .center-file-btn svg { width: 13px; height: 13px; }
+.rp-code-selection-status { overflow: hidden; color: var(--text-faint); font-family: var(--font-mono); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.rp-code-selection-status.active { color: var(--clay); font-weight: 650; }
+.rp-code-editor > .rp-code { flex: 1 1 auto; min-width: 0; min-height: 0; max-height: none; }
+.rp-code-editor > .rp-code-editable { border-radius: 0 0 var(--radius-sm) var(--radius-sm); }
+/* max-content, not 0: `.rp-code-body` carries `min-width: 0` for the plain
+   flex viewer, which zeroes this grid track's minimum contribution and
+   collapses all three layers to the pane width. The textarea then becomes a
+   nested `overflow: hidden` scroller on top that eats horizontal panning
+   (#1301). Sizing the stack to the widest line keeps mirror, selection layer
+   and textarea the same width, so `.rp-code` is the only scroller. */
+.rp-code-edit-stack { display: grid; flex: 1 1 auto; min-width: max-content; }
+.rp-code-edit-stack > .rp-code-body { grid-area: 1 / 1; }
+.rp-code-selection-layer {
+  z-index: 1; grid-area: 1 / 1; box-sizing: border-box; width: 100%; height: 100%;
+  margin: 0; padding: 12px 14px; overflow: hidden; pointer-events: none;
+  color: transparent; font-family: var(--font-mono); font-size: 12px; line-height: 1.6;
+  white-space: pre; overflow-wrap: normal;
+}
+.rp-code-selection-layer mark { border-radius: 2px; background: rgba(13, 148, 136, .24); background: color-mix(in srgb, var(--clay) 30%, transparent); color: transparent; box-decoration-break: clone; -webkit-box-decoration-break: clone; }
+.rp-code-input {
+  z-index: 2; grid-area: 1 / 1; box-sizing: border-box; width: 100%; height: 100%;
+  margin: 0; padding: 12px 14px; border: 0; background: transparent;
+  color: transparent; caret-color: var(--text);
+  font-family: var(--font-mono); font-size: 12px; line-height: 1.6;
+  white-space: pre; overflow: hidden; overflow-wrap: normal;
+  resize: none; outline: none;
+}
+.rp-code-input::selection {
+  background: rgba(13, 148, 136, .24);
+  background: color-mix(in srgb, var(--clay) 30%, transparent);
+  color: transparent;
+}
+/* Native ::selection paints while dragging; the mark layer takes over after blur. */
+.rp-code-edit-stack:focus-within .rp-code-selection-layer mark { background: transparent; }
+.rp-code-save-error { max-width: 320px; overflow: hidden; color: var(--err); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 
 /* --- Chat: tool/step summary chip (compact collapsible) --- */
 details.step { align-self: stretch; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-elev); box-shadow: var(--shadow-sm); }
@@ -178,12 +238,15 @@ details.step > summary .step-count { flex: 0 0 auto; font-size: 11.5px; color: v
 
 /* --- Chat: reviewer finding card (Warn / Info / Error) --- */
 .finding { align-self: stretch; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; background: var(--bg-elev); box-shadow: var(--shadow-sm); }
-.finding-head { display: flex; align-items: center; gap: 9px; padding: 11px 13px 9px; }
+.finding-head { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 9px; padding: 11px 13px 9px; }
+.finding-summary { display: flex; align-items: flex-start; gap: 9px; flex: 1 1 20rem; min-width: 0; }
+.finding-actions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; margin-left: auto; }
+.finding-actions .tool-btn, .finding-tag { flex-shrink: 0; white-space: nowrap; }
 .finding-avatar { font-size: 12px; color: var(--text-faint); font-weight: 600; }
 .finding-tag { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; padding: 2px 8px; border-radius: var(--radius-xs); display: inline-flex; align-items: center; gap: 5px; }
 .finding.warn .finding-tag { color: var(--warn); background: var(--warn-soft); }
 .finding.info .finding-tag { color: var(--info); background: var(--info-soft); }
 .finding.err .finding-tag { color: var(--err); background: color-mix(in srgb, var(--err) 12%, transparent); }
-.finding-title { font-size: 13px; font-weight: 600; color: var(--text); flex: 1 1 auto; min-width: 0; }
-.finding-body { padding: 0 13px 12px; font-size: 12.5px; color: var(--text-muted); line-height: 1.58; }
+.finding-title { font-size: 13px; font-weight: 600; color: var(--text); flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.finding-body { padding: 0 13px 12px; font-size: 12.5px; color: var(--text-muted); line-height: 1.58; overflow-wrap: anywhere; }
 .finding-note { padding: 8px 13px; font-size: 11.5px; color: var(--text-faint); border-top: 1px solid var(--border); background: var(--bg-sunken); font-style: italic; }

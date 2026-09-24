@@ -2,13 +2,13 @@
 
 use crate::bindings::{arm_caption_drag, open_external_url, window_control};
 use crate::i18n::{t, Locale};
-use leptos::{ev, window_event_listener, *};
-use wasm_bindgen::JsCast;
+use leptos::*;
 
 type MenuItem = (&'static str, &'static str, &'static str); // action, i18n key, shortcut
 
 const FILE_ITEMS: &[MenuItem] = &[
     ("new", "command.new_session", "Ctrl+N"),
+    ("new-window", "command.new_window", ""),
     ("projects", "command.projects", ""),
     ("files", "command.files", ""),
     (
@@ -51,6 +51,7 @@ const VIEW_ITEMS: &[MenuItem] = &[
 // doing nothing, which reads as a bug.
 const HOME_FILE_ITEMS: &[MenuItem] = &[
     ("new-project", "projects.new", "Ctrl+N"),
+    ("new-window", "command.new_window", ""),
     ("import-project", "projects.import", ""),
     ("scratch", "command.scratch", "Ctrl+Shift+N"),
     ("settings", "command.settings", "Ctrl+,"),
@@ -77,11 +78,24 @@ const HELP_ITEMS: &[MenuItem] = &[
     ("issues", "menu.issues", ""),
 ];
 
+/// Brand string used when no project is open. Keep in sync with
+/// `src-tauri` `project_commands::APP_WINDOW_TITLE`.
+pub(crate) const APP_WINDOW_TITLE: &str = "wisp-depmap";
+
+/// Window title shown in the custom Windows titlebar, taskbar, and Alt-Tab.
+pub(crate) fn app_window_title(project_name: Option<&str>) -> String {
+    match project_name.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => format!("{APP_WINDOW_TITLE} \u{2014} {name}"),
+        None => APP_WINDOW_TITLE.to_string(),
+    }
+}
+
 #[component]
 pub(super) fn WindowTitlebar(
     locale: RwSignal<Locale>,
     has_current_project: Signal<bool>,
     home: Signal<bool>,
+    brand: Signal<String>,
     on_action: Callback<&'static str>,
 ) -> impl IntoView {
     let open = create_rw_signal(None::<&'static str>);
@@ -93,11 +107,11 @@ pub(super) fn WindowTitlebar(
             match action {
                 "quit" => spawn_local(async { window_control("close").await }),
                 "docs" => {
-                    open_external_url("https://github.com/xuzhougeng/wisp-science#readme".into())
+                    open_external_url("https://github.com/Yu-Qiao-sjtu/wisp-science-depmap#readme".into())
                 }
-                "star-us" => open_external_url("https://github.com/xuzhougeng/wisp-science".into()),
+                "star-us" => open_external_url("https://github.com/Yu-Qiao-sjtu/wisp-science-depmap".into()),
                 "issues" => {
-                    open_external_url("https://github.com/xuzhougeng/wisp-science/issues".into())
+                    open_external_url("https://github.com/Yu-Qiao-sjtu/wisp-science-depmap/issues".into())
                 }
                 other => on_action.call(other),
             }
@@ -112,17 +126,14 @@ pub(super) fn WindowTitlebar(
         ("help", "menu.help", HELP_ITEMS, HELP_ITEMS),
     ];
 
-    window_event_listener(ev::keydown, move |ev| {
-        let Some(ev) = ev.dyn_ref::<web_sys::KeyboardEvent>() else {
-            return;
-        };
-        if ev.key() != "Escape" || ev.default_prevented() || crate::text::ime_composing(ev) {
-            return;
-        }
-        if open.get().is_some() {
-            ev.prevent_default();
+    // Menus sit above project pages, so consume Escape before the app closes
+    // the underlying research journey or another page.
+    crate::window_capture_escape(move || {
+        if open.get_untracked().is_some() {
             open.set(None);
+            return true;
         }
+        false
     });
 
     view! {
@@ -130,7 +141,8 @@ pub(super) fn WindowTitlebar(
             <div class="window-brand" data-testid="window-snap-drag"
                 on:mousedown=begin_window_move>
                 <span class="window-brand-icon"></span>
-                <span>"wisp science"</span>
+                <span class="window-brand-name" data-testid="window-brand-title"
+                    attr:title=move || brand.get()>{move || brand.get()}</span>
                 <span class="window-brand-version">{concat!("v", env!("CARGO_PKG_VERSION"))}</span>
             </div>
             <nav class="window-menu" aria-label="Application menu">
@@ -277,5 +289,20 @@ mod caption_gesture_tests {
         assert!(caption_drag_ready(4.0, 0.0));
         assert!(caption_drag_ready(0.0, -4.0));
         assert!(caption_drag_ready(3.0, 4.0));
+    }
+
+    #[test]
+    fn app_window_title_uses_the_project_name() {
+        assert_eq!(app_window_title(None), APP_WINDOW_TITLE);
+        assert_eq!(app_window_title(Some("")), APP_WINDOW_TITLE);
+        assert_eq!(app_window_title(Some("   ")), APP_WINDOW_TITLE);
+        assert_eq!(
+            app_window_title(Some("fkbp1a-aortic-ring-assay")),
+            "wisp-depmap \u{2014} fkbp1a-aortic-ring-assay"
+        );
+        assert_eq!(
+            app_window_title(Some("  fkbp1a  ")),
+            "wisp-depmap \u{2014} fkbp1a"
+        );
     }
 }

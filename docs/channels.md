@@ -4,35 +4,41 @@ Settings → Remote Access connects IM bots to the workspace agent: messages you
 from Feishu or WeChat drive normal agent sessions (visible in the desktop app),
 and the final answer of each turn is sent back to the chat.
 
-Desktop, Feishu, and WeChat share one durable **last-message session**. Every
-ordinary IM message is sent to the session that most recently accepted a user
-message on any of those three surfaces. This makes it possible to start work in
-the desktop app and continue it from either bot without rebuilding context.
-Merely viewing or navigating to a session does not change the route.
+Desktop, Feishu, and WeChat share one durable **IM target project**. Ordinary
+IM messages continue that project's current IM session. Starting work on the
+desktop in another project does **not** move Feishu or WeChat to that project —
+it only records that project's last session. Use `/project` from either bot to
+choose the IM destination.
 
-The shared target can be inspected and changed from either Feishu or WeChat:
+The IM target can be inspected and changed from either Feishu or WeChat:
 
-- `/status` shows the shared project and last-message session.
-- `/project` lists projects; `/project <number|name|id>` switches project and
-  prepares the shared route for a new session there.
-- `/session` lists recent sessions in the selected project;
-  `/session <number|title|id>` makes one the shared target.
-- `/new` prepares a fresh shared session in the selected project.
+- `/status` shows the IM project and last IM session.
+- `/project` lists projects; `/project <number|name|id>` switches the IM
+  project and prepares a new session there.
+- `/session` lists recent sessions in the IM project;
+  `/session <number|title|id>` makes one the IM target.
+- `/new` prepares a fresh IM session in the selected project.
 - `/stop` cancels the shared target's running turn; `/help` shows the command
   list.
+- WeChat additionally supports `/approval`, `/approve <code>`, and
+  `/reject <code> [feedback]` for text-only tool approval.
 
 List numbers and unique ID prefixes are accepted, so a UUID does not normally
 need to be typed in full. Route resolution and first-session creation are
 serialized across both channels, so simultaneous first messages cannot split
-into separate sessions. The last-message pointer is updated before waiting for
-a busy session, so a queued desktop follow-up becomes the Feishu/WeChat target
-immediately instead of remaining stuck behind the running turn. On upgrade,
-Wisp recovers the latest persisted user message once, then records accepted
-sends directly going forward.
+into separate sessions. A desktop send only records that project's last
+session; it does not move the IM target. On upgrade, a legacy
+`{project_id, session_id}` route becomes the IM destination and is copied into
+`last_session_by_project`. If no IM target is set, `/status`, `/session`, and
+`/new` ask the user to `/project` first.
 
-Only plain text is supported in v1 (WeChat voice messages arrive as transcripts
-and work too). Tool-approval prompts still appear in the desktop app —
-unattended turns that need approval wait until you click there.
+Only plain text input is supported in v1 (WeChat voice messages arrive as
+transcripts and work too). Approval prompts still appear in the desktop app. A
+WeChat turn that reaches a native Wisp confirmation or an ACP permission request
+also receives a bounded plain-text summary and a one-time approval code; Feishu
+approvals still require the desktop app. IM turns additionally force Ask on
+write/edit/shell and other mutating tools even when the desktop policy defaults
+to Allow, including Full Permission.
 
 ## Feishu bot
 
@@ -55,12 +61,18 @@ An existing app can still be configured manually on
 4. Paste App ID / App Secret in Settings → Remote Access, select the matching
    region, save, then toggle on. The secret is stored in the OS keyring.
 
-Direct (p2p) messages are handled as-is; in group chats the bot only reacts
-when @-mentioned. Duplicate event delivery is deduped by `event_id`. Normal
-agent turns appear as a single CardKit card: the card shows a safe, coarse
-view of tool progress and partial answer text, then becomes the final answer.
-Raw model reasoning, tool output, and command output are never copied into the
-external progress card. Slash-command replies remain plain text.
+Only the **bound owner** can drive agent turns. Scanning to create the app
+binds that Feishu account when the registration response includes an
+`open_id`. Otherwise bind an owner in Settings by confirming a pending pairing
+request or pasting their `open_id`. The first person to message the bot is
+never made owner automatically. Direct (p2p) and group @-mentions from anyone
+else are rejected before they enter the agent.
+
+Duplicate event delivery is deduped by `event_id`. Normal agent turns appear
+as a single CardKit card: the card shows a safe, coarse view of tool progress
+and partial answer text, then becomes the final answer. Raw model reasoning,
+tool output, and command output are never copied into the external progress
+card. Slash-command replies remain plain text.
 
 If CardKit creation or delivery is unavailable (for example because the app is
 missing CardKit permissions), Wisp falls back to one plain-text final reply.
@@ -79,8 +91,21 @@ Notes:
 - The login cannot be refreshed programmatically. When the server reports the
   session expired (errcode −14) the channel disables itself; re-scan to rebind.
 - Replies must be sent within ~30 minutes of your message (server-side
-  `context_token` window); if a turn runs longer, send another message to get
-  the result.
+  `context_token` window). Wisp keeps polling while an agent turn is running and
+  uses the newest owner message token for approval acknowledgements and final
+  replies.
+- Native Wisp confirmations and ACP permission requests are sent as plain text.
+  Reply with the exact
+  `/approve <code>` or `/reject <code> [feedback]` command, or use `/approval`
+  to list pending requests again. Codes are single-use and accept a unique
+  prefix of at least six hexadecimal characters.
+- For ACP, Wisp selects only the protocol's `AllowOnce` or `RejectOnce` option.
+  If the ACP agent offers only persistent choices, the text command fails
+  closed and that request must be handled in the desktop UI. ACP rejection
+  options cannot carry free-form feedback; Wisp names that limitation in its
+  acknowledgement instead of silently claiming the feedback was delivered.
+- Remote approval deliberately means **once**. Full Permission and persistent
+  session/project/global grants cannot be enabled from WeChat.
 
 ## Internals (for contributors)
 
@@ -88,13 +113,15 @@ Notes:
 pbbp2 frames → ACK ≤3s → events; REST token cache + CardKit stream),
 `feishu_registration.rs` (OAuth device-flow QR creation and polling),
 `feishu_card.rs` (pure CardKit/progress projection), `pbbp2.rs` (hand-rolled
-protobuf frame codec, round-trip tested), `weixin.rs` (QR bind, `getupdates`
-long-poll with cursor, send), and `mod.rs` (ChannelManager, live progress
-observer, shared last-message route in the `channel_last_message_route` setting,
-Tauri commands). The route contains `project_id` and an optional `session_id`;
-an empty session is the intentional pending state created by `/project` or
-`/new`. Inbound text reuses the same `send_message` path as the UI, so desktop
-and both channels update the same route and history/tools/approvals behave
-identically.
+protobuf frame codec, round-trip tested), `weixin.rs` (QR bind, non-blocking
+`getupdates` pump, sequential agent-turn worker, immediate slash-command
+control tasks, send), and `mod.rs` (ChannelManager, turn-scoped progress and
+approval observer, shared last-message route in the
+`channel_last_message_route` setting, Tauri commands). The route contains
+the IM `project_id`, an optional IM `session_id`, and `last_session_by_project`.
+An empty IM session is the intentional pending state created by `/project` or
+`/new`. Desktop `send_message` only updates that project's last session. Inbound
+text reuses the same `send_message` path as the UI with `TurnOrigin::Im`, so
+history is shared, while mutating-tool approval is stricter for IM.
 Protocol shapes follow phantty's tested implementations and the official
 `larksuite/oapi-sdk-go`.

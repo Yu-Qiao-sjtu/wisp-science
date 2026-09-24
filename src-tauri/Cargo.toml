@@ -1,6 +1,6 @@
 [package]
 name = "wisp-tauri"
-description = "Tauri v2 desktop shell for wisp-science: commands + agent event stream."
+description = "Tauri v2 desktop shell for wisp-depmap: commands + agent event stream."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,9 @@ license.workspace = true
 [[bin]]
 name = "wisp-tauri"
 path = "src/main.rs"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -18,7 +21,7 @@ serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
 
 [dependencies]
-tauri = { version = "2", features = ["devtools", "tray-icon"] }
+tauri = { version = "2", features = ["devtools", "tray-icon", "unstable"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-opener = "2"
@@ -46,7 +49,7 @@ base64 = { workspace = true }
 ring = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-pulldown-cmark = { version = "0.12", default-features = false }
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 same-file = { workspace = true }
 portable-pty = { workspace = true }
 async-trait = { workspace = true }
@@ -62,24 +65,29 @@ wisp-skills = { workspace = true }
 wisp-store = { workspace = true }
 wisp-runtime = { workspace = true }
 wisp-mcp = { workspace = true }
+wisp-bio = { workspace = true }
 wisp-acp = { workspace = true }
 wisp-paths = { workspace = true }
 wisp-sync = { workspace = true }
 wisp-tools = { workspace = true }
+wisp-runs = { workspace = true }
+wisp-app = { workspace = true }
+# Shared UI ⇄ Tauri invoke/event DTOs. Contract tests still round-trip backend
+# payloads into these types; live commands such as browser tab cleanup emit them.
+wisp-dto = { workspace = true }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 futures-util.workspace = true
-
-[dev-dependencies]
-# Contract tests: backend command payloads must deserialize into the shared
-# UI DTOs (crates/wisp-dto) to catch serde drift across the invoke boundary.
-wisp-dto = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
 tauri-winrt-notification = "0.7.3"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -88,3 +96,13 @@ windows = { version = "0.61", features = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-notification-sys = "0.6.15"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSString", "NSURL"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2 = "0.6"
+tao = "0.37.0"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }

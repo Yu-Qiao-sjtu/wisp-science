@@ -9,18 +9,33 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
 pub const LOCAL_CONTEXT_ID: &str = "local";
 pub const MAINLINE_RUNTIME_SCOPE: &str = "mainline";
+/// Total budget for one stop request, however many runtimes it covers. Stopping
+/// runs on agent tool calls, project switches, and app exit, so a worker that
+/// refuses to die must cost a bounded wait rather than the whole turn.
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeLanguage {
     Python,
     R,
+}
+
+impl RuntimeLanguage {
+    /// Extension a project script must carry to run in this language's runtime.
+    /// Matched case-insensitively, so `.r` and `.R` are both accepted.
+    pub fn script_extension(self) -> &'static str {
+        match self {
+            Self::Python => "py",
+            Self::R => "R",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -97,6 +112,20 @@ impl RuntimeKey {
         self.session_id = session_id.into();
         self
     }
+
+    /// Same interpreter slot, ignoring which conversation owns it.
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.project_id == other.project_id
+            && self.scope_key == other.scope_key
+            && self.context_id == other.context_id
+            && self.language == other.language
+    }
+
+    fn as_scope_shared(&self) -> Self {
+        let mut key = self.clone();
+        key.session_id.clear();
+        key
+    }
 }
 
 fn default_runtime_scope() -> String {
@@ -166,8 +195,14 @@ impl LaunchedRuntime {
 /// A launched, attached interpreter. The manager is its sole owner.
 #[async_trait]
 pub trait RuntimeKernel: Send {
-    async fn execute(&mut self, id: &str, code: &str, output: &RuntimeOutput)
-        -> Result<KernelResp>;
+    async fn execute(
+        &mut self,
+        id: &str,
+        code: &str,
+        source_name: Option<&str>,
+        required_objects: &[String],
+        output: &RuntimeOutput,
+    ) -> Result<KernelResp>;
 
     async fn inspect(&mut self, id: &str) -> Result<RuntimeObjectList>;
 
@@ -210,14 +245,34 @@ impl RuntimeOutput {
     }
 }
 
+#[derive(Debug)]
 pub struct RuntimeExecution {
     rx: mpsc::UnboundedReceiver<RuntimeEvent>,
+    info: RuntimeInfo,
 }
 
 impl RuntimeExecution {
     pub async fn recv(&mut self) -> Option<RuntimeEvent> {
         self.rx.recv().await
     }
+
+    /// The exact runtime generation that accepted this execution. This stays
+    /// stable even if the runtime is restarted after the result is returned.
+    pub fn info(&self) -> &RuntimeInfo {
+        &self.info
+    }
+}
+
+/// Preconditions and source metadata for one persistent runtime execution.
+/// Empty/default options preserve the original lazy-starting cell behavior.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeExecutionOptions {
+    /// Project-relative source filename used in interpreter diagnostics.
+    pub source_name: Option<String>,
+    /// Bindings that must already exist before any source is evaluated.
+    pub required_objects: Vec<String>,
+    /// Optional optimistic guard against executing in a replacement runtime.
+    pub expected_generation: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -246,6 +301,8 @@ struct RuntimeSession {
 struct ExecuteRequest {
     id: String,
     code: String,
+    source_name: Option<String>,
+    required_objects: Vec<String>,
     output: RuntimeOutput,
 }
 
@@ -273,6 +330,13 @@ impl RuntimeRequest {
 impl RuntimeSession {
     fn info(&self) -> RuntimeInfo {
         self.info.borrow().clone()
+    }
+
+    fn is_live(&self) -> bool {
+        matches!(
+            self.info().status,
+            RuntimeStatus::Starting | RuntimeStatus::Ready | RuntimeStatus::Busy
+        )
     }
 
     fn request_stop(&self) {
@@ -312,6 +376,15 @@ impl RuntimeSession {
             }
         }
     }
+
+    /// Wait for `Dead` until `deadline`, then report the last known state. The
+    /// caller keeps going either way: a driver still stuck in worker shutdown
+    /// must not hold up the conversation, the project switch, or app exit.
+    async fn wait_dead_until(&self, deadline: tokio::time::Instant) -> RuntimeInfo {
+        tokio::time::timeout_at(deadline, self.wait_dead())
+            .await
+            .unwrap_or_else(|_| self.info())
+    }
 }
 
 impl RuntimeManager {
@@ -345,7 +418,7 @@ impl RuntimeManager {
     }
 
     pub async fn start(&self, key: RuntimeKey, cwd: PathBuf) -> Result<RuntimeInfo> {
-        self.session(key, cwd)?.wait_started().await
+        self.prepare_session(key, cwd).await?.wait_started().await
     }
 
     pub async fn execute(
@@ -354,27 +427,80 @@ impl RuntimeManager {
         cwd: &Path,
         code: impl Into<String>,
     ) -> Result<RuntimeExecution> {
-        let session = self.session(key.clone(), cwd.to_path_buf())?;
-        session.wait_started().await?;
+        self.execute_with_options(key, cwd, code, RuntimeExecutionOptions::default())
+            .await
+    }
+
+    pub async fn execute_with_options(
+        &self,
+        key: &RuntimeKey,
+        cwd: &Path,
+        code: impl Into<String>,
+        options: RuntimeExecutionOptions,
+    ) -> Result<RuntimeExecution> {
+        let requires_existing =
+            options.expected_generation.is_some() || !options.required_objects.is_empty();
+        let session = if requires_existing {
+            let session = self
+                .registry()
+                .sessions
+                .get(key)
+                .cloned()
+                .ok_or_else(|| {
+                    let mut message = "runtime is not started; ".to_string();
+                    if let Some(expected) = options.expected_generation {
+                        message.push_str(&format!(
+                            "expected_runtime_generation={expected} requires an existing runtime of that generation; it does not start one. "
+                        ));
+                        if options.required_objects.is_empty() {
+                            message.push_str(
+                                "For initialization code that needs no prior runtime state, omit expected_runtime_generation on the first call. If prior state was expected, restore it explicitly before retrying."
+                            );
+                        }
+                    }
+                    if !options.required_objects.is_empty() {
+                        message.push_str(&format!(
+                            "required_objects={:?} requires existing bindings. Initialize and load these objects in a separate call without required_objects or expected_runtime_generation, then retry this source with verified preconditions.",
+                            options.required_objects
+                        ));
+                    }
+                    anyhow!(message)
+                })?;
+            // The registry lookup bypasses `session`, so this branch is the only
+            // place that still has to reject a runtime started elsewhere.
+            ensure_session_cwd(key, &session, cwd)?;
+            session
+        } else {
+            self.prepare_session(key.clone(), cwd.to_path_buf()).await?
+        };
+        let info = session.wait_started().await?;
+        if let Some(expected) = options.expected_generation {
+            if info.generation != expected {
+                return Err(anyhow!(
+                    "runtime generation changed: expected_runtime_generation={expected}, current {}; verify and restore the runtime state before retrying; do not guess a replacement generation",
+                    info.generation
+                ));
+            }
+        }
         let (tx, rx) = mpsc::unbounded_channel();
         let request = ExecuteRequest {
             id: uuid::Uuid::new_v4().to_string(),
             code: code.into(),
+            source_name: options.source_name,
+            required_objects: options.required_objects,
             output: RuntimeOutput::new(tx),
         };
         session
             .requests
             .send(RuntimeRequest::Execute(request))
             .map_err(|_| anyhow!("runtime request queue is closed"))?;
-        Ok(RuntimeExecution { rx })
+        Ok(RuntimeExecution { rx, info })
     }
 
     pub async fn inspect(&self, key: &RuntimeKey) -> Result<RuntimeObjectList> {
         let session = self
-            .registry()
-            .sessions
-            .get(key)
-            .cloned()
+            .lookup_registered(key)
+            .map(|(_, session)| session)
             .ok_or_else(|| anyhow!("runtime is not started"))?;
         session.wait_started().await?;
         let (reply, result) = oneshot::channel();
@@ -410,55 +536,43 @@ impl RuntimeManager {
         infos
     }
 
+    /// Stop one runtime but keep its dead record, so the next call reports the
+    /// stop instead of silently starting a replacement.
     pub async fn stop(&self, key: &RuntimeKey) -> Option<RuntimeInfo> {
-        let session = self.registry().sessions.get(key).cloned()?;
-        session.request_stop();
-        Some(session.wait_dead().await)
+        let found = self.lookup_registered(key)?;
+        self.stop_sessions(&[found]).await.pop()
+    }
+
+    /// Forget exactly the terminated instance selected in the UI. Keeping the
+    /// generation counter prevents stale guards from matching a replacement.
+    pub fn dismiss_dead(&self, runtime_id: &str) -> Result<()> {
+        let mut registry = self.registry();
+        let Some((key, session)) = registry
+            .sessions
+            .iter()
+            .find(|(_, session)| session.info().runtime_id == runtime_id)
+        else {
+            return Ok(());
+        };
+        if session.info().status != RuntimeStatus::Dead {
+            return Err(anyhow!("only terminated runtimes can be dismissed"));
+        }
+        let key = key.clone();
+        registry.sessions.remove(&key);
+        Ok(())
     }
 
     pub async fn restart(&self, key: RuntimeKey, cwd: PathBuf) -> Result<RuntimeInfo> {
-        let current = { self.registry().sessions.get(&key).cloned() };
-        if let Some(session) = current {
-            session.request_stop();
-            session.wait_dead().await;
-            let mut registry = self.registry();
-            if registry
-                .sessions
-                .get(&key)
-                .is_some_and(|current| Arc::ptr_eq(current, &session))
-            {
-                registry.sessions.remove(&key);
-            }
+        if let Some(found) = self.lookup_registered(&key) {
+            self.stop_sessions(&[found.clone()]).await;
+            self.forget_sessions(&[found]);
         }
         self.start(key, cwd).await
     }
 
     pub async fn stop_project(&self, project_id: &str) {
-        let sessions = {
-            let registry = self.registry();
-            registry
-                .sessions
-                .iter()
-                .filter(|(key, _)| key.project_id == project_id)
-                .map(|(key, session)| (key.clone(), session.clone()))
-                .collect::<Vec<_>>()
-        };
-        for (_, session) in &sessions {
-            session.request_stop();
-        }
-        for (_, session) in &sessions {
-            session.wait_dead().await;
-        }
-        let mut registry = self.registry();
-        for (key, session) in sessions {
-            if registry
-                .sessions
-                .get(&key)
-                .is_some_and(|current| Arc::ptr_eq(current, &session))
-            {
-                registry.sessions.remove(&key);
-            }
-        }
+        self.stop_and_forget(|key| key.project_id == project_id)
+            .await;
     }
 
     /// Stop every runtime owned by one conversation, e.g. when the session is
@@ -468,89 +582,118 @@ impl RuntimeManager {
         if session_id.is_empty() {
             return;
         }
-        let sessions = {
-            let registry = self.registry();
-            registry
-                .sessions
-                .iter()
-                .filter(|(key, _)| key.project_id == project_id && key.session_id == session_id)
-                .map(|(key, session)| (key.clone(), session.clone()))
-                .collect::<Vec<_>>()
-        };
-        for (_, session) in &sessions {
-            session.request_stop();
-        }
-        for (_, session) in &sessions {
-            session.wait_dead().await;
-        }
-        let mut registry = self.registry();
-        for (key, session) in sessions {
-            if registry
-                .sessions
-                .get(&key)
-                .is_some_and(|current| Arc::ptr_eq(current, &session))
-            {
-                registry.sessions.remove(&key);
-            }
-        }
+        self.stop_and_forget(|key| key.project_id == project_id && key.session_id == session_id)
+            .await;
     }
 
     pub async fn stop_scope(&self, project_id: &str, scope_key: &str) {
+        self.stop_and_forget(|key| key.project_id == project_id && key.scope_key == scope_key)
+            .await;
+    }
+
+    pub async fn shutdown_all(&self) {
+        self.stop_and_forget(|_| true).await;
+    }
+
+    async fn stop_and_forget(&self, matches: impl Fn(&RuntimeKey) -> bool) {
         let sessions = {
-            let registry = self.registry();
-            registry
+            self.registry()
                 .sessions
                 .iter()
-                .filter(|(key, _)| key.project_id == project_id && key.scope_key == scope_key)
+                .filter(|(key, _)| matches(key))
                 .map(|(key, session)| (key.clone(), session.clone()))
                 .collect::<Vec<_>>()
         };
-        for (_, session) in &sessions {
+        self.stop_sessions(&sessions).await;
+        self.forget_sessions(&sessions);
+    }
+
+    /// Ask every session to stop and wait out one shared budget. Returning on
+    /// the deadline is what keeps a worker that refuses to exit from blocking
+    /// the agent turn, the project switch, or app exit.
+    async fn stop_sessions(
+        &self,
+        sessions: &[(RuntimeKey, Arc<RuntimeSession>)],
+    ) -> Vec<RuntimeInfo> {
+        for (_, session) in sessions {
             session.request_stop();
         }
-        for (_, session) in &sessions {
-            session.wait_dead().await;
+        let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
+        let mut stopped = Vec::with_capacity(sessions.len());
+        for (_, session) in sessions {
+            stopped.push(session.wait_dead_until(deadline).await);
         }
+        stopped
+    }
+
+    fn forget_sessions(&self, sessions: &[(RuntimeKey, Arc<RuntimeSession>)]) {
         let mut registry = self.registry();
         for (key, session) in sessions {
             if registry
                 .sessions
-                .get(&key)
-                .is_some_and(|current| Arc::ptr_eq(current, &session))
+                .get(key)
+                .is_some_and(|current| Arc::ptr_eq(current, session))
             {
-                registry.sessions.remove(&key);
+                registry.sessions.remove(key);
             }
         }
     }
 
-    pub async fn shutdown_all(&self) {
-        let sessions = self
-            .registry()
+    /// Reuse a live interpreter for `key`, or start one after retiring the
+    /// scope-shared sibling that the runtimes panel would show as a second
+    /// Ready row for the same conversation (#1100).
+    async fn prepare_session(&self, key: RuntimeKey, cwd: PathBuf) -> Result<Arc<RuntimeSession>> {
+        if let Some(session) = self.live_session(&key) {
+            ensure_session_cwd(&key, &session, &cwd)?;
+            return Ok(session);
+        }
+        if !key.session_id.is_empty() {
+            // A conversation-owned python/r call must not pile a second SSH/WSL
+            // worker on top of an unowned (empty session_id) one. Stop the
+            // sibling first so the local ssh.exe drop can SIGHUP the remote.
+            self.stop_and_forget(|existing| {
+                existing.same_binding(&key) && existing.session_id.is_empty()
+            })
+            .await;
+        }
+        self.session(key, cwd)
+    }
+
+    fn live_session(&self, key: &RuntimeKey) -> Option<Arc<RuntimeSession>> {
+        let session = self.registry().sessions.get(key).cloned()?;
+        session.is_live().then_some(session)
+    }
+
+    fn lookup_registered(&self, key: &RuntimeKey) -> Option<(RuntimeKey, Arc<RuntimeSession>)> {
+        let registry = self.registry();
+        if let Some(session) = registry.sessions.get(key).cloned() {
+            return Some((key.clone(), session));
+        }
+        if key.session_id.is_empty() {
+            return None;
+        }
+        let shared = key.as_scope_shared();
+        registry
             .sessions
-            .values()
+            .get(&shared)
             .cloned()
-            .collect::<Vec<_>>();
-        for session in &sessions {
-            session.request_stop();
-        }
-        for session in sessions {
-            session.wait_dead().await;
-        }
-        self.registry().sessions.clear();
+            .map(|session| (shared, session))
     }
 
     fn session(&self, key: RuntimeKey, cwd: PathBuf) -> Result<Arc<RuntimeSession>> {
         let mut registry = self.registry();
         if let Some(session) = registry.sessions.get(&key) {
-            if session.cwd != cwd {
-                return Err(anyhow!(
-                    "runtime for project '{}' was started in '{}', not '{}'",
-                    key.project_id,
-                    session.cwd.display(),
-                    cwd.display()
-                ));
-            }
+            ensure_session_cwd(&key, session, &cwd)?;
             return Ok(session.clone());
+        }
+        // A Start/Run with no viewed conversation must not create a
+        // scope-shared worker beside an already-live session-owned one: the
+        // panel treats empty session_id as visible on every conversation.
+        if key.session_id.is_empty() {
+            if let Some(session) = latest_live_scoped(&registry, &key) {
+                ensure_session_cwd(&key, &session, &cwd)?;
+                return Ok(session);
+            }
         }
 
         let generation = registry.generations.entry(key.clone()).or_default();
@@ -616,13 +759,9 @@ impl RuntimeLauncher for LocalRuntimeLauncher {
 
         let (interpreter, args, envs, language) = match key.language {
             RuntimeLanguage::Python => {
-                let python = PythonEnv::managed(&self.app_data).python();
-                if !python.is_file() {
-                    return Err(anyhow!(
-                        "managed Python interpreter not found at {}; wait for Python bootstrap",
-                        python.display()
-                    ));
-                }
+                let python = PythonEnv::find_python(&self.app_data).ok_or_else(|| anyhow!(
+                    "Python interpreter not found; use the local-env-setup skill to prepare Python before running code"
+                ))?;
                 if !self.python_worker.is_file() {
                     return Err(anyhow!(
                         "Python runtime worker not found at {}",
@@ -632,14 +771,16 @@ impl RuntimeLauncher for LocalRuntimeLauncher {
                 (
                     python,
                     vec![self.python_worker.as_os_str().to_os_string()],
-                    self.envs.as_slice(),
+                    self.envs.clone(),
                     "python",
                 )
             }
             RuntimeLanguage::R => {
-                let rscript = find_rscript().ok_or_else(|| {
-                    anyhow!("Rscript not found on PATH; install R and add Rscript to PATH")
-                })?;
+                let rscript = find_rscript()
+                    .map(|path| crate::direct_rscript(&path))
+                    .ok_or_else(|| {
+                        anyhow!("Rscript not found on PATH; install R and add Rscript to PATH")
+                    })?;
                 let worker = self
                     .r_worker
                     .as_ref()
@@ -650,19 +791,20 @@ impl RuntimeLauncher for LocalRuntimeLauncher {
                         worker.display()
                     ));
                 }
+                let envs = crate::conda_prefix_envs(&rscript);
                 (
                     rscript,
                     vec![
                         OsString::from("--vanilla"),
                         worker.as_os_str().to_os_string(),
                     ],
-                    &[][..],
+                    envs,
                     "r",
                 )
             }
         };
         let client =
-            KernelClient::spawn_command(&interpreter, &args, envs, Some(cwd), language).await?;
+            KernelClient::spawn_command(&interpreter, &args, &envs, Some(cwd), language).await?;
         let ready = client.ready().clone();
         Ok(LaunchedRuntime::new(
             Box::new(client),
@@ -759,7 +901,13 @@ async fn runtime_driver(
         match request {
             RuntimeRequest::Execute(request) => {
                 let outcome = {
-                    let execution = kernel.execute(&request.id, &request.code, &request.output);
+                    let execution = kernel.execute(
+                        &request.id,
+                        &request.code,
+                        request.source_name.as_deref(),
+                        &request.required_objects,
+                        &request.output,
+                    );
                     tokio::pin!(execution);
                     tokio::select! {
                         biased;
@@ -857,6 +1005,31 @@ async fn runtime_driver(
     info_tx.send_replace(info);
 }
 
+fn latest_live_scoped(registry: &Registry, binding: &RuntimeKey) -> Option<Arc<RuntimeSession>> {
+    registry
+        .sessions
+        .iter()
+        .filter(|(key, session)| {
+            key.same_binding(binding) && !key.session_id.is_empty() && session.is_live()
+        })
+        .max_by_key(|(_, session)| session.info().last_activity_at_ms)
+        .map(|(_, session)| session.clone())
+}
+
+/// A live runtime is bound to the directory it was launched in; reusing it from
+/// another root would silently resolve relative paths against the wrong project.
+fn ensure_session_cwd(key: &RuntimeKey, session: &RuntimeSession, cwd: &Path) -> Result<()> {
+    if session.cwd == cwd {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "runtime for project '{}' was started in '{}', not '{}'",
+        key.project_id,
+        session.cwd.display(),
+        cwd.display()
+    ))
+}
+
 fn fail_pending(requests: &mut mpsc::UnboundedReceiver<RuntimeRequest>, message: &str) {
     while let Ok(request) = requests.try_recv() {
         request.fail(message);
@@ -879,6 +1052,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::time::{sleep, Duration};
 
+    #[test]
+    fn script_extension_matches_the_language_file_suffix() {
+        assert_eq!(RuntimeLanguage::Python.script_extension(), "py");
+        assert_eq!(RuntimeLanguage::R.script_extension(), "R");
+    }
+
     #[derive(Clone, Default)]
     struct FakeLauncher {
         launches: Arc<AtomicUsize>,
@@ -886,6 +1065,7 @@ mod tests {
         active: Arc<AtomicUsize>,
         max_active: Arc<AtomicUsize>,
         exited: Arc<AtomicBool>,
+        stuck_shutdown: Arc<AtomicBool>,
         launch_cwds: Arc<Mutex<Vec<PathBuf>>>,
         launch_delay: Duration,
     }
@@ -903,6 +1083,7 @@ mod tests {
                     active: self.active.clone(),
                     max_active: self.max_active.clone(),
                     exited: self.exited.clone(),
+                    stuck_shutdown: self.stuck_shutdown.clone(),
                 }),
                 RuntimeMetadata {
                     interpreter: Some("fake-python".into()),
@@ -919,6 +1100,7 @@ mod tests {
         active: Arc<AtomicUsize>,
         max_active: Arc<AtomicUsize>,
         exited: Arc<AtomicBool>,
+        stuck_shutdown: Arc<AtomicBool>,
     }
 
     struct ActiveCall(Arc<AtomicUsize>);
@@ -935,11 +1117,28 @@ mod tests {
             &mut self,
             _id: &str,
             code: &str,
+            _source_name: Option<&str>,
+            required_objects: &[String],
             output: &RuntimeOutput,
         ) -> Result<KernelResp> {
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(active, Ordering::SeqCst);
             let _active = ActiveCall(self.active.clone());
+
+            let missing = required_objects
+                .iter()
+                .filter(|name| name.as_str() != "value")
+                .cloned()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                return Ok(KernelResp {
+                    error: Some(format!(
+                        "required runtime objects are missing: {}",
+                        missing.join(", ")
+                    )),
+                    ..KernelResp::default()
+                });
+            }
 
             if let Some(value) = code.strip_prefix("set_after_delay:") {
                 sleep(Duration::from_millis(40)).await;
@@ -984,6 +1183,11 @@ mod tests {
         }
 
         async fn shutdown(&mut self) -> Result<()> {
+            if self.stuck_shutdown.load(Ordering::SeqCst) {
+                // A worker whose descendants keep the inherited stderr pipe
+                // open never reports that it finished shutting down (#941).
+                std::future::pending::<()>().await;
+            }
             self.shutdowns.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -1086,6 +1290,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dismiss_dead_removes_only_selected_instance_and_keeps_generation() {
+        let launcher = FakeLauncher::default();
+        let manager = manager(&launcher);
+        let key = RuntimeKey::local_python("project-a");
+        let sibling = RuntimeKey::local_python("project-b");
+        let cwd = PathBuf::from("project-a");
+        let first = manager.start(key.clone(), cwd.clone()).await.unwrap();
+        manager.start(sibling.clone(), cwd.clone()).await.unwrap();
+        assert!(manager.dismiss_dead(&first.runtime_id).is_err());
+        manager.stop(&key).await;
+        manager.dismiss_dead(&first.runtime_id).unwrap();
+        assert_eq!(manager.list().len(), 1);
+        assert_eq!(manager.list()[0].key, sibling);
+        let replacement = manager.start(key, cwd).await.unwrap();
+        assert!(replacement.generation > first.generation);
+        manager.dismiss_dead(&first.runtime_id).unwrap();
+        assert_eq!(manager.list().len(), 2);
+        manager.shutdown_all().await;
+    }
+
+    #[tokio::test]
     async fn parallel_sessions_in_one_scope_keep_independent_runtime_state() {
         let launcher = FakeLauncher::default();
         let manager = manager(&launcher);
@@ -1120,9 +1345,12 @@ mod tests {
         let session_a = RuntimeKey::local_python("project-a").with_session("frame-a");
         let session_b = RuntimeKey::local_python("project-a").with_session("frame-b");
         let cwd = PathBuf::from("project-a");
-        for key in [&shared, &session_a, &session_b] {
-            manager.start(key.clone(), cwd.clone()).await.unwrap();
-        }
+        manager.start(session_a.clone(), cwd.clone()).await.unwrap();
+        manager.start(session_b.clone(), cwd.clone()).await.unwrap();
+        // Scope-shared cannot sit beside conversation-owned workers (#1100);
+        // a later unowned start reuses the most recently active session.
+        manager.start(shared.clone(), cwd.clone()).await.unwrap();
+        assert_eq!(manager.list().len(), 2);
 
         manager.stop_session("project-a", "frame-a").await;
         let remaining = manager
@@ -1130,13 +1358,48 @@ mod tests {
             .into_iter()
             .map(|runtime| runtime.key)
             .collect::<Vec<_>>();
-        assert!(remaining.contains(&shared));
         assert!(remaining.contains(&session_b));
         assert!(!remaining.contains(&session_a));
 
-        // An empty session id must never match the scope-shared runtime.
+        // An empty session id must never match a conversation-owned runtime.
         manager.stop_session("project-a", "").await;
-        assert_eq!(manager.list().len(), 2);
+        assert_eq!(manager.list().len(), 1);
+        manager.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn conversation_start_retires_the_scope_shared_duplicate() {
+        let launcher = FakeLauncher::default();
+        let manager = manager(&launcher);
+        let shared = RuntimeKey::local_python("project-a");
+        let session_a = RuntimeKey::local_python("project-a").with_session("frame-a");
+        let cwd = PathBuf::from("project-a");
+        manager.start(shared.clone(), cwd.clone()).await.unwrap();
+        manager.start(session_a.clone(), cwd.clone()).await.unwrap();
+
+        let live = manager.list();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].key, session_a);
+        assert_eq!(launcher.launches.load(Ordering::SeqCst), 2);
+        assert_eq!(launcher.shutdowns.load(Ordering::SeqCst), 1);
+        manager.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn restored_conversation_reuses_its_live_runtime() {
+        let launcher = FakeLauncher::default();
+        let manager = manager(&launcher);
+        let session_a = RuntimeKey::local_python("project-a").with_session("frame-a");
+        let cwd = PathBuf::from("project-a");
+        finished(manager.execute(&session_a, &cwd, "set:3").await.unwrap())
+            .await
+            .unwrap();
+        let value = finished(manager.execute(&session_a, &cwd, "get").await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(value.stdout, "3");
+        assert_eq!(launcher.launches.load(Ordering::SeqCst), 1);
+        assert_eq!(manager.list().len(), 1);
         manager.shutdown_all().await;
     }
 
@@ -1189,6 +1452,177 @@ mod tests {
         assert_eq!(python_value.stdout, "3");
         assert_eq!(r_value.stdout, "7");
         assert_eq!(launcher.launches.load(Ordering::SeqCst), 2);
+        manager.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn required_objects_never_lazy_start_an_empty_runtime() {
+        let launcher = FakeLauncher::default();
+        let manager = manager(&launcher);
+        let key = RuntimeKey::local_python("project-a");
+        let cwd = PathBuf::from("project-a");
+
+        let error = manager
+            .execute_with_options(
+                &key,
+                &cwd,
+                "get",
+                RuntimeExecutionOptions {
+                    required_objects: vec!["value".into()],
+                    ..RuntimeExecutionOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("runtime is not started"));
+        assert_eq!(launcher.launches.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_runtime_errors_identify_each_precondition_without_launching() {
+        let launcher = FakeLauncher::default();
+        let manager = manager(&launcher);
+        let key = RuntimeKey::local_python("project-a");
+        let cwd = PathBuf::from("project-a");
+
+        for (expected_generation, required_objects) in [
+            (Some(1), vec![]),
+            (None, vec!["value".to_string()]),
+            (Some(1), vec!["value".to_string()]),
+        ] {
+            let error = manager
+                .execute_with_options(
+                    &key,
+                    &cwd,
+                    "set:9",
+                    RuntimeExecutionOptions {
+                        expected_generation,
+                        required_objects: required_objects.clone(),
+                        ..RuntimeExecutionOptions::default()
+                    },
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("runtime is not started"), "{error}");
+            assert_eq!(
+                error.contains("expected_runtime_generation=1"),
+                expected_generation.is_some(),
+                "{error}"
+            );
+            if required_objects.is_empty() {
+                assert!(error.contains("omit expected_runtime_generation on the first call"));
+                assert!(!error.contains("required_objects"));
+            } else {
+                assert!(error.contains("required_objects=[\"value\"]"), "{error}");
+                assert!(error.contains("separate call"), "{error}");
+            }
+            assert_eq!(launcher.launches.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    /// The guarded path looks the session up straight out of the registry, which
+    /// skips the directory check that `session` applies on the lazy path.
+    #[tokio::test]
+    async fn a_guarded_execution_still_rejects_a_runtime_from_another_root() {
+        let launcher = FakeLauncher::default();
+        let manager = manager(&launcher);
+        let key = RuntimeKey::local_python("project-a");
+        manager
+            .start(key.clone(), PathBuf::from("project-a"))
+            .await
+            .unwrap();
+
+        let error = manager
+            .execute_with_options(
+                &key,
+                Path::new("project-b"),
+                "get",
+                RuntimeExecutionOptions {
+                    required_objects: vec!["value".into()],
+                    ..RuntimeExecutionOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("was started in"),
+            "{error}, expected the started-elsewhere rejection"
+        );
+        manager.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn required_objects_are_checked_before_source_execution() {
+        let launcher = FakeLauncher::default();
+        let manager = manager(&launcher);
+        let key = RuntimeKey::local_python("project-a");
+        let cwd = PathBuf::from("project-a");
+        manager.start(key.clone(), cwd.clone()).await.unwrap();
+
+        let execution = manager
+            .execute_with_options(
+                &key,
+                &cwd,
+                "set:9",
+                RuntimeExecutionOptions {
+                    required_objects: vec!["sce".into()],
+                    ..RuntimeExecutionOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let response = finished(execution).await.unwrap();
+        assert_eq!(
+            response.error.as_deref(),
+            Some("required runtime objects are missing: sce")
+        );
+
+        let value = finished(manager.execute(&key, &cwd, "get").await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(value.stdout, "0", "guarded source must not run");
+        manager.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn expected_generation_rejects_a_replacement_runtime() {
+        let launcher = FakeLauncher::default();
+        let manager = manager(&launcher);
+        let key = RuntimeKey::local_python("project-a");
+        let cwd = PathBuf::from("project-a");
+        let first = manager.start(key.clone(), cwd.clone()).await.unwrap();
+        let second = manager.restart(key.clone(), cwd.clone()).await.unwrap();
+        assert!(second.generation > first.generation);
+
+        let error = manager
+            .execute_with_options(
+                &key,
+                &cwd,
+                "get",
+                RuntimeExecutionOptions {
+                    expected_generation: Some(first.generation),
+                    ..RuntimeExecutionOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("runtime generation changed"));
+
+        let execution = manager
+            .execute_with_options(
+                &key,
+                &cwd,
+                "get",
+                RuntimeExecutionOptions {
+                    expected_generation: Some(second.generation),
+                    ..RuntimeExecutionOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(execution.info().generation, second.generation);
+        finished(execution).await.unwrap();
         manager.shutdown_all().await;
     }
 
@@ -1268,6 +1702,66 @@ mod tests {
         assert_eq!(finished(get).await.unwrap().stdout, "0");
         assert_eq!(launcher.launches.load(Ordering::SeqCst), 2);
         manager.shutdown_all().await;
+    }
+
+    /// Stopping runs inside agent tool calls, project switches, and app exit,
+    /// so it must complete on a budget even when the worker never does (#941).
+    #[tokio::test(start_paused = true)]
+    async fn stopping_a_stuck_worker_gives_up_on_the_budget() {
+        let launcher = FakeLauncher::default();
+        let manager = manager(&launcher);
+        let key = RuntimeKey::local_python("project-a");
+        let cwd = PathBuf::from("project-a");
+        manager.start(key.clone(), cwd.clone()).await.unwrap();
+        launcher.stuck_shutdown.store(true, Ordering::SeqCst);
+
+        let started = tokio::time::Instant::now();
+        let stopped = manager.stop(&key).await.unwrap();
+        assert!(started.elapsed() >= STOP_TIMEOUT);
+        assert_eq!(stopped.status, RuntimeStatus::Stopping);
+        assert_eq!(launcher.shutdowns.load(Ordering::SeqCst), 0);
+
+        // An explicit stop keeps its record, so the next call reports the stop
+        // instead of quietly starting a second interpreter.
+        assert!(manager.execute(&key, &cwd, "get").await.is_err());
+        assert_eq!(launcher.launches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restarting_past_a_stuck_worker_still_yields_a_fresh_runtime() {
+        let launcher = FakeLauncher::default();
+        let manager = manager(&launcher);
+        let key = RuntimeKey::local_python("project-a");
+        let cwd = PathBuf::from("project-a");
+        let first = manager.start(key.clone(), cwd.clone()).await.unwrap();
+        launcher.stuck_shutdown.store(true, Ordering::SeqCst);
+
+        let restarted = manager.restart(key.clone(), cwd.clone()).await.unwrap();
+        assert_eq!(restarted.generation, first.generation + 1);
+        assert_eq!(restarted.status, RuntimeStatus::Ready);
+        assert_eq!(manager.list().len(), 1);
+        assert_eq!(launcher.launches.load(Ordering::SeqCst), 2);
+    }
+
+    /// One stuck worker per project must not add up: app exit spends a single
+    /// budget for every runtime it stops.
+    #[tokio::test(start_paused = true)]
+    async fn app_exit_shares_one_budget_across_stuck_runtimes() {
+        let launcher = FakeLauncher::default();
+        let manager = manager(&launcher);
+        for project in ["project-a", "project-b", "project-c"] {
+            manager
+                .start(RuntimeKey::local_python(project), PathBuf::from(project))
+                .await
+                .unwrap();
+        }
+        launcher.stuck_shutdown.store(true, Ordering::SeqCst);
+
+        let started = tokio::time::Instant::now();
+        manager.shutdown_all().await;
+        assert!(started.elapsed() >= STOP_TIMEOUT);
+        assert!(started.elapsed() < STOP_TIMEOUT * 2);
+        assert!(manager.list().is_empty());
     }
 
     #[tokio::test]

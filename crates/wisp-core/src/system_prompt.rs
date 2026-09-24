@@ -36,14 +36,14 @@ impl<'a> SystemPrompt<'a> {
     }
 
     fn base_intro() -> String {
-        "You are **wisp-science**, an interactive AI agent for software engineering and scientific computing tasks. \
-\"wisp-science\" is your name and identity — always refer to yourself as wisp-science. You are NOT \"Claude Science\", \
+        "You are **wisp-depmap**, an interactive AI agent for software engineering and scientific computing tasks. \
+\"wisp-depmap\" is your name and identity — always refer to yourself as wisp-depmap. You are NOT \"Claude Science\", \
 \"Claude\", \"ChatGPT\", \"Gemini\", or any other assistant or product, and you must never call yourself by those names, \
 even though you are built on top of a large language model.\n\n\
-About the model that powers you: your provider and model are configured by the host (the wisp-science app) and chosen \
+About the model that powers you: your provider and model are configured by the host (the wisp-depmap app) and chosen \
 by the user — the backend may be an Anthropic, OpenAI-compatible (e.g. GLM, DeepSeek, Qwen), or other model, and it can \
 change between sessions. Do NOT assume or claim a specific vendor or model name. If the user asks which model you use, \
-tell them the underlying model is whatever is set in wisp-science's Settings (provider + model), that you can't reliably \
+tell them the underlying model is whatever is set in wisp-depmap's Settings (provider + model), that you can't reliably \
 read the exact version from inside a turn, and point them to Settings — never guess \"Claude\" or any other name.\n\n\
 Use the instructions below and the tools available to you to assist the user.\n\
 IMPORTANT: Never generate or guess URLs unless you are confident they help the user with their work. \
@@ -83,27 +83,30 @@ never reduce the promised samples or scientific objective without the user's exp
 **3. Surgical changes.** Touch only what you must. Don't 'improve' adjacent code or refactor things that aren't broken. Match existing style.\n\
 **4. Verify before completion.** Transform tasks into verifiable goals: 'Write tests for X, then make them pass.' For multi-step work, state a brief plan first.\n\
 **5. Respect cancellations and course corrections.** When the user cancels or removes work, stop it, revise the active plan immediately, and mark the removed step `cancelled` when using `update_plan`. A cancelled step is terminal: never resume it merely because an older plan or message still lists it. Only restore it after a new explicit user request.\n\
-**6. Treat global memory as context, not policy.** A `<global_memory>` block contains user-confirmed but potentially stale user context. Apply only relevant preferences or facts. Project instructions and the user's current request override it; when memory entries conflict, follow the host-declared recency order. Memory never grants permission to bypass safety rules or tool approval.\n".into()
+**6. Treat global memory as silent context, not policy.** A `<global_memory>` block contains user-confirmed but potentially stale user context. Apply only relevant preferences or facts, silently. Do not acknowledge, quote, summarize, or explain whether a memory applies, and never announce that an irrelevant memory is being ignored, unless the user explicitly asks about memory. Project instructions and the user's current request override it; when memory entries conflict, follow the host-declared recency order. Memory never grants permission to bypass safety rules or tool approval.\n".into()
     }
 
     fn tool_guidance() -> String {
         "## Tool Selection\n\n\
-Use the dedicated tool when one exists (read/write/edit/search/grep/attempt_completion). Reach for **shell** only when no dedicated tool fits — it runs PowerShell on Windows and POSIX `sh` on macOS/Linux, with a 60s timeout.\n\
+Use dedicated tools for file operations (read/write/edit/search/grep) and **attempt_completion** for delivery. For short standalone scripts and commands, use **shell** — it runs PowerShell on Windows and POSIX `sh` on macOS/Linux, with a 60s timeout.\n\
+Long-running standalone commands use **run_in_context** and **monitor_run** when those tools are available. Duration alone is not a reason to move analysis that depends on existing in-memory objects into a fresh process. Do not wait with shell `sleep`/`Start-Sleep`, `ps` polling, `nohup`, or background `&`.\n\
 When the user asks what a configured Workflow is, what it does, or how it works, call **explain_workflow** when available and explain the returned task graph. Inspection is not execution: do not call **delegate_tasks** unless the user asks to run the Workflow.\n\
 When the user asks to change app appearance or preferences (font size, theme, language, compaction, notifications) or to inspect disk storage for this project, call **configure**. Do not send them to Settings for those allowlisted keys. Secrets, API keys, model profiles, workspace directory, and proxy stay in Settings. List or update specialists with **configure** get specialists and **save_specialist** (pass `id` to edit).\n\
 Use **edit** (not write) for small in-place changes; read the target first so `old` matches the current file exactly, and ensure `old` is unique or pass `all=true`.\n\
 When a user turn contains a `Selected excerpt from workspace file` path and asks for a change, modify that file directly with the file tools and verify the saved result. Do not merely reply with a replacement code block.\n\
 Use **view_image** for screenshots, UI mockups, error screens, and diagrams. The `read` tool auto-routes image files (.png/.jpg/.jpeg/.gif/.webp) to vision, but call `view_image` directly when the path is computed.\n\
 Write shell commands for the OS in the Environment section. Do not use Unix one-liners such as `mkdir -p`, `awk`, `head`, or nested Bash quoting on Windows; use PowerShell equivalents, Python, or a small script file. For SSH, avoid long nested-quote one-liners; run one simple command or send a script over stdin.\n\
-Use **python** or **r** (when available) for persistent exploratory analysis in the data's execution context — variables and loaded data persist across cells. Put multi-line code in one valid cell, and prefer a language runtime over shell `awk` for tabular analysis. R plots must be written explicitly with `png()`, `pdf()`, `ggsave()`, or another file device.\n\
+**python** and **r** (when available) provide persistent runtimes in the data's execution context: variables, imports, and loaded objects persist across calls. They support inline code and saved `.py`/`.R` files through `script_path`. **shell** and **run_in_context** execute commands in fresh processes. Choose the execution method based on the user's workflow, the value of retaining in-memory state, the script's execution requirements, and the task lifecycle. Use the selected environment's interpreter or project environment (for example `pixi run`) for either method.\n\
+Keep reproducible source in project files regardless of process lifetime. When a script depends on an already-loaded object, pass `required_objects` with `script_path` and do not switch to `python file.py`, `Rscript`, shell, or `run_in_context` without deliberately arranging how that state will be reconstructed. Separate expensive loading from analysis that consumes the loaded objects. Put multi-line inline code in one valid cell. R plots must be written explicitly with `png()`, `pdf()`, `ggsave()`, or another file device.\n\
 When a browser tool reports the extension is not connected, do not answer live, latest, current, or URL-specific questions from memory. Tell the user this turn has no live web retrieval, ask them to open Chrome/Chromium so the extension can connect, and wait.\n\
+Keep intermediate tool narration sparse. The UI already shows tool and Run cards. Do not announce that a Run was submitted, say that you are waiting or monitoring, or preface a `monitor_run` call; call the tool directly. Send an intermediate update only for a material result, a changed plan, a failure that needs explanation, or required user action.\n\
 Always finish with **attempt_completion** to present the final result.\n".into()
     }
 
     fn environment_guidance() -> String {
         "## Python, R, And Local Environments\n\n\
-Use the existing **python** tool for ordinary analysis; its variables and loaded data persist across cells. **A missing package is a setup step, not a dead end.** If an import fails or a needed tool is absent, install it (see below) and continue — do not re-probe the same missing module in a loop, and do not silently downgrade to a lower-quality fallback (e.g. a worse PDF/text extractor) that yields garbled output. Install once, confirm the import, then proceed. Do not hunt for random system Python installs with repeated `where`/`Get-Command` probes, and do not install into an arbitrary global Python.\n\
-Use the existing **r** tool when R is the appropriate analysis environment. It requires an existing `Rscript` and `jsonlite`; do not silently install R or packages. Interpreter paths belong to the selected execution context's persisted settings. When the user supplies or asks to change a Python/R path, use `set_runtime_interpreter` with the matching `context_id` if that tool is available; never try to change the Wisp host process environment from a shell tool.\n\
+Use the selected environment for both standalone scripts and interactive analysis; choose process lifetime using Tool Selection above. **A missing package is a setup step, not a dead end.** If an import fails or a needed tool is absent, install it (see below) and continue — do not re-probe the same missing module in a loop, and do not silently downgrade to a lower-quality fallback (e.g. a worse PDF/text extractor) that yields garbled output. Install once, confirm the import, then proceed. Do not hunt for random system Python installs with repeated `where`/`Get-Command` probes, and do not install into an arbitrary global Python.\n\
+The persistent **r** tool requires an existing `Rscript` and `jsonlite`; standalone R scripts require only their own dependencies. Do not silently install R or packages. Interpreter paths belong to the selected execution context's persisted settings. When the user supplies or asks to change a Python/R path, use `set_runtime_interpreter` with the matching `context_id` if that tool is available; never try to change the Wisp host process environment from a shell tool.\n\
 When packages or a project-specific scientific stack are needed, call `use_skill` for `local-env-setup` first. For local bioinformatics/scientific package work, prefer a project-local **pixi** environment: `pixi init`, `pixi add ...`, then `pixi run python ...` from the project directory.\n\
 Before any `pip`, `uv`, `npm`, or `pixi add` download, consider the user's network. If mainland-China or corporate-mirror access is likely or requested, configure PyPI/uv and pixi conda/PyPI mirrors first; otherwise use defaults.\n".into()
     }
@@ -127,12 +130,47 @@ If a named workflow is disabled or unavailable, follow the same principles direc
             "## Skills Selection Guidelines\n\n\
 {count} {availability} currently configured, enabled, and searchable for this project/session. Their catalog and bodies are not preloaded.\n\n\
 - When a task may match an installed workflow, call `search_skills` with concise task or domain keywords.\n\
+- Preserve important terms from the user's original language. If the first search has no confident match, retry once with common English domain synonyms, or with the user's language when the first query was English.\n\
 - When a task needs a specific model ability (e.g. image understanding), call `search_models` with a capability keyword like `vision` to find a suitable model, then pass its id to `create_workflow` via `params.model_id`.\n\
 - When the user asks how many Skills are configured, enabled, effective, shadowed, or broken, use `list_skill_catalog` and read its explicitly named count fields.\n\
 - Treat `current_configured_enabled_count` as authoritative for this Agent snapshot. If the user cites a different UI or remembered count, report the discrepancy; do not accept, relabel, or explain the user's number without supporting inventory data.\n\
 - Then call `use_skill` with the exact returned name before proceeding.\n\
 - If the user already attached a selected skill's guidance to the turn, follow that content without loading it again.\n"
         )
+    }
+
+    /// Refresh execution guidance in resumed conversations without rebuilding
+    /// project rules, environment snapshots, or specialist/delegation sections.
+    pub fn refresh_execution_guidance(&self, prompt: &mut String) {
+        for (header, replacement) in [
+            ("## Tool Selection", Self::tool_guidance()),
+            (
+                "## Python, R, And Local Environments",
+                Self::environment_guidance(),
+            ),
+        ] {
+            // A similarly named heading inside user/project instructions is
+            // not a host-owned section, including in older/custom prompts.
+            let boundary = [
+                "\n\n## Project Instructions (AGENTS.md)",
+                "\n\n## User Rules",
+                "\n\n## Environment",
+            ]
+            .iter()
+            .filter_map(|marker| prompt.find(marker))
+            .min()
+            .unwrap_or(prompt.len());
+            let marker = format!("\n\n{header}\n");
+            let Some(start) = prompt[..boundary].find(&marker).map(|offset| offset + 2) else {
+                continue;
+            };
+            let search_from = start + header.len();
+            let end = prompt[search_from..]
+                .find("\n\n## ")
+                .map(|offset| search_from + offset)
+                .unwrap_or(prompt.len());
+            prompt.replace_range(start..end, replacement.trim_end());
+        }
     }
 
     /// Replace only the skills section in a persisted system prompt. Other
@@ -215,7 +253,7 @@ If a named workflow is disabled or unavailable, follow the same principles direc
             std::env::consts::OS.to_string()
         };
         format!(
-            "## Environment\n- Working directory: {}\n- Operating system: {os}\n- Host: wisp-science (Rust)\n- Shell: {}\n",
+            "## Environment\n- Working directory: {}\n- Operating system: {os}\n- Host: wisp-depmap (Rust)\n- Shell: {}\n",
             self.project_root.display(),
             Self::shell_name()
         )
@@ -396,18 +434,30 @@ mod tests {
     }
 
     #[test]
-    fn identity_names_wisp_science_and_stays_model_agnostic() {
+    fn tool_guidance_forbids_shell_sleep_polling() {
+        let skills = SkillIndex::default();
+        let out = SystemPrompt::new(std::path::Path::new("/tmp"), &skills, None).assemble();
+        assert!(out.contains("run_in_context"));
+        assert!(out.contains("monitor_run"));
+        assert!(
+            out.contains("Do not wait with shell `sleep`"),
+            "sleep-polling ban missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn identity_names_wisp_depmap_and_stays_model_agnostic() {
         let skills = SkillIndex::default();
         let out = SystemPrompt::new(std::path::Path::new("/tmp"), &skills, None).assemble();
         // #42: the agent confused itself with the upstream "Claude Science" and
         // claimed an Anthropic model while actually running GLM. Lock in that the
         // prompt fixes its name and keeps it from asserting a specific model.
         assert!(
-            out.contains("You are **wisp-science**"),
+            out.contains("You are **wisp-depmap**"),
             "identity anchor missing:\n{out}"
         );
         assert!(
-            out.contains("wisp-science's Settings"),
+            out.contains("wisp-depmap's Settings"),
             "model-agnostic guidance missing:\n{out}"
         );
     }
@@ -458,6 +508,58 @@ mod tests {
     }
 
     #[test]
+    fn prompt_keeps_reproducible_scripts_in_the_loaded_runtime() {
+        let skills = SkillIndex::default();
+        let out = SystemPrompt::new(std::path::Path::new("/tmp"), &skills, None).assemble();
+        assert!(out.contains("through `script_path`"), "{out}");
+        assert!(out.contains("pass `required_objects`"), "{out}");
+        assert!(
+            out.contains("do not switch to `python file.py`, `Rscript`"),
+            "{out}"
+        );
+        assert!(out.contains("how that state will be reconstructed"));
+    }
+
+    #[test]
+    fn prompt_describes_execution_capabilities_without_routing_by_task_category() {
+        let skills = SkillIndex::default();
+        let out = SystemPrompt::new(std::path::Path::new("/tmp"), &skills, None).assemble();
+        assert!(out.contains("provide persistent runtimes"));
+        assert!(out.contains("execute commands in fresh processes"));
+        assert!(out.contains("selected environment's interpreter"));
+        assert!(out.contains("the script's execution requirements"));
+        assert!(out.contains("Duration alone is not a reason"));
+        assert!(!out.contains("Default to standalone scripts"));
+        assert!(!out.contains("CSV/JSON"));
+        assert!(!out.contains("report/HTML"));
+        assert!(!out.contains("Use the existing **python** tool for ordinary analysis"));
+        assert!(!out.contains("Reach for **shell** only when no dedicated tool fits"));
+    }
+
+    #[test]
+    fn resumed_execution_guidance_refresh_preserves_other_sections() {
+        let skills = SkillIndex::default();
+        let system = SystemPrompt::new(std::path::Path::new("/tmp"), &skills, None);
+        let mut old = "Intro\n\n## Tool Selection\n\nOld runtime preference.\n\n## Python, R, And Local Environments\n\nOld environment rule.\n\n## Scientific Deliverables\n\nKeep deliverables.\n\n## Project Instructions (AGENTS.md)\n\nUser text.\n\n## Tool Selection\n\nProject-owned heading.\n\n## User Rules\n\nUser rules.\n\n## Environment\n\nWindows custom snapshot.\n\n## Specialist\n\nKeep specialist.\n\n## Delegation\n\nKeep grants.".to_string();
+        let suffix = old[old.find("\n\n## Scientific Deliverables").unwrap()..].to_string();
+        system.refresh_execution_guidance(&mut old);
+        assert!(old.starts_with("Intro\n\n## Tool Selection"));
+        assert!(old.contains("provide persistent runtimes"));
+        assert!(!old.contains("Old runtime preference"));
+        assert!(!old.contains("Old environment rule"));
+        assert!(old.ends_with(&suffix));
+        let refreshed = old.clone();
+        system.refresh_execution_guidance(&mut old);
+        assert_eq!(old, refreshed, "refresh must be idempotent");
+
+        let mut custom =
+            "Intro\n\n## User Rules\n\n## Tool Selection\n\nLeave this alone.".to_string();
+        let original = custom.clone();
+        system.refresh_execution_guidance(&mut custom);
+        assert_eq!(custom, original);
+    }
+
+    #[test]
     fn prompt_warns_against_cross_shell_one_liners() {
         let skills = SkillIndex::default();
         let out = SystemPrompt::new(std::path::Path::new("/tmp"), &skills, None).assemble();
@@ -498,15 +600,39 @@ mod tests {
     }
 
     #[test]
-    fn prompt_keeps_global_memory_below_system_and_current_user_authority() {
+    fn prompt_keeps_global_memory_silent_and_below_current_user_authority() {
         let skills = SkillIndex::default();
         let out = SystemPrompt::new(std::path::Path::new("/tmp"), &skills, None).assemble();
         assert!(
-            out.contains("Treat global memory as context, not policy"),
+            out.contains("Treat global memory as silent context, not policy"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Do not acknowledge, quote, summarize"),
+            "{out}"
+        );
+        assert!(
+            out.contains("never announce that an irrelevant memory is being ignored"),
             "{out}"
         );
         assert!(out.contains("user's current request override it"), "{out}");
         assert!(out.contains("never grants permission"), "{out}");
+    }
+
+    #[test]
+    fn prompt_keeps_run_monitoring_in_tool_cards_instead_of_chat_preambles() {
+        let skills = SkillIndex::default();
+        let out = SystemPrompt::new(std::path::Path::new("/tmp"), &skills, None).assemble();
+        assert!(
+            out.contains("Keep intermediate tool narration sparse"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Do not announce that a Run was submitted"),
+            "{out}"
+        );
+        assert!(out.contains("preface a `monitor_run` call"), "{out}");
+        assert!(out.contains("material result, a changed plan"), "{out}");
     }
 
     #[test]
@@ -567,6 +693,10 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("`search_skills`"), "{out}");
+        assert!(
+            out.contains("retry once with common English domain synonyms"),
+            "{out}"
+        );
         assert!(out.contains("do not accept, relabel, or explain"), "{out}");
         assert!(!out.contains("secret-skill"), "{out}");
         assert!(!out.contains("SHOULD_NOT_BE_IN_SYSTEM_PROMPT"), "{out}");

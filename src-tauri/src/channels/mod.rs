@@ -1,17 +1,21 @@
 //! External IM channels (Feishu bot, WeChat iLink bot).
 //!
 //! Inbound text from a channel drives a normal agent session — the turn runs
-//! through the same `send_message` path the UI uses, so history, tools,
-//! approvals, and persistence all behave identically and the conversation is
-//! visible in the desktop app. The final assistant message is sent back to
-//! the IM chat when the turn completes.
+//! through the same `send_message` path the UI uses, so history, tools, and
+//! persistence behave the same way and the conversation is visible in the
+//! desktop app. The final assistant message is sent back to the IM chat when
+//! the turn completes. Feishu additionally requires a desktop-confirmed owner
+//! before any inbound message may enter that path, and IM turns force Ask on
+//! mutating tools even when the desktop policy defaults to Allow.
 //!
-//! Desktop, Feishu, and WeChat share one durable last-message route. An ordinary
-//! IM message always continues the session that most recently accepted a user
-//! message on any of those surfaces; `/project`, `/session`, and `/new` can
-//! explicitly move that shared target. Non-secret config lives in SQLite
-//! settings; the Feishu app secret and WeChat bot token live in the keyring.
+//! Desktop, Feishu, and WeChat share one durable **IM target project**. An
+//! ordinary IM message continues that project's current IM session; `/project`,
+//! `/session`, and `/new` move the IM target. A desktop send only updates that
+//! project's last session — it never steals the IM project. Non-secret config
+//! lives in SQLite settings; the Feishu app secret and WeChat bot token live
+//! in the keyring.
 
+use crate::workspace_surface::WorkspaceManager;
 pub mod feishu;
 pub mod feishu_card;
 pub mod feishu_registration;
@@ -23,16 +27,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::watch;
 use wisp_store::secrets::Secret;
 use wisp_store::Store;
 
 const FEISHU_SECRET: &str = "feishu_app_secret";
+const FEISHU_OWNER_KEY: &str = "feishu_owner_binding";
+const FEISHU_PENDING_OWNER_KEY: &str = "feishu_pending_owner";
 const WEIXIN_TOKEN_SECRET: &str = "weixin_bot_token";
 /// ponytail: single reply cap for both channels; per-channel limits if an API
 /// ever rejects shorter messages.
 const REPLY_MAX_CHARS: usize = 8000;
+const APPROVAL_PREVIEW_MAX_CHARS: usize = 1200;
+const APPROVAL_CODE_CHARS: usize = 8;
 
 // ------------------------------------------------------------------- manager
 
@@ -164,6 +172,96 @@ async fn load_weixin_binding(store: &Store) -> Option<weixin::Binding> {
     serde_json::from_str(&get_setting(store, "weixin_binding").await).ok()
 }
 
+fn emit_channels_updated(app: &AppHandle) {
+    let _ = app.emit("channels-updated", ());
+}
+
+async fn load_feishu_owner(store: &Store) -> Option<String> {
+    let raw = get_setting(store, FEISHU_OWNER_KEY).await;
+    let binding: feishu::OwnerBinding = serde_json::from_str(&raw).ok()?;
+    let open_id = binding.open_id.trim();
+    (!open_id.is_empty()).then(|| open_id.to_string())
+}
+
+async fn load_feishu_pending_owner(store: &Store) -> Option<String> {
+    let open_id = get_setting(store, FEISHU_PENDING_OWNER_KEY).await;
+    let open_id = open_id.trim();
+    (!open_id.is_empty()).then(|| open_id.to_string())
+}
+
+async fn save_feishu_owner(store: &Store, open_id: &str) -> Result<(), String> {
+    let open_id = open_id.trim();
+    if open_id.is_empty() {
+        return Err("所有者 open_id 不能为空。".into());
+    }
+    let binding = feishu::OwnerBinding {
+        open_id: open_id.to_string(),
+        bound_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let json = serde_json::to_string(&binding).map_err(|error| error.to_string())?;
+    store
+        .set_setting(FEISHU_OWNER_KEY, &json)
+        .await
+        .map_err(|error| error.to_string())?;
+    store
+        .set_setting(FEISHU_PENDING_OWNER_KEY, "")
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn clear_feishu_owner(store: &Store) -> Result<(), String> {
+    store
+        .set_setting(FEISHU_OWNER_KEY, "")
+        .await
+        .map_err(|error| error.to_string())?;
+    store
+        .set_setting(FEISHU_PENDING_OWNER_KEY, "")
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn save_feishu_pending_owner(store: &Store, open_id: &str) -> Result<(), String> {
+    let open_id = open_id.trim();
+    if open_id.is_empty() {
+        return Ok(());
+    }
+    if load_feishu_pending_owner(store).await.as_deref() == Some(open_id) {
+        return Ok(());
+    }
+    store
+        .set_setting(FEISHU_PENDING_OWNER_KEY, open_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Gate one inbound Feishu sender. `None` means the message may enter the
+/// agent path; `Some(reply)` is sent back and the turn is not started.
+pub(crate) async fn authorize_feishu_sender(
+    app: &AppHandle,
+    sender_open_id: &str,
+) -> Option<String> {
+    let state = app.state::<AppState>();
+    let owner = load_feishu_owner(&state.store).await;
+    match feishu::sender_decision(sender_open_id, owner.as_deref()) {
+        feishu::SenderDecision::Allow => None,
+        feishu::SenderDecision::Reject => Some(feishu::NON_OWNER_REPLY.to_string()),
+        feishu::SenderDecision::Unbound => {
+            if let Err(error) = save_feishu_pending_owner(&state.store, sender_open_id).await {
+                tracing::warn!(
+                    target: "wisp",
+                    channel = "feishu",
+                    %error,
+                    "failed to record pending Feishu owner"
+                );
+            }
+            emit_channels_updated(app);
+            Some(feishu::UNBOUND_REPLY.to_string())
+        }
+    }
+}
+
 // --------------------------------------------- live agent progress observers
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,6 +274,7 @@ pub(crate) enum ProgressEvent {
         ok: bool,
         duration_ms: u64,
     },
+    ApprovalRequested(crate::ConfirmRequest),
 }
 
 type ProgressSubscribers =
@@ -296,6 +395,17 @@ pub(crate) fn publish_agent_event(event: &crate::AgentEvent) {
         ),
         _ => return,
     };
+    publish_progress_event(frame_id, progress);
+}
+
+pub(crate) fn publish_approval_request(request: &crate::ConfirmRequest) {
+    publish_progress_event(
+        &request.frame_id,
+        ProgressEvent::ApprovalRequested(request.clone()),
+    );
+}
+
+fn publish_progress_event(frame_id: &str, progress: ProgressEvent) {
     let Some(registry) = PROGRESS_SUBSCRIBERS.get() else {
         return;
     };
@@ -318,6 +428,106 @@ fn truncate_reply(text: &str, max_chars: usize) -> String {
     format!("{cut}\n……(内容过长已截断,完整内容请在桌面端查看)")
 }
 
+fn approval_code(approval_id: &str) -> String {
+    approval_id
+        .chars()
+        .take(APPROVAL_CODE_CHARS)
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+fn approval_preview(request: &crate::ConfirmRequest) -> String {
+    let raw = if request.preview.trim().is_empty() {
+        request.message.trim()
+    } else {
+        request.preview.trim()
+    };
+    if raw.chars().count() <= APPROVAL_PREVIEW_MAX_CHARS {
+        raw.to_string()
+    } else {
+        format!(
+            "{}\n……(审批详情过长已截断)",
+            raw.chars()
+                .take(APPROVAL_PREVIEW_MAX_CHARS)
+                .collect::<String>()
+        )
+    }
+}
+
+pub(super) fn render_approval_request(request: &crate::ConfirmRequest) -> String {
+    let code = approval_code(&request.approval_id);
+    let tool = if request.tool.trim().is_empty() {
+        "操作"
+    } else {
+        request.tool.trim()
+    };
+    let preview = approval_preview(request);
+    let detail = if preview.is_empty() {
+        String::new()
+    } else {
+        format!("\n详情:\n{preview}\n")
+    };
+    format!(
+        "⚠️ Wisp 等待审批\n\n编号: {code}\n会话: {}\n工具: {tool}\n{detail}\n回复:\n/approve {code}\n/reject {code} 原因",
+        short_id(&request.frame_id)
+    )
+}
+
+async fn pending_approval_requests(state: &AppState) -> Vec<crate::ConfirmRequest> {
+    let mut requests = crate::approval_commands::pending_confirmation_requests(state);
+    requests.extend(crate::acp::pending_remote_permission_requests(state).await);
+    requests.sort_by(|left, right| left.approval_id.cmp(&right.approval_id));
+    requests
+}
+
+async fn render_pending_approvals(state: &AppState) -> String {
+    let requests = pending_approval_requests(state).await;
+    if requests.is_empty() {
+        return "当前没有待审批请求。".into();
+    }
+    let mut text = format!("当前有 {} 个待审批请求:\n", requests.len());
+    for request in requests {
+        text.push('\n');
+        text.push_str(&render_approval_request(&request));
+        text.push('\n');
+    }
+    truncate_reply(text.trim_end(), REPLY_MAX_CHARS)
+}
+
+async fn respond_text_approval(
+    app: &AppHandle,
+    state: &AppState,
+    selector: &str,
+    approved: bool,
+    feedback: Option<String>,
+) -> Result<crate::approval_commands::RemoteConfirmationResolution, String> {
+    let selector = selector.trim().to_ascii_lowercase();
+    if selector.len() < 6 || !selector.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err("审批编号至少需要 6 位十六进制字符。".into());
+    }
+    let native = crate::approval_commands::pending_confirmation_requests(state);
+    let acp = crate::acp::pending_remote_permission_requests(state).await;
+    let native_matches = native
+        .iter()
+        .filter(|request| request.approval_id.starts_with(&selector))
+        .count();
+    let acp_matches = acp
+        .iter()
+        .filter(|request| request.approval_id.starts_with(&selector))
+        .count();
+    match native_matches + acp_matches {
+        0 => Err("未找到该待审批请求；它可能已经处理或失效。".into()),
+        1 if native_matches == 1 => {
+            crate::approval_commands::respond_remote_confirmation(
+                state, &selector, approved, feedback,
+            )
+            .await
+        }
+        1 => crate::acp::respond_remote_permission(state, app, &selector, approved).await,
+        _ => Err("审批编号前缀不唯一，请输入更多位。".into()),
+    }
+}
+
 // ------------------------------------------------ shared last-message route
 
 const LAST_MESSAGE_ROUTE_KEY: &str = "channel_last_message_route";
@@ -325,14 +535,18 @@ const LAST_MESSAGE_ROUTE_KEY: &str = "channel_last_message_route";
 /// accepted-send updates across the desktop, Feishu, and WeChat.
 static ROUTE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// The shared routing target. `session_id=None` is an explicit `/project` or
-/// `/new` selection: the next ordinary message creates a session there.
+/// The IM routing target plus the last accepted send per project. `project_id`
+/// / `session_id` are the Feishu/WeChat destination; desktop sends only write
+/// `last_session_by_project`. `session_id=None` is an explicit `/project` or
+/// `/new` selection: the next ordinary IM message creates a session there.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 struct SharedRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    last_session_by_project: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -359,9 +573,9 @@ async fn route_set_unlocked(store: &Store, route: &SharedRoute) -> Result<(), St
         .map_err(|error| error.to_string())
 }
 
-/// Validate the persisted target. On first run after upgrading, recover the
-/// most recently inserted user message from the transcript store. This is only
-/// a cold-start fallback; every subsequent accepted send writes the exact route.
+/// Validate the persisted IM target. Legacy `{project_id, session_id}` JSON is
+/// kept as the IM destination and copied into `last_session_by_project`. A
+/// desktop send never becomes the IM project.
 async fn validated_route_unlocked(store: &Store) -> Result<SharedRoute, String> {
     let original = route_get_unlocked(store).await;
     let mut route = original.clone();
@@ -371,10 +585,30 @@ async fn validated_route_unlocked(store: &Store) -> Result<SharedRoute, String> 
             .await
             .map_err(|error| error.to_string())?
         {
-            Some(owner) => route.project_id = Some(owner),
+            Some(owner) => {
+                route.project_id = Some(owner.clone());
+                route
+                    .last_session_by_project
+                    .entry(owner)
+                    .or_insert_with(|| session_id.to_string());
+            }
             None => {
-                route.project_id = None;
                 route.session_id = None;
+                if let Some(project_id) = route.project_id.as_deref() {
+                    if let Some(fallback) = route.last_session_by_project.get(project_id).cloned() {
+                        if store
+                            .frame_project_id(&fallback)
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .as_deref()
+                            == Some(project_id)
+                        {
+                            route.session_id = Some(fallback);
+                        } else {
+                            route.last_session_by_project.remove(project_id);
+                        }
+                    }
+                }
             }
         }
     }
@@ -388,18 +622,6 @@ async fn validated_route_unlocked(store: &Store) -> Result<SharedRoute, String> 
             {
                 route.project_id = None;
             }
-        }
-    }
-    if route.project_id.is_none() && route.session_id.is_none() {
-        if let Some((session_id, project_id)) = store
-            .last_user_message_session()
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            route = SharedRoute {
-                project_id: Some(project_id),
-                session_id: Some(session_id),
-            };
         }
     }
     if route != original {
@@ -419,9 +641,9 @@ async fn set_route(store: &Store, route: &SharedRoute) -> Result<(), String> {
 }
 
 /// Called by the shared desktop/channel `send_message` path after validation,
-/// but before waiting for the destination session's turn lock. A queued user
-/// message therefore changes the route immediately, matching send order rather
-/// than eventual execution order.
+/// but before waiting for the destination session's turn lock. Desktop and IM
+/// both record that project's last session; only IM slash commands change the
+/// IM target project.
 pub(crate) async fn record_last_message_session(
     store: &Store,
     frame_id: &str,
@@ -432,33 +654,30 @@ pub(crate) async fn record_last_message_session(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("Session '{frame_id}' no longer exists."))?;
-    route_set_unlocked(
-        store,
-        &SharedRoute {
-            project_id: Some(project_id),
-            session_id: Some(frame_id.to_string()),
-        },
-    )
-    .await
+    let mut route = validated_route_unlocked(store).await?;
+    route
+        .last_session_by_project
+        .insert(project_id, frame_id.to_string());
+    route_set_unlocked(store, &route).await
 }
 
-/// Resolve an ordinary IM message to the shared target. Holding `ROUTE_LOCK`
+/// Resolve an ordinary IM message to the IM target. Holding `ROUTE_LOCK`
 /// across validation and creation makes the no-history case linearizable: a
 /// Feishu message and a WeChat message arriving together reuse one new frame.
-async fn resolve_message_session(
-    store: &Store,
-    default_project_id: &str,
-) -> Result<String, String> {
+async fn resolve_message_session(store: &Store) -> Result<String, String> {
     let _route_guard = ROUTE_LOCK.lock().await;
     let mut route = validated_route_unlocked(store).await?;
     if route.project_id.is_none() {
-        route.project_id = Some(default_project_id.to_string());
+        return Err("还没有 IM 目标项目。请先发送 /project 选择。".into());
     }
     if route.session_id.is_none() {
-        let project_id = route.project_id.as_deref().unwrap_or_default();
-        let frame_id = crate::create_session_frame(store, project_id)
+        let project_id = route.project_id.clone().unwrap_or_default();
+        let frame_id = crate::create_session_frame(store, &project_id)
             .await
             .map_err(|error| format!("创建会话失败: {error}"))?;
+        route
+            .last_session_by_project
+            .insert(project_id, frame_id.clone());
         route.session_id = Some(frame_id);
         // Persist before running the turn so a provider error does not make a
         // retry fan out into another empty session.
@@ -629,7 +848,7 @@ async fn project_name(store: &Store, project_id: &str) -> String {
 
 async fn route_status_text(store: &Store, route: &SharedRoute) -> String {
     let Some(project_id) = route.project_id.as_deref() else {
-        return "还没有最近发言会话。下一条普通消息会使用桌面端当前项目，也可以先发送 /project 选择。".into();
+        return "还没有 IM 目标项目。下一条普通消息前请先发送 /project 选择。".into();
     };
     let project = project_name(store, project_id).await;
     let session = match route.session_id.as_deref() {
@@ -645,7 +864,7 @@ async fn route_status_text(store: &Store, route: &SharedRoute) -> String {
         }
         None => "新会话（下一条普通消息创建）".into(),
     };
-    format!("共享目标项目: {project}\n最近发言会话: {session}")
+    format!("IM 目标项目: {project}\n最近 IM 会话: {session}")
 }
 
 /// The turn's answer for IM delivery. Agent turns normally finish via the
@@ -665,7 +884,7 @@ async fn last_assistant_text(store: &Store, frame_id: &str) -> Option<String> {
         .find(|t| !t.trim().is_empty())
 }
 
-const HELP_TEXT: &str = "可用命令:\n/status — 查看共享的最近发言会话\n/project — 列出项目\n/project <序号|名称|ID> — 切换项目\n/session — 列出当前项目的最近会话\n/session <序号|标题|ID> — 切换会话\n/new — 在当前项目开启新会话\n/stop — 停止当前任务\n/help — 显示本帮助\n\n桌面端、微信和飞书共用同一个路由目标：普通消息始终继续最近一次实际发送过用户消息的 session。/project、/session 和 /new 会显式切换这个共享目标。";
+const HELP_TEXT: &str = "可用命令:\n/status — 查看 IM 目标项目和会话\n/project — 列出项目\n/project <序号|名称|ID> — 切换 IM 目标项目\n/session — 列出当前 IM 项目的最近会话\n/session <序号|标题|ID> — 切换 IM 会话\n/new — 在当前 IM 项目开启新会话\n/approval — 查看待审批请求（微信）\n/approve <编号> — 批准一次（微信）\n/reject <编号> [原因] — 拒绝（微信）\n/stop — 停止当前任务\n/help — 显示本帮助\n\n微信和飞书共用同一个 IM 目标项目。桌面端在某个项目里发言只会更新该项目的最近会话，不会把 IM 目标抢走。/project、/session 和 /new 会显式切换这个 IM 目标。";
 
 /// Route one inbound IM text: chat commands are handled locally, everything
 /// else drives an agent turn. Returns the reply to send back (may be empty).
@@ -701,6 +920,66 @@ pub(crate) async fn handle_inbound_observed(
     let argument = parts.next().unwrap_or_default().trim();
     match command.as_str() {
         "/help" => return HELP_TEXT.to_string(),
+        "/approval" | "/approvals" => {
+            if channel != "weixin" {
+                return "文本审批命令目前仅支持绑定 owner 的微信一对一会话。".into();
+            }
+            return render_pending_approvals(&state).await;
+        }
+        "/approve" => {
+            if channel != "weixin" {
+                return "文本审批命令目前仅支持绑定 owner 的微信一对一会话。".into();
+            }
+            let mut approval = argument.split_whitespace();
+            let Some(selector) = approval.next() else {
+                return "用法: /approve <审批编号>".into();
+            };
+            if approval.next().is_some() {
+                return "用法: /approve <审批编号>。微信审批目前只允许本次。".into();
+            }
+            return match respond_text_approval(app, &state, selector, true, None).await {
+                Ok(resolved) => format!(
+                    "已批准 {}，会话 {} 将继续执行。",
+                    approval_code(&resolved.approval_id),
+                    short_id(&resolved.frame_id)
+                ),
+                Err(error) => format!("批准失败: {error}"),
+            };
+        }
+        "/reject" => {
+            if channel != "weixin" {
+                return "文本审批命令目前仅支持绑定 owner 的微信一对一会话。".into();
+            }
+            let mut rejection = argument.splitn(2, char::is_whitespace);
+            let selector = rejection.next().unwrap_or_default().trim();
+            if selector.is_empty() {
+                return "用法: /reject <审批编号> [原因]".into();
+            }
+            let feedback = rejection
+                .next()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let feedback_supplied = feedback.is_some();
+            return match respond_text_approval(app, &state, selector, false, feedback).await {
+                Ok(resolved) => {
+                    let note = if feedback_supplied
+                        && resolved.source
+                            == crate::approval_commands::RemoteConfirmationSource::Acp
+                    {
+                        " ACP 协议不支持附带拒绝原因。"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "已拒绝 {}，会话 {} 将收到拒绝结果。{note}",
+                        approval_code(&resolved.approval_id),
+                        short_id(&resolved.frame_id)
+                    )
+                }
+                Err(error) => format!("拒绝失败: {error}"),
+            };
+        }
         "/status" => {
             return match validated_route(&state.store).await {
                 Ok(route) => route_status_text(&state.store, &route).await,
@@ -735,7 +1014,7 @@ pub(crate) async fn handle_inbound_observed(
                 return format!("切换共享路由失败: {error}");
             }
             return format!(
-                "共享目标已切换到项目“{}”。下一条微信或飞书普通消息会在这里创建新会话；也可发送 /session 选择已有会话。",
+                "IM 目标已切换到项目“{}”。下一条微信或飞书普通消息会在这里创建新会话；也可发送 /session 选择已有会话。",
                 selected.name
             );
         }
@@ -745,7 +1024,7 @@ pub(crate) async fn handle_inbound_observed(
                 Err(error) => return format!("读取共享路由失败: {error}"),
             };
             if route.project_id.is_none() {
-                route.project_id = Some(state.active("main").id);
+                return "还没有 IM 目标项目。请先发送 /project 选择。".into();
             }
             if argument.eq_ignore_ascii_case("new") {
                 route.session_id = None;
@@ -788,7 +1067,7 @@ pub(crate) async fn handle_inbound_observed(
                 return format!("切换共享路由失败: {error}");
             }
             return format!(
-                "共享目标已切换到会话“{}” · {}。后续微信和飞书消息都会继续这个会话。",
+                "IM 目标已切换到会话“{}” · {}。后续微信和飞书消息都会继续这个会话。",
                 selected.title,
                 short_id(&selected.id)
             );
@@ -799,7 +1078,7 @@ pub(crate) async fn handle_inbound_observed(
                 Err(error) => return format!("读取共享路由失败: {error}"),
             };
             if route.project_id.is_none() {
-                route.project_id = Some(state.active("main").id);
+                return "还没有 IM 目标项目。请先发送 /project 选择。".into();
             }
             route.session_id = None;
             let project = project_name(
@@ -834,11 +1113,11 @@ pub(crate) async fn handle_inbound_observed(
         return format!("未知命令“{command}”。发送 /help 查看可用命令。");
     }
 
-    let Some(window) = app.get_webview_window("main") else {
+    let Some(window) = app.workspace_surface("main") else {
         return "桌面端主窗口不可用,无法处理消息。".to_string();
     };
     // Resolve and, when needed, create the shared target atomically.
-    let session_id = match resolve_message_session(&state.store, &state.active("main").id).await {
+    let session_id = match resolve_message_session(&state.store).await {
         Ok(session_id) => session_id,
         Err(error) => return format!("路由消息失败: {error}"),
     };
@@ -847,10 +1126,10 @@ pub(crate) async fn handle_inbound_observed(
     // before the long agent turn so a later `/stop` can interrupt it. The
     // destination runtime serializes subsequent turns in this same session.
     drop(_turn_guard);
-    let result = crate::send_message(
-        app.state(),
+    let result = crate::send_message_inner(
+        state.inner(),
         app.clone(),
-        window,
+        window.label(),
         Some(session_id.clone()),
         text.to_string(),
         None,
@@ -860,6 +1139,8 @@ pub(crate) async fn handle_inbound_observed(
         progress.as_ref().map(PendingProgress::id),
         None,
         None,
+        None,
+        crate::TurnOrigin::Im,
     )
     .await;
     match result {
@@ -884,6 +1165,8 @@ pub struct ChannelsStatus {
     pub feishu_has_secret: bool,
     pub feishu_state: String,
     pub feishu_detail: String,
+    pub feishu_owner_open_id: String,
+    pub feishu_pending_owner_open_id: String,
     pub weixin_enabled: bool,
     pub weixin_bound: bool,
     pub weixin_state: String,
@@ -908,6 +1191,10 @@ pub(crate) async fn channels_status(
         feishu_has_secret,
         feishu_state: feishu.state,
         feishu_detail: feishu.detail,
+        feishu_owner_open_id: load_feishu_owner(&state.store).await.unwrap_or_default(),
+        feishu_pending_owner_open_id: load_feishu_pending_owner(&state.store)
+            .await
+            .unwrap_or_default(),
         weixin_enabled: get_setting(&state.store, "weixin_enabled").await == "true",
         weixin_bound: load_weixin_binding(&state.store).await.is_some(),
         weixin_state: weixin.state,
@@ -970,6 +1257,8 @@ pub struct FeishuBindStart {
     pub flow_id: String,
     /// data: URL of the registration verification QR image.
     pub qr_image: String,
+    /// Source text for native QR rendering (contains no stored credential).
+    pub qr_content: String,
     pub expires_in_seconds: u64,
 }
 
@@ -997,6 +1286,7 @@ pub(crate) async fn feishu_bind_start(
     Ok(FeishuBindStart {
         flow_id,
         qr_image,
+        qr_content: started.verification_uri,
         expires_in_seconds: started.expires_in_seconds,
     })
 }
@@ -1043,6 +1333,7 @@ pub(crate) async fn feishu_bind_poll(
             app_id,
             app_secret,
             international,
+            owner_open_id,
         } => {
             let stored_secret = app_secret;
             tokio::task::spawn_blocking(move || Secret::set(FEISHU_SECRET, &stored_secret))
@@ -1062,6 +1353,10 @@ pub(crate) async fn feishu_bind_poll(
                 )
                 .await
                 .map_err(|e| e.to_string())?;
+            if !owner_open_id.trim().is_empty() {
+                save_feishu_owner(&state.store, &owner_open_id).await?;
+            }
+            emit_channels_updated(&app);
             if get_setting(&state.store, "feishu_enabled").await == "true" {
                 mgr.start_feishu(&app).await;
             }
@@ -1087,6 +1382,7 @@ pub(crate) async fn feishu_bind_cancel(
 pub(crate) async fn feishu_unbind(
     state: State<'_, AppState>,
     mgr: State<'_, ChannelManager>,
+    app: AppHandle,
 ) -> Result<(), String> {
     mgr.stop_feishu();
     mgr.feishu_registrations.lock().await.clear();
@@ -1101,6 +1397,51 @@ pub(crate) async fn feishu_unbind(
         .set_setting("feishu_enabled", "false")
         .await
         .map_err(|e| e.to_string())?;
+    clear_feishu_owner(&state.store).await?;
+    emit_channels_updated(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn set_feishu_owner(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    open_id: String,
+) -> Result<(), String> {
+    let open_id = open_id.trim();
+    if open_id.is_empty() {
+        clear_feishu_owner(&state.store).await?;
+    } else {
+        save_feishu_owner(&state.store, open_id).await?;
+    }
+    emit_channels_updated(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn confirm_feishu_pending_owner(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let Some(open_id) = load_feishu_pending_owner(&state.store).await else {
+        return Err("没有待确认的飞书发送者。".into());
+    };
+    save_feishu_owner(&state.store, &open_id).await?;
+    emit_channels_updated(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn reject_feishu_pending_owner(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    state
+        .store
+        .set_setting(FEISHU_PENDING_OWNER_KEY, "")
+        .await
+        .map_err(|e| e.to_string())?;
+    emit_channels_updated(&app);
     Ok(())
 }
 
@@ -1133,6 +1474,8 @@ pub struct WeixinBindStart {
     pub qrcode: String,
     /// data: URL of the QR image to render.
     pub qr_image: String,
+    /// Source text for native QR rendering (contains no stored credential).
+    pub qr_content: String,
 }
 
 pub(crate) fn qr_svg_data_url(content: &str) -> Result<String, String> {
@@ -1155,6 +1498,7 @@ pub(crate) async fn weixin_bind_start() -> Result<WeixinBindStart, String> {
     let qr = client.get_qrcode().await.map_err(|e| e.to_string())?;
     Ok(WeixinBindStart {
         qr_image: qr_svg_data_url(&qr.qrcode_img_content)?,
+        qr_content: qr.qrcode_img_content,
         qrcode: qr.qrcode,
     })
 }
@@ -1247,6 +1591,7 @@ mod tests {
         let route = SharedRoute {
             project_id: Some("project-1".into()),
             session_id: Some("session-1".into()),
+            ..Default::default()
         };
         let json = serde_json::to_string(&route).unwrap();
         assert_eq!(serde_json::from_str::<SharedRoute>(&json).unwrap(), route);
@@ -1286,7 +1631,10 @@ mod tests {
         assert!(HELP_TEXT.contains("/status"));
         assert!(HELP_TEXT.contains("/project"));
         assert!(HELP_TEXT.contains("/session"));
-        assert!(HELP_TEXT.contains("微信和飞书共用同一个路由目标"));
+        assert!(HELP_TEXT.contains("/approval"));
+        assert!(HELP_TEXT.contains("/approve <编号>"));
+        assert!(HELP_TEXT.contains("/reject <编号>"));
+        assert!(HELP_TEXT.contains("微信和飞书共用同一个 IM 目标项目"));
         let projects = vec![ProjectChoice {
             id: "project-123456".into(),
             name: "Alpha".into(),
@@ -1300,9 +1648,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_route_follows_the_last_sent_session_and_recovers_after_delete() {
+    async fn desktop_send_does_not_steal_the_im_project() {
         let path = std::env::temp_dir().join(format!(
-            "wisp_channels_last_route_{}.sqlite",
+            "wisp_channels_im_project_{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(&path).await.unwrap();
+        store
+            .create_project("project-1", "Alpha", "/workspace/alpha")
+            .await
+            .unwrap();
+        store
+            .create_project("project-2", "Beta", "/workspace/beta")
+            .await
+            .unwrap();
+        store
+            .create_frame("session-1", "project-1", "OPERON", "wisp")
+            .await
+            .unwrap();
+        store
+            .create_frame("session-2", "project-2", "OPERON", "wisp")
+            .await
+            .unwrap();
+        set_route(
+            &store,
+            &SharedRoute {
+                project_id: Some("project-1".into()),
+                session_id: Some("session-1".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        record_last_message_session(&store, "session-2")
+            .await
+            .unwrap();
+        let route = validated_route(&store).await.unwrap();
+        assert_eq!(route.project_id.as_deref(), Some("project-1"));
+        assert_eq!(route.session_id.as_deref(), Some("session-1"));
+        assert_eq!(
+            route
+                .last_session_by_project
+                .get("project-2")
+                .map(String::as_str),
+            Some("session-2")
+        );
+
+        store
+            .delete_session("session-1", "project-1")
+            .await
+            .unwrap();
+        let route = validated_route(&store).await.unwrap();
+        assert_eq!(route.project_id.as_deref(), Some("project-1"));
+        assert_eq!(route.session_id, None);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn legacy_route_json_becomes_the_im_target() {
+        let path = std::env::temp_dir().join(format!(
+            "wisp_channels_legacy_route_{}.sqlite",
             uuid::Uuid::new_v4()
         ));
         let store = Store::open(&path).await.unwrap();
@@ -1315,37 +1722,22 @@ mod tests {
             .await
             .unwrap();
         store
-            .create_frame("session-2", "project-1", "OPERON", "wisp")
-            .await
-            .unwrap();
-        store
-            .append_message("session-1", 1, &wisp_llm::Message::user("first"))
-            .await
-            .unwrap();
-        store
-            .append_message("session-2", 1, &wisp_llm::Message::user("second"))
-            .await
-            .unwrap();
-
-        // Cold-start migration discovers the latest actual user message.
-        let route = validated_route(&store).await.unwrap();
-        assert_eq!(route.session_id.as_deref(), Some("session-2"));
-
-        // The same writer is called by desktop, Feishu, and WeChat turn starts;
-        // there is intentionally no channel/chat key in the persisted value.
-        record_last_message_session(&store, "session-1")
+            .set_setting(
+                LAST_MESSAGE_ROUTE_KEY,
+                r#"{"project_id":"project-1","session_id":"session-1"}"#,
+            )
             .await
             .unwrap();
         let route = validated_route(&store).await.unwrap();
         assert_eq!(route.project_id.as_deref(), Some("project-1"));
         assert_eq!(route.session_id.as_deref(), Some("session-1"));
-
-        store
-            .delete_session("session-1", "project-1")
-            .await
-            .unwrap();
-        let route = validated_route(&store).await.unwrap();
-        assert_eq!(route.session_id.as_deref(), Some("session-2"));
+        assert_eq!(
+            route
+                .last_session_by_project
+                .get("project-1")
+                .map(String::as_str),
+            Some("session-1")
+        );
         drop(store);
         let _ = std::fs::remove_file(path);
     }
@@ -1374,6 +1766,7 @@ mod tests {
             &SharedRoute {
                 project_id: Some("project-1".into()),
                 session_id: None,
+                ..Default::default()
             },
         )
         .await
@@ -1397,10 +1790,20 @@ mod tests {
             .create_project("project-1", "Alpha", "/workspace/alpha")
             .await
             .unwrap();
+        set_route(
+            &store,
+            &SharedRoute {
+                project_id: Some("project-1".into()),
+                session_id: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
         let (feishu, wechat) = tokio::join!(
-            resolve_message_session(&store, "project-1"),
-            resolve_message_session(&store, "project-1")
+            resolve_message_session(&store),
+            resolve_message_session(&store)
         );
         let feishu = feishu.unwrap();
         let wechat = wechat.unwrap();
@@ -1519,6 +1922,7 @@ mod tests {
             name: "shell".into(),
             ok: true,
             content: "SECRET=do-not-forward".into(),
+            structured_content: None,
             duration_ms: 42,
         });
         assert_eq!(
@@ -1530,6 +1934,19 @@ mod tests {
             })
         );
 
+        let mut request = crate::ConfirmRequest::new(
+            &frame_id,
+            "Dangerous command detected".into(),
+            "shell",
+            "Remove-Item output.tmp".into(),
+        );
+        request.approval_id = "abcdef1234567890abcdef1234567890".into();
+        publish_approval_request(&request);
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(ProgressEvent::ApprovalRequested(request))
+        );
+
         drop(subscription);
         drop(pending);
         publish_agent_event(&crate::AgentEvent::Text {
@@ -1537,6 +1954,26 @@ mod tests {
             delta: "ignored".into(),
         });
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn wechat_approval_text_uses_one_time_code_and_bounded_preview() {
+        let mut request = crate::ConfirmRequest::new(
+            "session-1234567890",
+            "Dangerous command detected".into(),
+            "shell",
+            "好".repeat(APPROVAL_PREVIEW_MAX_CHARS + 10),
+        );
+        request.approval_id = "abcdef1234567890abcdef1234567890".into();
+
+        let rendered = render_approval_request(&request);
+        assert!(rendered.contains("编号: ABCDEF12"));
+        assert!(rendered.contains("会话: session-"));
+        assert!(rendered.contains("工具: shell"));
+        assert!(rendered.contains("审批详情过长已截断"));
+        assert!(rendered.contains("/approve ABCDEF12"));
+        assert!(rendered.contains("/reject ABCDEF12 原因"));
+        assert!(!rendered.contains(&"好".repeat(APPROVAL_PREVIEW_MAX_CHARS + 1)));
     }
 
     #[test]
@@ -1551,5 +1988,31 @@ mod tests {
         )
         .unwrap();
         assert!(svg.contains("<svg"));
+    }
+
+    #[tokio::test]
+    async fn feishu_owner_is_never_the_first_pending_sender() {
+        let path =
+            std::env::temp_dir().join(format!("wisp_feishu_owner_{}.sqlite", uuid::Uuid::new_v4()));
+        let store = Store::open(&path).await.unwrap();
+        assert!(load_feishu_owner(&store).await.is_none());
+
+        save_feishu_pending_owner(&store, "ou_stranger")
+            .await
+            .unwrap();
+        assert!(load_feishu_owner(&store).await.is_none());
+        assert_eq!(
+            load_feishu_pending_owner(&store).await.as_deref(),
+            Some("ou_stranger")
+        );
+
+        save_feishu_owner(&store, "ou_owner").await.unwrap();
+        assert_eq!(load_feishu_owner(&store).await.as_deref(), Some("ou_owner"));
+        assert!(load_feishu_pending_owner(&store).await.is_none());
+
+        clear_feishu_owner(&store).await.unwrap();
+        assert!(load_feishu_owner(&store).await.is_none());
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 }

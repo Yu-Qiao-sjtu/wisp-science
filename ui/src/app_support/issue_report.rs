@@ -1,7 +1,7 @@
 use crate::dto::BootstrapStatus;
 use crate::i18n::{tf, Locale};
 
-pub(crate) const GITHUB_ISSUE_NEW: &str = "https://github.com/xuzhougeng/wisp-science/issues/new";
+pub(crate) const GITHUB_ISSUE_NEW: &str = "https://github.com/Yu-Qiao-sjtu/wisp-science-depmap/issues/new";
 
 /// Hidden context attached to the user's first feedback turn. Non-sensitive
 /// bootstrap metadata is embedded so the model never has to ask for version/OS
@@ -14,10 +14,11 @@ pub(crate) fn issue_report_chat_prompt(
     let empty = BootstrapStatus {
         skills_loaded: 0,
         python_ok: false,
-        python_initializing: false,
+        local_environment: None,
         mcp_catalog: 0,
         uv_ok: false,
         node_ok: false,
+        npm_ok: false,
         sci_ok: false,
         pixi_ok: false,
         app_version: String::new(),
@@ -47,7 +48,7 @@ pub(crate) fn issue_report_chat_prompt(
             ("arch", &bootstrap.arch),
             ("model", model),
             ("startup", startup),
-            ("repo", "xuzhougeng/wisp-science"),
+            ("repo", "Yu-Qiao-sjtu/wisp-science-depmap"),
             ("issue_base", GITHUB_ISSUE_NEW),
         ],
     )
@@ -61,10 +62,11 @@ mod tests {
         BootstrapStatus {
             skills_loaded: 1,
             python_ok: true,
-            python_initializing: false,
+            local_environment: None,
             mcp_catalog: 1,
             uv_ok: true,
             node_ok: true,
+            npm_ok: true,
             sci_ok: true,
             pixi_ok: true,
             app_version: "0.34.0".into(),
@@ -86,6 +88,6 @@ mod tests {
         assert!(prompt.contains("total=120ms store=90ms window_ready=600000ms"));
         assert!(prompt.contains("0.34.0"));
         assert!(!prompt.contains("/mock/root"));
-        assert!(prompt.contains("wisp-science"));
+        assert!(prompt.contains("wisp-depmap"));
     }
 }

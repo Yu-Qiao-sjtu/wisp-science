@@ -1,3 +1,4 @@
+use super::context_epochs::{HEAD_EPOCH_ROWS, LIVE_LOG_ROWS};
 use super::{
     parse_role, session_display_title, MessageResourceLink, RecentSessionDetail,
     SessionSearchResult, Store,
@@ -8,6 +9,12 @@ use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, Transaction};
 use std::collections::{HashMap, HashSet};
 use wisp_llm::Message;
+
+/// Synthetic model-context checkpoints are not user-authored questions.
+/// Keep both markers for archives written before semantic compaction existed.
+pub fn is_compaction_checkpoint(text: &str) -> bool {
+    text.starts_with("[context summary checkpoint]") || text.starts_with("[compacted;")
+}
 
 /// Sidebar, project-card count, and search (#888): a root frame is visible
 /// once it has a user turn **or** an explicit title. Untitled empty drafts stay
@@ -88,6 +95,9 @@ pub struct SessionTranscriptPage {
     pub next_before_seq: Option<i64>,
     pub user_offset: usize,
     pub latest_seq: i64,
+    /// Message-only legacy prefix preceding visual events. None is the old
+    /// message fallback; Some(0) prevents compacted context leaking into UI.
+    pub event_message_prefix_len: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -177,10 +187,10 @@ async fn branch_message_rows(
     tx: &mut Transaction<'_, Sqlite>,
     frame_id: &str,
 ) -> Result<Vec<BranchMessageRow>> {
-    let rows = sqlx::query(
+    let rows = sqlx::query(&format!(
         "SELECT seq,role,content,tool_calls,tool_call_id,tool_name,reasoning,ts,model_name \
-         FROM messages WHERE frame_id=? ORDER BY seq",
-    )
+         FROM messages m WHERE m.frame_id=? AND {LIVE_LOG_ROWS} ORDER BY seq"
+    ))
     .bind(frame_id)
     .fetch_all(&mut **tx)
     .await?;
@@ -336,6 +346,14 @@ pub(crate) const RECENT_TURN_TOOL_PREVIEW_MAX_CHARS: usize = 4_000;
 /// Runs are project-level records and survive, but their stale frame reference
 /// is cleared. Artifact files are also left untouched in the workspace.
 async fn delete_session_rows(tx: &mut Transaction<'_, Sqlite>, frame_id: &str) -> Result<()> {
+    sqlx::query("DELETE FROM research_archive_continuations WHERE frame_id=?")
+        .bind(frame_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM research_archives WHERE frame_id=? AND frozen_at IS NULL")
+        .bind(frame_id)
+        .execute(&mut **tx)
+        .await?;
     sqlx::query(
         "UPDATE runs SET frame_id=NULL \
          WHERE frame_id IN (SELECT id FROM frames WHERE root_frame_id=?)",
@@ -459,7 +477,34 @@ async fn delete_session_rows(tx: &mut Transaction<'_, Sqlite>, frame_id: &str) -
     .execute(&mut **tx)
     .await?;
 
+    sqlx::query(
+        "UPDATE global_memories SET source_frame_id=NULL \
+         WHERE source_frame_id IN (SELECT id FROM frames WHERE root_frame_id=?)",
+    )
+    .bind(frame_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE schedules SET frame_id=NULL \
+         WHERE frame_id IN (SELECT id FROM frames WHERE root_frame_id=?)",
+    )
+    .bind(frame_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE schedule_runs SET frame_id=NULL \
+         WHERE frame_id IN (SELECT id FROM frames WHERE root_frame_id=?)",
+    )
+    .bind(frame_id)
+    .execute(&mut **tx)
+    .await?;
+
     for statement in [
+        "DELETE FROM agent_workflow_deliveries WHERE frame_id IN (SELECT id FROM frames WHERE root_frame_id=?)",
+        "DELETE FROM session_branch_merges WHERE EXISTS (SELECT 1 FROM frames frame WHERE frame.root_frame_id=? AND (frame.id=session_branch_merges.source_frame_id OR frame.id=session_branch_merges.branch_frame_id))",
+        "DELETE FROM ask_user_requests WHERE frame_id IN (SELECT id FROM frames WHERE root_frame_id=?)",
+        "DELETE FROM session_imports WHERE frame_id IN (SELECT id FROM frames WHERE root_frame_id=?)",
+        "DELETE FROM codex_imports WHERE frame_id IN (SELECT id FROM frames WHERE root_frame_id=?)",
         "DELETE FROM session_execution_contexts WHERE frame_id IN (SELECT id FROM frames WHERE root_frame_id=?)",
         "DELETE FROM session_reviews WHERE frame_id IN (SELECT id FROM frames WHERE root_frame_id=?)",
         "DELETE FROM session_ui_events WHERE frame_id IN (SELECT id FROM frames WHERE root_frame_id=?)",
@@ -467,6 +512,7 @@ async fn delete_session_rows(tx: &mut Transaction<'_, Sqlite>, frame_id: &str) -
         "DELETE FROM codex_turn_configs WHERE frame_id IN (SELECT id FROM frames WHERE root_frame_id=?)",
         "DELETE FROM acp_sessions WHERE frame_id IN (SELECT id FROM frames WHERE root_frame_id=?)",
         "DELETE FROM execution_log WHERE frame_id IN (SELECT id FROM frames WHERE root_frame_id=?)",
+        "DELETE FROM context_epochs WHERE frame_id IN (SELECT id FROM frames WHERE root_frame_id=?)",
         "DELETE FROM messages WHERE frame_id IN (SELECT id FROM frames WHERE root_frame_id=?)",
     ] {
         sqlx::query(statement)
@@ -699,9 +745,9 @@ impl Store {
         let now = chrono::Utc::now().timestamp();
         let inserted = sqlx::query(
             "INSERT INTO frames(\
-                id,parent_frame_id,root_frame_id,agent_name,status,project_id,model,exploration_id,\
+                id,parent_frame_id,root_frame_id,agent_name,status,project_id,model,reasoning_effort,service_tier,exploration_id,\
                 input_tokens,output_tokens,created_at,updated_at,completed_at\
-             ) SELECT ?,id,COALESCE(root_frame_id,id),?,'running',project_id,?,exploration_id,0,0,?,?,NULL \
+             ) SELECT ?,id,COALESCE(root_frame_id,id),?,'running',project_id,?,reasoning_effort,service_tier,exploration_id,0,0,?,?,NULL \
              FROM frames WHERE id=? AND project_id=?",
         )
         .bind(id)
@@ -749,6 +795,18 @@ impl Store {
         .fetch_optional(&self.pool)
         .await?
         .flatten())
+    }
+
+    /// Per-conversation service-tier override. `None` inherits the bound
+    /// model profile; `Some("")` explicitly selects provider default.
+    pub async fn frame_service_tier(&self, frame_id: &str) -> Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, Option<String>>("SELECT service_tier FROM frames WHERE id=?")
+                .bind(frame_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten(),
+        )
     }
 
     /// Overwrite a frame's created/updated timestamps. Used by importers so
@@ -809,53 +867,45 @@ impl Store {
         Ok(())
     }
 
-    pub async fn append_message(&self, frame_id: &str, seq: i64, msg: &Message) -> Result<()> {
-        let id = uuid::Uuid::new_v4().to_string();
-        let role = if msg.role == wisp_llm::Role::User
-            && msg.tool_name.as_deref() == Some(super::AGENT_WORKFLOW_COMPLETION_TOOL)
-        {
-            "internal".into()
-        } else {
-            format!("{:?}", msg.role).to_ascii_lowercase()
-        };
-        let content = serde_json::to_string(&msg.content)?;
-        let tool_calls = if msg.tool_calls.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(&msg.tool_calls)?)
-        };
-        sqlx::query("INSERT INTO messages(id,frame_id,seq,role,content,tool_calls,tool_call_id,tool_name,reasoning,ts,model_name) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
-            .bind(id).bind(frame_id).bind(seq).bind(role).bind(content)
-            .bind(tool_calls)
-            .bind(msg.tool_call_id.as_deref())
-            .bind(msg.tool_name.as_deref())
-            .bind(msg.reasoning.as_deref())
-            .bind(msg.ts)
-            .bind(msg.model_name.as_deref())
-            .execute(&self.pool).await?;
+    pub async fn set_frame_service_tier(
+        &self,
+        frame_id: &str,
+        project_id: &str,
+        service_tier: Option<&str>,
+    ) -> Result<()> {
+        let updated = sqlx::query(
+            "UPDATE frames SET service_tier=?,updated_at=? WHERE id=? AND project_id=?",
+        )
+        .bind(service_tier)
+        .bind(chrono::Utc::now().timestamp())
+        .bind(frame_id)
+        .bind(project_id)
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() != 1 {
+            anyhow::bail!("Session not found");
+        }
         Ok(())
     }
 
-    /// Replace a frame's model context wholesale (user-triggered /compact).
+    pub async fn append_message(&self, frame_id: &str, seq: i64, msg: &Message) -> Result<()> {
+        insert_message_row(&self.pool, frame_id, seq, msg).await
+    }
+
+    /// Rebuild a frame's model context from scratch as epoch 0 (session
+    /// import, seed data, exploration clones, interrupted-turn rollback).
     /// Only the `messages` rows are rewritten — the session_ui_events visual
-    /// transcript keeps the full history on purpose. Resource links anchor to
-    /// message seqs, which a rewrite invalidates, so they are dropped too.
+    /// transcript keeps the full history on purpose. Resource links and turn
+    /// undo anchor to message seqs, which a rewrite invalidates, so they are
+    /// dropped too. Compaction does not go through here any more: it opens a
+    /// new context epoch (`open_context_epoch`) and leaves seqs stable.
+    /// Deletes and inserts share one write transaction: an interruption
+    /// mid-replace leaves the previous transcript fully intact instead of an
+    /// emptied or half-written frame.
     pub async fn replace_messages(&self, frame_id: &str, msgs: &[Message]) -> Result<()> {
-        sqlx::query("DELETE FROM message_resource_links WHERE frame_id=?")
-            .bind(frame_id)
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("DELETE FROM turn_file_undo WHERE frame_id=?")
-            .bind(frame_id)
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("DELETE FROM messages WHERE frame_id=?")
-            .bind(frame_id)
-            .execute(&self.pool)
-            .await?;
-        for (i, msg) in msgs.iter().enumerate() {
-            self.append_message(frame_id, (i + 1) as i64, msg).await?;
-        }
+        let mut tx = self.begin_write().await?;
+        replace_message_rows(&mut tx, frame_id, msgs).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -865,10 +915,11 @@ impl Store {
     /// untouched. Returns false when the frame has no system message.
     pub async fn replace_system_message(&self, frame_id: &str, msg: &Message) -> Result<bool> {
         let content = serde_json::to_string(&msg.content)?;
-        let updated = sqlx::query(
+        let updated = sqlx::query(&format!(
             "UPDATE messages SET content=? WHERE frame_id=? AND role='system' \
-             AND seq=(SELECT MIN(seq) FROM messages WHERE frame_id=? AND role='system')",
-        )
+             AND seq=(SELECT MIN(seq) FROM messages m WHERE m.frame_id=? AND role='system' \
+                      AND {HEAD_EPOCH_ROWS})"
+        ))
         .bind(content)
         .bind(frame_id)
         .bind(frame_id)
@@ -887,11 +938,12 @@ impl Store {
         if frame_ids.is_empty() {
             return Ok(map);
         }
-        let mut qb: sqlx::QueryBuilder<'_, sqlx::Sqlite> = sqlx::QueryBuilder::new(
-            "SELECT frame_id, content FROM messages m WHERE role='system' \
-             AND seq=(SELECT MIN(seq) FROM messages WHERE frame_id=m.frame_id AND role='system') \
-             AND frame_id IN (",
-        );
+        let mut qb: sqlx::QueryBuilder<'_, sqlx::Sqlite> = sqlx::QueryBuilder::new(format!(
+            "SELECT frame_id, content FROM messages m WHERE role='system' AND {HEAD_EPOCH_ROWS} \
+             AND seq=(SELECT MIN(seq) FROM messages mm WHERE mm.frame_id=m.frame_id \
+                      AND mm.role='system' AND mm.epoch=m.epoch) \
+             AND frame_id IN ("
+        ));
         let mut separated = qb.separated(", ");
         for id in frame_ids {
             separated.push_bind(id);
@@ -907,22 +959,111 @@ impl Store {
         Ok(map)
     }
 
+    /// Rows in the head epoch (what `load_messages` would return).
     pub async fn message_count(&self, frame_id: &str) -> Result<i64> {
+        Ok(sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM messages m WHERE m.frame_id=? AND {HEAD_EPOCH_ROWS}"
+        ))
+        .bind(frame_id)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// Lightweight live activity for a delegated child frame. Attempt usage is
+    /// finalized only when the Agent returns, while message/tool rows are
+    /// durable as work happens; the Workflow UI uses this to avoid displaying
+    /// a false `0 tools` during a long-running task.
+    pub async fn frame_message_activity(&self, frame_id: &str) -> Result<(i64, i64, Option<i64>)> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS message_count,\
+                    COALESCE(SUM(CASE WHEN role='tool' THEN 1 ELSE 0 END),0) AS tool_count,\
+                    MAX(ts) AS last_activity_at \
+             FROM messages WHERE frame_id=?",
+        )
+        .bind(frame_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((
+            row.try_get("message_count")?,
+            row.try_get("tool_count")?,
+            row.try_get("last_activity_at")?,
+        ))
+    }
+
+    /// Return a bounded newest-first window of persisted results for one tool.
+    ///
+    /// Delegated research uses this append-only message boundary for progress
+    /// recovery. Keeping progress in the transcript means reconnecting the UI
+    /// does not depend on an in-memory WebSocket or a second job-state store.
+    /// Consumers can skip a malformed/failed newest result and recover the
+    /// preceding valid checkpoint without loading the entire child transcript.
+    pub async fn recent_tool_result_texts(
+        &self,
+        frame_id: &str,
+        tool_name: &str,
+        limit: u32,
+    ) -> Result<Vec<(String, i64)>> {
+        let rows = sqlx::query(
+            "SELECT content,ts FROM messages \
+             WHERE frame_id=? AND role='tool' AND tool_name=? \
+             ORDER BY seq DESC LIMIT ?",
+        )
+        .bind(frame_id)
+        .bind(tool_name)
+        .bind(limit.clamp(1, 50))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let content_json: String = row.try_get("content")?;
+                let content = serde_json::from_str::<wisp_llm::Content>(&content_json)
+                    .unwrap_or_else(|_| wisp_llm::Content::text(""));
+                Ok((content.as_text(), row.try_get("ts")?))
+            })
+            .collect()
+    }
+
+    /// Durable seq cursor for a frame: `COALESCE(MAX(seq), 0)`.
+    ///
+    /// This is the source of truth for `last_seq` recovery. Do not use
+    /// `messages.len()` or `COUNT(*)` — gaps make those diverge from `MAX(seq)`.
+    pub async fn max_message_seq(&self, frame_id: &str) -> Result<i64> {
         Ok(
-            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE frame_id=?")
+            sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM messages WHERE frame_id=?")
                 .bind(frame_id)
                 .fetch_one(&self.pool)
                 .await?,
         )
     }
 
-    /// Drop persisted turns after `keep` (seq is 1-based; keep=3 retains seq 1..=3).
-    pub async fn truncate_messages(&self, frame_id: &str, keep: i64) -> Result<()> {
+    /// Drop model-context rows with `seq > keep_seq` and the seq-anchored
+    /// records that pointed at them, leaving the visual transcript alone.
+    /// Used to roll an interrupted turn out of the context while its rows stay
+    /// visible as history. `keep_seq` must lie in the head epoch; frozen
+    /// epochs always sit below it and are never touched.
+    pub async fn truncate_model_context(&self, frame_id: &str, keep_seq: i64) -> Result<()> {
         let mut tx = self.begin_write().await?;
-        reconcile_session_branches_after_truncate(&mut tx, frame_id, keep).await?;
-        truncate_message_rows(&mut tx, frame_id, keep).await?;
+        for statement in [
+            "DELETE FROM message_resource_links WHERE frame_id=? AND message_seq>?",
+            "DELETE FROM turn_file_undo WHERE frame_id=? AND user_message_seq>?",
+            "DELETE FROM messages WHERE frame_id=? AND seq>?",
+        ] {
+            sqlx::query(statement)
+                .bind(frame_id)
+                .bind(keep_seq)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Drop persisted turns after `keep` (seq is 1-based; keep=3 retains seq 1..=3).
+    /// `keep` is a durable message seq in the current head epoch. After a
+    /// compaction, use `rewind_to_seq` to restore an older epoch.
+    pub async fn truncate_messages(&self, frame_id: &str, keep: i64) -> Result<()> {
+        let epoch = self.frame_head_epoch(frame_id).await?;
+        self.rewind_to_seq(frame_id, epoch, keep).await
     }
 
     pub(crate) async fn truncate_message_rows(
@@ -932,6 +1073,137 @@ impl Store {
     ) -> Result<()> {
         truncate_message_rows(tx, frame_id, keep).await
     }
+
+    #[cfg(test)]
+    pub(crate) async fn replace_message_rows_for_test(
+        tx: &mut Transaction<'_, Sqlite>,
+        frame_id: &str,
+        msgs: &[Message],
+    ) -> Result<()> {
+        replace_message_rows(tx, frame_id, msgs).await
+    }
+}
+
+pub(crate) fn message_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<(i64, Message)> {
+    let seq: i64 = row.try_get("seq")?;
+    let role: String = row.try_get("role")?;
+    let content_json: String = row.try_get("content")?;
+    let content: wisp_llm::Content =
+        serde_json::from_str(&content_json).unwrap_or(wisp_llm::Content::text(""));
+    let tool_calls_json: Option<String> = row.try_get("tool_calls")?;
+    let tool_calls: Vec<wisp_llm::ToolCall> = tool_calls_json
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let tool_call_id: Option<String> = row.try_get("tool_call_id")?;
+    let tool_name: Option<String> = row.try_get("tool_name")?;
+    let reasoning: Option<String> = row.try_get("reasoning")?;
+    let ts: i64 = row.try_get("ts")?;
+    let model_name: Option<String> = row.try_get("model_name")?;
+    Ok((
+        seq,
+        Message {
+            role: parse_role(&role),
+            content,
+            tool_calls,
+            tool_call_id,
+            tool_name,
+            reasoning,
+            ts,
+            model_name,
+        },
+    ))
+}
+
+/// Insert into the frame's head epoch (the context the model sees now).
+pub(crate) async fn insert_message_row<'e, E>(
+    executor: E,
+    frame_id: &str,
+    seq: i64,
+    msg: &Message,
+) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    insert_message_row_in_epoch(executor, frame_id, None, seq, msg).await
+}
+
+/// `epoch = None` resolves to the frame's current `head_epoch` at insert time
+/// (0 when the frame row is missing). Compaction passes the new epoch
+/// explicitly; `replace_message_rows` passes 0.
+pub(crate) async fn insert_message_row_in_epoch<'e, E>(
+    executor: E,
+    frame_id: &str,
+    epoch: Option<i64>,
+    seq: i64,
+    msg: &Message,
+) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let id = uuid::Uuid::new_v4().to_string();
+    let role = if msg.role == wisp_llm::Role::User
+        && msg.tool_name.as_deref() == Some(super::AGENT_WORKFLOW_COMPLETION_TOOL)
+    {
+        "internal".into()
+    } else {
+        format!("{:?}", msg.role).to_ascii_lowercase()
+    };
+    let content = serde_json::to_string(&msg.content)?;
+    let tool_calls = if msg.tool_calls.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&msg.tool_calls)?)
+    };
+    sqlx::query(
+        "INSERT INTO messages(id,frame_id,seq,role,content,tool_calls,tool_call_id,tool_name,reasoning,ts,model_name,epoch) \
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,COALESCE(?,(SELECT head_epoch FROM frames WHERE id=?),0))",
+    )
+        .bind(id).bind(frame_id).bind(seq).bind(role).bind(content)
+        .bind(tool_calls)
+        .bind(msg.tool_call_id.as_deref())
+        .bind(msg.tool_name.as_deref())
+        .bind(msg.reasoning.as_deref())
+        .bind(msg.ts)
+        .bind(msg.model_name.as_deref())
+        .bind(epoch)
+        .bind(frame_id)
+        .execute(executor).await?;
+    Ok(())
+}
+
+async fn replace_message_rows(
+    tx: &mut Transaction<'_, Sqlite>,
+    frame_id: &str,
+    msgs: &[Message],
+) -> Result<()> {
+    sqlx::query("DELETE FROM message_resource_links WHERE frame_id=?")
+        .bind(frame_id)
+        .execute(&mut **tx)
+        .await?;
+    // #973/#978: undo rows key off pre-compaction seqs. Mapping them onto the
+    // rewritten 1..n seqs needs a stable turn/message id; wipe instead.
+    sqlx::query("DELETE FROM turn_file_undo WHERE frame_id=?")
+        .bind(frame_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM messages WHERE frame_id=?")
+        .bind(frame_id)
+        .execute(&mut **tx)
+        .await?;
+    // A wholesale rewrite starts the frame's context history over: epoch 0
+    // only, no frozen epochs left behind.
+    sqlx::query("DELETE FROM context_epochs WHERE frame_id=?")
+        .bind(frame_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("UPDATE frames SET head_epoch=0 WHERE id=?")
+        .bind(frame_id)
+        .execute(&mut **tx)
+        .await?;
+    for (i, msg) in msgs.iter().enumerate() {
+        insert_message_row_in_epoch(&mut **tx, frame_id, Some(0), (i + 1) as i64, msg).await?;
+    }
+    Ok(())
 }
 
 /// Reconcile branch provenance before removing a mainline suffix.
@@ -941,6 +1213,43 @@ impl Store {
 /// the merge. A checkpoint itself remains valid only while its concrete anchor
 /// is retained: `before_user` needs that user message, while `after_response`
 /// also needs a retained assistant reply for the turn.
+async fn visual_retained_turns(
+    tx: &mut Transaction<'_, Sqlite>,
+    frame_id: &str,
+) -> Result<Vec<bool>> {
+    let rows = sqlx::query(
+        "SELECT json_extract(event_json,'$.kind') AS kind, \
+         json_extract(event_json,'$.text') AS text \
+         FROM session_ui_events WHERE frame_id=? \
+         AND json_extract(event_json,'$.kind') IN ('User','Text') ORDER BY seq",
+    )
+    .bind(frame_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut turns = Vec::<bool>::new();
+    for row in rows {
+        let kind: String = row.try_get("kind")?;
+        match kind.as_str() {
+            "User" => {
+                let Some(text) = row.try_get::<Option<String>, _>("text")? else {
+                    continue;
+                };
+                if is_compaction_checkpoint(&text) {
+                    continue;
+                }
+                turns.push(false);
+            }
+            "Text" => {
+                if let Some(has_reply) = turns.last_mut() {
+                    *has_reply = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(turns)
+}
+
 pub(crate) async fn reconcile_session_branches_after_truncate(
     tx: &mut Transaction<'_, Sqlite>,
     frame_id: &str,
@@ -954,28 +1263,33 @@ pub(crate) async fn reconcile_session_branches_after_truncate(
     .execute(&mut **tx)
     .await?;
 
-    let retained = sqlx::query(
-        "SELECT role,content,tool_name FROM messages WHERE frame_id=? AND seq<=? ORDER BY seq",
-    )
-    .bind(frame_id)
-    .bind(keep)
-    .fetch_all(&mut **tx)
-    .await?;
-    let mut retained_turns = Vec::<bool>::new();
-    for row in retained {
-        let role: String = row.try_get("role")?;
-        let tool_name: Option<String> = row.try_get("tool_name")?;
-        if role == "user"
-            && tool_name.as_deref() != Some(crate::AGENT_WORKFLOW_COMPLETION_TOOL)
-            && row
-                .try_get::<Option<String>, _>("content")?
-                .and_then(|content| serde_json::from_str::<wisp_llm::Content>(&content).ok())
-                .is_some_and(|content| !content.as_text().trim().is_empty())
-        {
-            retained_turns.push(false);
-        } else if role == "assistant" {
-            if let Some(has_reply) = retained_turns.last_mut() {
-                *has_reply = true;
+    let mut retained_turns = visual_retained_turns(tx, frame_id).await?;
+    if retained_turns.is_empty() {
+        let retained = sqlx::query(
+            "SELECT role,content,tool_name FROM messages WHERE frame_id=? AND seq<=? ORDER BY seq",
+        )
+        .bind(frame_id)
+        .bind(keep)
+        .fetch_all(&mut **tx)
+        .await?;
+        for row in retained {
+            let role: String = row.try_get("role")?;
+            let tool_name: Option<String> = row.try_get("tool_name")?;
+            if role == "user"
+                && tool_name.as_deref() != Some(crate::AGENT_WORKFLOW_COMPLETION_TOOL)
+                && row
+                    .try_get::<Option<String>, _>("content")?
+                    .and_then(|content| serde_json::from_str::<wisp_llm::Content>(&content).ok())
+                    .is_some_and(|content| {
+                        !content.as_text().trim().is_empty()
+                            && !is_compaction_checkpoint(&content.as_text())
+                    })
+            {
+                retained_turns.push(false);
+            } else if role == "assistant" {
+                if let Some(has_reply) = retained_turns.last_mut() {
+                    *has_reply = true;
+                }
             }
         }
     }
@@ -1077,10 +1391,10 @@ impl Store {
         frame_id: &str,
         turn_limit: usize,
     ) -> Result<Vec<Message>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             "WITH recent_user_turns AS (\
-                 SELECT seq FROM messages \
-                 WHERE frame_id=? AND role='user' AND tool_name IS NULL \
+                 SELECT seq FROM messages m \
+                 WHERE m.frame_id=? AND role='user' AND tool_name IS NULL AND {LIVE_LOG_ROWS} \
                  ORDER BY seq DESC LIMIT ?\
              ), start_seq AS (SELECT MIN(seq) AS seq FROM recent_user_turns) \
              SELECT seq,role,json_quote(substr(\
@@ -1094,9 +1408,9 @@ impl Store {
                  CASE WHEN role='tool' AND COALESCE(tool_name,'') NOT IN \
                      ('attempt_completion','propose_plan','ask_user') THEN ? ELSE ? END\
              )) AS content,NULL AS tool_calls,tool_call_id,tool_name,NULL AS reasoning,ts,model_name \
-             FROM messages WHERE frame_id=? \
-             AND seq>=COALESCE((SELECT seq FROM start_seq), 0) ORDER BY seq ASC",
-        )
+             FROM messages m WHERE m.frame_id=? AND {LIVE_LOG_ROWS} \
+             AND seq>=COALESCE((SELECT seq FROM start_seq), 0) ORDER BY seq ASC"
+        ))
         .bind(frame_id)
         .bind(turn_limit.max(1) as i64)
         .bind(RECENT_TURN_TOOL_PREVIEW_MAX_CHARS as i64)
@@ -1133,10 +1447,10 @@ impl Store {
         &self,
         frame_id: &str,
     ) -> Result<Vec<(i64, String, i64, Option<i64>)>> {
-        let rows = sqlx::query(
-            "SELECT seq,role,content,ts FROM messages \
-             WHERE frame_id=? AND role IN ('user','assistant') ORDER BY seq",
-        )
+        let rows = sqlx::query(&format!(
+            "SELECT seq,role,content,ts FROM messages m \
+             WHERE m.frame_id=? AND role IN ('user','assistant') AND {LIVE_LOG_ROWS} ORDER BY seq"
+        ))
         .bind(frame_id)
         .fetch_all(&self.pool)
         .await?;
@@ -1156,48 +1470,35 @@ impl Store {
             let content_json: String = row.try_get("content")?;
             let content: wisp_llm::Content =
                 serde_json::from_str(&content_json).unwrap_or(wisp_llm::Content::text(""));
-            messages.push((seq, content.as_text(), ts, None));
+            let text = content.as_text();
+            if !is_compaction_checkpoint(&text) {
+                messages.push((seq, text, ts, None));
+            }
         }
         Ok(messages)
     }
 
-    /// Load all messages with their durable sequence numbers. Readers use the
-    /// sequence as a stable evidence locator even when one large transcript is
-    /// split across several model calls.
+    /// Load the head-epoch messages (the context the model sees now) with
+    /// their durable sequence numbers. Readers use the sequence as a stable
+    /// evidence locator even when one large transcript is split across
+    /// several model calls. Frozen epochs are reachable through
+    /// `load_messages_in_epoch` / `load_messages_all_epochs`.
     pub async fn load_messages_with_seq(&self, frame_id: &str) -> Result<Vec<(i64, Message)>> {
-        let rows = sqlx::query("SELECT seq,role,content,tool_calls,tool_call_id,tool_name,reasoning,ts,model_name FROM messages WHERE frame_id=? ORDER BY seq ASC")
-            .bind(frame_id)
-            .fetch_all(&self.pool).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT seq,role,content,tool_calls,tool_call_id,tool_name,reasoning,ts,model_name \
+             FROM messages m WHERE m.frame_id=? AND {HEAD_EPOCH_ROWS} ORDER BY seq ASC"
+        ))
+        .bind(frame_id)
+        .fetch_all(&self.pool)
+        .await?;
         let mut out = vec![];
         for row in rows {
-            let seq: i64 = row.try_get("seq")?;
-            let role: String = row.try_get("role")?;
-            let content_json: String = row.try_get("content")?;
-            let content: wisp_llm::Content =
-                serde_json::from_str(&content_json).unwrap_or(wisp_llm::Content::text(""));
-            let tool_calls_json: Option<String> = row.try_get("tool_calls")?;
-            let tool_calls: Vec<wisp_llm::ToolCall> = tool_calls_json
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default();
-            let tool_call_id: Option<String> = row.try_get("tool_call_id")?;
-            let tool_name: Option<String> = row.try_get("tool_name")?;
-            let reasoning: Option<String> = row.try_get("reasoning")?;
-            let ts: i64 = row.try_get("ts")?;
-            let model_name: Option<String> = row.try_get("model_name")?;
-            let role = parse_role(&role);
-            out.push((
-                seq,
-                Message {
-                    role,
-                    content,
-                    tool_calls,
-                    tool_call_id,
-                    tool_name,
-                    reasoning,
-                    ts,
-                    model_name,
-                },
-            ));
+            match message_from_row(&row) {
+                Ok(item) => out.push(item),
+                Err(error) => {
+                    tracing::warn!(frame_id, %error, "skipping unreadable message row");
+                }
+            }
         }
         Ok(out)
     }
@@ -1213,10 +1514,13 @@ impl Store {
         turn_limit: usize,
     ) -> Result<SessionTranscriptPage> {
         let limit = turn_limit.max(1);
-        let user_rows = sqlx::query(
-            "SELECT seq FROM messages WHERE frame_id=? AND role='user' \
-             AND (? IS NULL OR seq < ?) ORDER BY seq DESC LIMIT ?",
-        )
+        // Paging walks the live log: compaction copies (checkpoint, retained
+        // tail) have no visual events of their own and would otherwise count
+        // as extra user turns and push the page window past the last boundary.
+        let user_rows = sqlx::query(&format!(
+            "SELECT seq FROM messages m WHERE m.frame_id=? AND role='user' AND {LIVE_LOG_ROWS} \
+             AND (? IS NULL OR seq < ?) ORDER BY seq DESC LIMIT ?"
+        ))
         .bind(frame_id)
         .bind(before_seq)
         .bind(before_seq)
@@ -1229,9 +1533,10 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let has_more = user_seqs.len() > limit;
         let selected = &user_seqs[..user_seqs.len().min(limit)];
-        let oldest_available: Option<i64> = sqlx::query_scalar(
-            "SELECT MIN(seq) FROM messages WHERE frame_id=? AND (? IS NULL OR seq < ?)",
-        )
+        let oldest_available: Option<i64> = sqlx::query_scalar(&format!(
+            "SELECT MIN(seq) FROM messages m WHERE m.frame_id=? AND {LIVE_LOG_ROWS} \
+             AND (? IS NULL OR seq < ?)"
+        ))
         .bind(frame_id)
         .bind(before_seq)
         .bind(before_seq)
@@ -1246,10 +1551,11 @@ impl Store {
         };
         let next_before_seq = has_more.then_some(start_seq);
 
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             "SELECT seq,role,content,tool_calls,tool_call_id,tool_name,reasoning,ts,model_name \
-             FROM messages WHERE frame_id=? AND seq>=? AND (? IS NULL OR seq < ?) ORDER BY seq",
-        )
+             FROM messages m WHERE m.frame_id=? AND {LIVE_LOG_ROWS} \
+             AND seq>=? AND (? IS NULL OR seq < ?) ORDER BY seq"
+        ))
         .bind(frame_id)
         .bind(start_seq)
         .bind(before_seq)
@@ -1281,18 +1587,7 @@ impl Store {
             ));
         }
 
-        let user_offset: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM messages WHERE frame_id=? AND role='user' AND seq < ?",
-        )
-        .bind(frame_id)
-        .bind(start_seq)
-        .fetch_one(&self.pool)
-        .await?;
-        let latest_seq: i64 =
-            sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM messages WHERE frame_id=?")
-                .bind(frame_id)
-                .fetch_one(&self.pool)
-                .await?;
+        let latest_seq = self.max_message_seq(frame_id).await?;
 
         let start_event_seq: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(seq),0) FROM session_ui_events WHERE frame_id=? \
@@ -1303,6 +1598,35 @@ impl Store {
         .bind(start_seq)
         .fetch_one(&self.pool)
         .await?;
+        // Visual indices must use the same history as the outline. Model
+        // sequence numbers are reused after compaction, while event sequence
+        // numbers remain monotonic. Include any legacy message-only prefix.
+        let outline = self.session_outline_records(frame_id).await?;
+        let user_offset = outline
+            .iter()
+            .filter(|(event_seq, item)| {
+                event_seq.map_or_else(
+                    || item.seq.is_some_and(|seq| seq < start_seq),
+                    |seq| seq <= start_event_seq,
+                )
+            })
+            .count();
+        let event_message_prefix_len = outline.iter().any(|(seq, _)| seq.is_some()).then(|| {
+            let legacy_seqs = outline
+                .iter()
+                .filter(|(seq, _)| seq.is_none())
+                .filter_map(|(_, item)| item.seq)
+                .collect::<HashSet<_>>();
+            if legacy_seqs.is_empty() {
+                return 0;
+            }
+            messages
+                .iter()
+                .take_while(|(seq, message)| {
+                    message.role != wisp_llm::Role::User || legacy_seqs.contains(seq)
+                })
+                .count()
+        });
         let end_event_seq = if let Some(before) = before_seq {
             sqlx::query_scalar(
                 "SELECT COALESCE(MAX(seq),0) FROM session_ui_events WHERE frame_id=? \
@@ -1418,8 +1742,9 @@ impl Store {
             ui_events,
             resources,
             next_before_seq,
-            user_offset: user_offset as usize,
+            user_offset,
             latest_seq,
+            event_message_prefix_len,
         })
     }
 
@@ -1477,6 +1802,118 @@ impl Store {
         rows.into_iter()
             .map(|row| row.try_get("event_json").map_err(Into::into))
             .collect()
+    }
+
+    /// Full visual outline, independent of the compacted model context.
+    pub async fn load_session_outline(
+        &self,
+        frame_id: &str,
+    ) -> Result<Vec<wisp_dto::SessionOutlineItem>> {
+        Ok(self
+            .session_outline_records(frame_id)
+            .await?
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect())
+    }
+
+    /// The private event sequence anchors offsets; it must never be passed to
+    /// the public message-sequence paging cursor. Event-backed entries expose
+    /// no cursor: navigation walks pages until it finds their visual index.
+    async fn session_outline_records(
+        &self,
+        frame_id: &str,
+    ) -> Result<Vec<(Option<i64>, wisp_dto::SessionOutlineItem)>> {
+        let current = self.load_session_user_messages(frame_id).await?;
+        // Do not load tool dumps or assistant text just to build the index.
+        let rows = sqlx::query(
+            "SELECT seq,created_at,json_extract(event_json,'$.kind') AS kind, \
+             CASE WHEN json_extract(event_json,'$.kind')='User' \
+                  THEN json_extract(event_json,'$.text') END AS text, \
+             json_extract(event_json,'$.seq') AS message_seq \
+             FROM session_ui_events WHERE frame_id=? \
+             AND json_extract(event_json,'$.kind') IN ('User','Text','MessageBoundary') ORDER BY seq",
+        ).bind(frame_id).fetch_all(&self.pool).await?;
+        let mut records = Vec::<(Option<i64>, wisp_dto::SessionOutlineItem)>::new();
+        let mut pending_user = false;
+        let mut first_boundary = None;
+        for row in rows {
+            let kind: String = row.try_get("kind")?;
+            let timestamp = row
+                .try_get::<Option<i64>, _>("created_at")?
+                .filter(|ts| *ts > 0)
+                .map(|ts| ts / 1000);
+            match kind.as_str() {
+                "User" => {
+                    let Some(text) = row.try_get::<Option<String>, _>("text")? else {
+                        continue;
+                    };
+                    if is_compaction_checkpoint(&text) {
+                        continue;
+                    }
+                    records.push((
+                        Some(row.try_get("seq")?),
+                        wisp_dto::SessionOutlineItem {
+                            user_index: records.len(),
+                            seq: None,
+                            text,
+                            sent_at: timestamp,
+                            response_at: None,
+                        },
+                    ));
+                    pending_user = true;
+                }
+                "MessageBoundary" if pending_user => {
+                    if records.len() == 1 {
+                        first_boundary = row.try_get::<Option<i64>, _>("message_seq")?;
+                    }
+                    pending_user = false;
+                }
+                "Text" => {
+                    if let Some((_, item)) = records.last_mut() {
+                        item.response_at = timestamp.or(item.response_at);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Some old sessions acquired event logging partway through. Only
+        // retain a message prefix when its first event still has an exact
+        // sequence/text anchor. Never guess by matching repeated text.
+        let prefix_len = if records.len() > current.len() {
+            // The model has already lost turns. A coincidental repeated text
+            // and reused sequence must not manufacture a legacy prefix.
+            0
+        } else if let Some((_, first)) = records.first() {
+            current
+                .iter()
+                .position(|(seq, text, ..)| Some(*seq) == first_boundary && text == &first.text)
+                .unwrap_or(0)
+        } else {
+            current.len()
+        };
+        let mut outline = current
+            .into_iter()
+            .take(prefix_len)
+            .enumerate()
+            .map(|(user_index, (seq, text, sent_at, response_at))| {
+                (
+                    None,
+                    wisp_dto::SessionOutlineItem {
+                        user_index,
+                        seq: Some(seq),
+                        text,
+                        sent_at: (sent_at > 0).then_some(sent_at),
+                        response_at,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        for (event_seq, mut item) in records {
+            item.user_index = outline.len();
+            outline.push((event_seq, item));
+        }
+        Ok(outline)
     }
 
     /// Load the persisted visual transcript with per-event wall-clock stamps
@@ -1548,6 +1985,24 @@ impl Store {
         )
         .bind(frame_id)
         .bind(kind)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn load_mcp_app_presentation_event(
+        &self,
+        frame_id: &str,
+        presentation_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT event_json FROM session_ui_events WHERE frame_id=? \
+             AND json_extract(event_json,'$.kind')='ToolPresentation' \
+             AND json_extract(event_json,'$.presentation_kind')='mcp_app' \
+             AND json_extract(event_json,'$.presentation_id')=? \
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(frame_id)
+        .bind(presentation_id)
         .fetch_optional(&self.pool)
         .await?)
     }
@@ -1707,6 +2162,7 @@ impl Store {
 
     /// Delete a saved conversation (root frame) and all of its messages/artifacts.
     pub async fn delete_session(&self, frame_id: &str, project_id: &str) -> Result<()> {
+        self.require_unarchived_session(frame_id).await?;
         let exists: Option<(String,)> = sqlx::query_as(
             "SELECT id FROM frames WHERE id=? AND project_id=? AND parent_frame_id=id",
         )
@@ -1802,6 +2258,7 @@ impl Store {
         }
 
         if remove_source {
+            self.require_unarchived_session(frame_id).await?;
             if self
                 .session_has_conversation_branches(frame_id, source_project_id)
                 .await?
@@ -1837,7 +2294,7 @@ impl Store {
         }
 
         let source = sqlx::query(
-            "SELECT agent_name,status,model,reasoning_effort,input_tokens,output_tokens,completed_at,title \
+            "SELECT agent_name,status,model,reasoning_effort,service_tier,input_tokens,output_tokens,completed_at,title,head_epoch,context_epoch_high_water \
              FROM frames WHERE id=? AND project_id=? AND parent_frame_id=id",
         )
         .bind(frame_id)
@@ -1849,9 +2306,9 @@ impl Store {
         let now = chrono::Utc::now().timestamp();
         sqlx::query(
             "INSERT INTO frames(\
-                id,parent_frame_id,root_frame_id,agent_name,status,project_id,folder_id,model,reasoning_effort,\
-                input_tokens,output_tokens,created_at,updated_at,completed_at,title\
-             ) VALUES(?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,?)",
+                id,parent_frame_id,root_frame_id,agent_name,status,project_id,folder_id,model,reasoning_effort,service_tier,\
+                input_tokens,output_tokens,created_at,updated_at,completed_at,title,head_epoch,context_epoch_high_water\
+             ) VALUES(?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?,?)",
         )
         .bind(new_frame_id)
         .bind(new_frame_id)
@@ -1861,42 +2318,42 @@ impl Store {
         .bind(target_project_id)
         .bind(source.try_get::<Option<String>, _>("model")?)
         .bind(source.try_get::<Option<String>, _>("reasoning_effort")?)
+        .bind(source.try_get::<Option<String>, _>("service_tier")?)
         .bind(source.try_get::<Option<i64>, _>("input_tokens")?)
         .bind(source.try_get::<Option<i64>, _>("output_tokens")?)
         .bind(now)
         .bind(now)
         .bind(source.try_get::<Option<i64>, _>("completed_at")?)
         .bind(source.try_get::<Option<String>, _>("title")?)
+        .bind(source.try_get::<i64, _>("head_epoch")?)
+        .bind(source.try_get::<i64, _>("context_epoch_high_water")?)
         .execute(&mut *tx)
         .await?;
 
-        let messages = sqlx::query(
-            "SELECT seq,role,content,tool_calls,tool_call_id,tool_name,reasoning,ts,model_name \
+        // Every epoch moves with the conversation so frozen history stays
+        // rewindable in the target project.
+        sqlx::query(
+            "INSERT INTO messages(\
+                id,frame_id,seq,role,content,tool_calls,tool_call_id,tool_name,reasoning,ts,model_name,epoch\
+             ) SELECT lower(hex(randomblob(16))),?,seq,role,content,tool_calls,tool_call_id,tool_name,reasoning,ts,model_name,epoch \
              FROM messages WHERE frame_id=? ORDER BY seq",
         )
+        .bind(new_frame_id)
         .bind(frame_id)
-        .fetch_all(&mut *tx)
+        .execute(&mut *tx)
         .await?;
-        for message in messages {
-            sqlx::query(
-                "INSERT INTO messages(\
-                    id,frame_id,seq,role,content,tool_calls,tool_call_id,tool_name,reasoning,ts,model_name\
-                 ) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            )
-            .bind(uuid::Uuid::new_v4().to_string())
-            .bind(new_frame_id)
-            .bind(message.try_get::<i64, _>("seq")?)
-            .bind(message.try_get::<String, _>("role")?)
-            .bind(message.try_get::<Option<String>, _>("content")?)
-            .bind(message.try_get::<Option<String>, _>("tool_calls")?)
-            .bind(message.try_get::<Option<String>, _>("tool_call_id")?)
-            .bind(message.try_get::<Option<String>, _>("tool_name")?)
-            .bind(message.try_get::<Option<String>, _>("reasoning")?)
-            .bind(message.try_get::<i64, _>("ts")?)
-            .bind(message.try_get::<Option<String>, _>("model_name")?)
-            .execute(&mut *tx)
-            .await?;
-        }
+        sqlx::query(
+            "INSERT INTO context_epochs(frame_id,epoch,parent_epoch,strategy,kind,before_tokens,\
+                after_tokens,first_seq,initial_head_seq,checkpoint_seq,first_kept_seq,archive_ref,\
+                ui_event_seq,created_at) \
+             SELECT ?,epoch,parent_epoch,strategy,kind,before_tokens,after_tokens,first_seq,\
+                initial_head_seq,checkpoint_seq,first_kept_seq,archive_ref,ui_event_seq,created_at \
+             FROM context_epochs WHERE frame_id=?",
+        )
+        .bind(new_frame_id)
+        .bind(frame_id)
+        .execute(&mut *tx)
+        .await?;
 
         let reviews = sqlx::query(
             "SELECT message_seq,report_json,created_at,updated_at \
@@ -1951,6 +2408,7 @@ impl Store {
         project_id: &str,
         title: &str,
     ) -> Result<()> {
+        self.require_unarchived_session(frame_id).await?;
         let title = title.trim();
         if title.is_empty() {
             anyhow::bail!("Title cannot be empty");
@@ -2058,8 +2516,9 @@ impl Store {
         Ok(())
     }
 
-    /// Mark a branch created by the current checkpoint-aware flow. Legacy rows
-    /// with only `branched_from` deliberately do not participate.
+    /// Mark a branch created by the current checkpoint-aware flow, inheriting
+    /// its source's folder so the sidebar can nest it beneath that source.
+    /// Legacy rows with only `branched_from` deliberately do not participate.
     pub async fn set_session_branch_point(
         &self,
         frame_id: &str,
@@ -2071,12 +2530,15 @@ impl Store {
             anyhow::bail!("Invalid conversation branch checkpoint kind");
         }
         sqlx::query(
-            "UPDATE frames SET branched_from=?,branch_point_user_index=?,branch_point_kind=? \
+            "UPDATE frames SET branched_from=?,branch_point_user_index=?,branch_point_kind=?, \
+             folder_id=(SELECT source.folder_id FROM frames source \
+                        WHERE source.id=? AND source.project_id=frames.project_id) \
              WHERE id=?",
         )
         .bind(source_id)
         .bind(i64::try_from(checkpoint_user_index)?)
         .bind(checkpoint_kind)
+        .bind(source_id)
         .bind(frame_id)
         .execute(&self.pool)
         .await?;
@@ -2256,22 +2718,12 @@ impl Store {
                 .fetch_one(&mut *tx)
                 .await?;
         let message = Message::assistant(summary);
-        sqlx::query(
-            "INSERT INTO messages(id,frame_id,seq,role,content,tool_calls,tool_call_id,tool_name,reasoning,ts,model_name) \
-             VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        insert_message_row(
+            &mut *tx,
+            &preview.main_session_id,
+            summary_message_seq,
+            &message,
         )
-        .bind(uuid::Uuid::new_v4().to_string())
-        .bind(&preview.main_session_id)
-        .bind(summary_message_seq)
-        .bind("assistant")
-        .bind(serde_json::to_string(&message.content)?)
-        .bind(Option::<String>::None)
-        .bind(Option::<String>::None)
-        .bind(Option::<String>::None)
-        .bind(Option::<String>::None)
-        .bind(message.ts)
-        .bind(Option::<String>::None)
-        .execute(&mut *tx)
         .await?;
         // Do not emit a normal Text event for the summary. Event replay
         // coalesces adjacent assistant text, so a tail-only merge could be
@@ -2323,12 +2775,20 @@ impl Store {
         }
         let now = chrono::Utc::now().timestamp();
         let n = sqlx::query(
-            "UPDATE frames SET folder_id=?, updated_at=? WHERE id=? AND project_id=? AND parent_frame_id=id",
+            // Move the persisted subtree, including descendants outside the loaded
+            // sidebar page. UNION also terminates malformed cyclic branch links.
+            "WITH RECURSIVE family(id) AS ( \
+                SELECT id FROM frames WHERE id=? AND project_id=? AND parent_frame_id=id \
+                UNION \
+                SELECT f.id FROM frames f JOIN family ON f.branched_from=family.id \
+                WHERE f.project_id=? AND f.parent_frame_id=f.id AND f.exploration_id IS NULL \
+             ) UPDATE frames SET folder_id=?, updated_at=? WHERE id IN (SELECT id FROM family)",
         )
-        .bind(folder_id)
-        .bind(now)
         .bind(frame_id)
         .bind(project_id)
+        .bind(project_id)
+        .bind(folder_id)
+        .bind(now)
         .execute(&self.pool)
         .await?;
         if n.rows_affected() == 0 {

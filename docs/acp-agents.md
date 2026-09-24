@@ -4,6 +4,14 @@ Wisp can run an external coding agent through the [Agent Client Protocol](https:
 
 ACP Agents are **not** HTTP model profiles. Settings → Models configures API providers for the built-in Wisp agent. ACP configures a separate local process that owns its own session, tools, and auth.
 
+Each conversation retains its own agent binding when switching sessions or
+restarting Wisp. Model/reasoning configuration options are cached per conversation
+and launch-profile fingerprint, including subsequent agent option updates. When
+an agent omits options from load/resume, Wisp restores the last received list;
+an explicitly empty list clears it. Restored controls work before the first
+message by resuming the bound agent when a setting is changed. Older sessions
+without a saved list must receive options once before Wisp can cache them.
+
 ## Prerequisites
 
 1. Install Node.js (needed for the official npm ACP adapters).
@@ -42,7 +50,7 @@ Click a row to edit. HTTP and ACP both use Cancel / Save on the subpage.
 
 4. Click **Save Agent**.
 5. Click **Test Connection**. A success message means Wisp could launch the process and complete ACP `initialize`.
-6. If auth methods appear after the test, click the advertised button (for example browser login). Credentials stay with the agent; Wisp does not store them in SQLite.
+6. If auth methods appear after the test, click the advertised button. Agent-managed methods run through ACP directly. For a terminal method, Wisp opens the adapter's advertised login command in the integrated terminal; complete the interactive login there, then test or start the ACP session again. Credentials stay with the agent; Wisp does not store them in SQLite.
 7. Close the dialog, open the model picker again, and select the ACP Agent under **ACP Agents**.
 8. Send a prompt. The first prompt locks that session to the selected agent.
 
@@ -118,6 +126,15 @@ npm install -g @agentclientprotocol/claude-agent-acp
 - Permission cards show the exact options the agent returns; choose one to continue.
 - If the agent advertises session config options (model, mode, …), open the compact ACP model menu beside Send to adjust them.
 - Stop cancels the active ACP turn for the bound session.
+- ACP startup, authentication, disconnect, and resume/load failures stop the
+  request. The error card retains the original error and explicitly says Wisp
+  did not fall back to an HTTP model. It offers no native transcript **Resume**
+  action: check the ACP connection/login and send the message again. To use an
+  HTTP model, start a new conversation and select it explicitly; HTTP API usage
+  may incur separate charges. A legacy HTTP value in `frames.model` does not
+  override an existing `acp_sessions` binding.
+- When the first send creates the conversation, a startup failure before ACP
+  binds it keeps the selected ACP Agent in the picker for the next send.
 - After restart, Wisp reconnects only when the same profile fingerprint and project path still match and the agent supports resume/load. Editing Command/Arguments creates a new fingerprint; start a fresh session.
 
 Wisp injects its scientific MCP bridge into the ACP session, so the external
@@ -194,8 +211,9 @@ can be imported into the current project without copy/paste (#464).
 - Choose the local machine, a registered WSL distribution, or a configured SSH
   server. Codex sessions come from `~/.codex/sessions`; Claude Code sessions
   come from `~/.claude/projects`. The newest 500 sessions are listed 25 at a
-  time with the working directory, message count, and last activity. Click a
-  row to load a bounded preview of its first conversation turns.
+  time with the title, working directory, message count, and last activity.
+  Use the search field to match a title, project path, session ID, or source
+  path. Click a row to load a bounded preview of its first conversation turns.
 - **Import** copies the user/assistant turns into a regular Wisp session; the
   original chronology is preserved in the sidebar ordering. Wisp creates or
   reuses a `codex` or `claude` group for newly imported sessions. The dialog
@@ -206,6 +224,8 @@ can be imported into the current project without copy/paste (#464).
 - Discovery metadata is cached per app/source combination. Reopening the
   dialog or switching back to a source uses that cache; **Refresh** compares
   file size and modification time and only rereads metadata for changed files.
+  Local Codex metadata is read from complete JSONL records, so large instruction
+  preambles do not turn a title or message count into a directory-name or zero.
   Remote scans transfer a small metadata prefix, while **Import** reads the
   selected full transcript. Importing updates the visible row without starting
   another scan.
@@ -240,7 +260,7 @@ can be imported into the current project without copy/paste (#464).
 
 ## Related docs
 
-- [GitHub Pages: ACP Agent 配置](acp-agents.html) — site page for this guide
+- [GitHub Pages tutorials](tutorials.html) — includes the advanced ACP configuration tutorial
 - [Model configuration](model-configuration.md) — HTTP API profiles for the built-in agent
 - [ACP client integration plan](superpowers/plans/2026-07-11-acp-client-integration.md) — architecture notes
 - [ACP protocol](https://agentclientprotocol.com/protocol/v1/overview)

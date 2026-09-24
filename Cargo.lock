@@ -98,6 +98,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "ambient-authority"
+version = "0.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9d4ee0d472d1cd2e28c97dfa124b3d8d992e10eb0a035f33f5d12e3a177ba3b"
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -443,7 +449,7 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
 dependencies = [
- "bit-vec",
+ "bit-vec 0.8.0",
 ]
 
 [[package]]
@@ -451,6 +457,15 @@ name = "bit-vec"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
+
+[[package]]
+name = "bit-vec"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b71798fca2c1fe1086445a7258a4bc81e6e49dcd24c8d0dd9a1e57395b603f51"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "bitflags"
@@ -639,6 +654,48 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f2d30e4173c4026932d51d31d6b0613b1fd3014bf3f9f8943d4ba139c437ba0"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "cap-fs-ext"
+version = "3.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "476f0d0003a760918ed4b1e039a59e11769030416f79c8222551d22785f7f70d"
+dependencies = [
+ "cap-primitives",
+ "cap-std",
+ "io-lifetimes",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "cap-primitives"
+version = "3.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e0bf07d379916947be6c4a07f43684153d710a2896c31f9e97781362895596c"
+dependencies = [
+ "ambient-authority",
+ "fs-set-times",
+ "io-extras",
+ "io-lifetimes",
+ "ipnet",
+ "maybe-owned",
+ "rustix",
+ "rustix-linux-procfs",
+ "windows-sys 0.59.0",
+ "winx",
+]
+
+[[package]]
+name = "cap-std"
+version = "3.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a59e59fa26472d29680ece6a9f8ee8b0551a719a33df2f5240bde065ecbddfd7"
+dependencies = [
+ "cap-primitives",
+ "io-extras",
+ "io-lifetimes",
+ "rustix",
 ]
 
 [[package]]
@@ -1693,6 +1750,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs-set-times"
+version = "0.20.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94e7099f6313ecacbe1256e8ff9d617b75d1bcb16a6fddef94866d225a01a14a"
+dependencies = [
+ "io-lifetimes",
+ "rustix",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2582,6 +2650,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-extras"
+version = "0.18.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2285ddfe3054097ef4b2fe909ef8c3bcd1ea52a8f0d274416caebeef39f04a65"
+dependencies = [
+ "io-lifetimes",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "io-lifetimes"
+version = "2.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06432fb54d3be7964ecd3649233cddf80db2832f47fec34c01f65b3d9d774983"
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3018,6 +3102,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
+name = "maybe-owned"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4facc753ae494aeb6e3c22f839b158aebd4f9270f55cd3c79906c45476c47ab4"
+
+[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3047,6 +3137,16 @@ name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+
+[[package]]
+name = "mime_guess"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
+dependencies = [
+ "mime",
+ "unicase",
+]
 
 [[package]]
 name = "minisign-verify"
@@ -3122,6 +3222,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ndk-context"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
+
+[[package]]
 name = "ndk-sys"
 version = "0.6.0+11769913"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3155,6 +3261,52 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "noodles-bgzf"
+version = "0.46.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37290f565045fd2775b549e62dffca7e1afadc70d8d5a3a2ef19609eb3d8193b"
+dependencies = [
+ "bytes",
+ "crossbeam-channel",
+ "flate2",
+]
+
+[[package]]
+name = "noodles-core"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53e1e8a419dbba0e4000b0e60830b124138c7f2277ad556463506f1a81d32d17"
+dependencies = [
+ "bstr",
+]
+
+[[package]]
+name = "noodles-csi"
+version = "0.55.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9c846d8128bd80b18d891b13cb9e0bc1d364429d6ab3ec3c83939f3d32ba105"
+dependencies = [
+ "bit-vec 0.9.1",
+ "bstr",
+ "indexmap 2.14.0",
+ "noodles-bgzf",
+ "noodles-core",
+]
+
+[[package]]
+name = "noodles-tabix"
+version = "0.61.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2443d0852c9618cd4aa8d11bc7c1884285e46aa4466cf5c1e49f3d9756ca7ced"
+dependencies = [
+ "bstr",
+ "indexmap 2.14.0",
+ "noodles-bgzf",
+ "noodles-core",
+ "noodles-csi",
 ]
 
 [[package]]
@@ -3847,8 +3999,15 @@ checksum = "f86ba2052aebccc42cbbb3ed234b8b13ce76f75c3551a303cb2bcffcff12bb14"
 dependencies = [
  "bitflags 2.13.0",
  "memchr",
+ "pulldown-cmark-escape",
  "unicase",
 ]
+
+[[package]]
+name = "pulldown-cmark-escape"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "007d8adb5ddab6f8e3f491ac63566a7d5002cc7ed73901f72057943fa71ae1ae"
 
 [[package]]
 name = "pxfm"
@@ -4140,6 +4299,7 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
+ "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -4242,6 +4402,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxmltree"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4267,6 +4436,16 @@ dependencies = [
  "libc",
  "linux-raw-sys",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rustix-linux-procfs"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fc84bf7e9aa16c4f2c758f27412dc9841341e16aa682d9c7ac308fe3ee12056"
+dependencies = [
+ "once_cell",
+ "rustix",
 ]
 
 [[package]]
@@ -5150,9 +5329,7 @@ dependencies = [
 
 [[package]]
 name = "tao"
-version = "0.35.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1c93047acf68669466a34690ac58cca7010bd1b201e1ec86f1fd0a75d3dd4a9"
+version = "0.37.0"
 dependencies = [
  "bitflags 2.13.0",
  "block2",
@@ -5170,6 +5347,7 @@ dependencies = [
  "libc",
  "log",
  "ndk",
+ "ndk-context",
  "ndk-sys",
  "objc2",
  "objc2-app-kit",
@@ -5182,17 +5360,17 @@ dependencies = [
  "tao-macros",
  "unicode-segmentation",
  "url",
- "windows",
- "windows-core 0.61.2",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
  "windows-version",
  "x11-dl",
 ]
 
 [[package]]
 name = "tao-macros"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4e16beb8b2ac17db28eab8bca40e62dbfbb34c0fcdc6d9826b11b7b5d047dfd"
+checksum = "5f7eeb6d99155545da6150a1795945f16ac9c178deb2a5f2e74d776107bd5849"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5264,7 +5442,7 @@ dependencies = [
  "webkit2gtk",
  "webview2-com",
  "window-vibrancy",
- "windows",
+ "windows 0.61.3",
 ]
 
 [[package]]
@@ -5424,7 +5602,7 @@ dependencies = [
  "tauri-plugin",
  "thiserror 2.0.18",
  "url",
- "windows",
+ "windows 0.61.3",
  "zbus",
 ]
 
@@ -5499,14 +5677,12 @@ dependencies = [
  "url",
  "webkit2gtk",
  "webview2-com",
- "windows",
+ "windows 0.61.3",
 ]
 
 [[package]]
 name = "tauri-runtime-wry"
 version = "2.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e6fac707727b7a2f48e4ded90976324267371073edbb415ffb73bb0458d203f"
 dependencies = [
  "gtk",
  "http",
@@ -5524,7 +5700,7 @@ dependencies = [
  "url",
  "webkit2gtk",
  "webview2-com",
- "windows",
+ "windows 0.61.3",
  "wry",
 ]
 
@@ -5584,7 +5760,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ed071c670382e85fc2f48ae706492d8c338f4f89bf72520d32f8abfe880aade"
 dependencies = [
  "thiserror 2.0.18",
- "windows",
+ "windows 0.61.3",
  "windows-version",
 ]
 
@@ -6530,7 +6706,7 @@ checksum = "7130243a7a5b33c54a444e54842e6a9e133de08b5ad7b5861cd8ed9a6a5bc96a"
 dependencies = [
  "webview2-com-macros",
  "webview2-com-sys",
- "windows",
+ "windows 0.61.3",
  "windows-core 0.61.2",
  "windows-implement",
  "windows-interface",
@@ -6554,7 +6730,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "381336cfffd772377d291702245447a5251a2ffa5bad679c99e61bc48bacbf9c"
 dependencies = [
  "thiserror 2.0.18",
- "windows",
+ "windows 0.61.3",
  "windows-core 0.61.2",
 ]
 
@@ -6628,11 +6804,23 @@ version = "0.61.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9babd3a767a4c1aef6900409f85f5d53ce2544ccdfaa86dad48c91782c6d6893"
 dependencies = [
- "windows-collections",
+ "windows-collections 0.2.0",
  "windows-core 0.61.2",
- "windows-future",
+ "windows-future 0.2.1",
  "windows-link 0.1.3",
- "windows-numerics",
+ "windows-numerics 0.2.0",
+]
+
+[[package]]
+name = "windows"
+version = "0.62.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "527fadee13e0c05939a6a05d5bd6eec6cd2e3dbd648b9f8e447c6518133d8580"
+dependencies = [
+ "windows-collections 0.3.2",
+ "windows-core 0.62.2",
+ "windows-future 0.3.2",
+ "windows-numerics 0.3.1",
 ]
 
 [[package]]
@@ -6642,6 +6830,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3beeceb5e5cfd9eb1d76b381630e82c4241ccd0d27f1a39ed41b2760b255c5e8"
 dependencies = [
  "windows-core 0.61.2",
+]
+
+[[package]]
+name = "windows-collections"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b2d95af1a8a14a3c7367e1ed4fc9c20e0a26e79551b1454d72583c97cc6610"
+dependencies = [
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -6678,7 +6875,18 @@ checksum = "fc6a41e98427b19fe4b73c550f060b59fa592d7d686537eebf9385621bfbad8e"
 dependencies = [
  "windows-core 0.61.2",
  "windows-link 0.1.3",
- "windows-threading",
+ "windows-threading 0.1.0",
+]
+
+[[package]]
+name = "windows-future"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1d6f90251fe18a279739e78025bd6ddc52a7e22f921070ccdc67dde84c605cb"
+dependencies = [
+ "windows-core 0.62.2",
+ "windows-link 0.2.1",
+ "windows-threading 0.2.1",
 ]
 
 [[package]]
@@ -6723,6 +6931,16 @@ checksum = "9150af68066c4c5c07ddc0ce30421554771e528bde427614c61038bc2c92c2b1"
 dependencies = [
  "windows-core 0.61.2",
  "windows-link 0.1.3",
+]
+
+[[package]]
+name = "windows-numerics"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e2e40844ac143cdb44aead537bbf727de9b044e107a0f1220392177d15b0f26"
+dependencies = [
+ "windows-core 0.62.2",
+ "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -6896,6 +7114,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b66463ad2e0ea3bbf808b7f1d371311c80e115c0b71d60efc142cafbcfb057a6"
 dependencies = [
  "windows-link 0.1.3",
+]
+
+[[package]]
+name = "windows-threading"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3949bd5b99cafdf1c7ca86b43ca564028dfe27d66958f2470940f73d86d75b37"
+dependencies = [
+ "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -7137,8 +7364,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d135d17ab770252ad95e9a872d365cf3090e3be864a34ab46f48555993efc904"
 
 [[package]]
+name = "winx"
+version = "0.36.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f3fd376f71958b862e7afb20cfe5a22830e1963462f3a17f49d82a6c1d1f42d"
+dependencies = [
+ "bitflags 2.13.0",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "wisp-acp"
-version = "1.6.0"
+version = "0.13.0"
 dependencies = [
  "agent-client-protocol",
  "async-process",
@@ -7150,8 +7387,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "wisp-app"
+version = "0.13.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "wisp-dto",
+ "wisp-llm",
+ "wisp-store",
+]
+
+[[package]]
+name = "wisp-bio"
+version = "0.13.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "flate2",
+ "noodles-bgzf",
+ "noodles-core",
+ "noodles-csi",
+ "noodles-tabix",
+ "reqwest 0.12.28",
+ "roxmltree",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "wisp-llm",
+ "wisp-tools",
+]
+
+[[package]]
 name = "wisp-cli"
-version = "1.6.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7164,17 +7438,21 @@ dependencies = [
  "tokio",
  "tracing-subscriber",
  "uuid",
+ "wisp-bio",
  "wisp-core",
+ "wisp-dto",
  "wisp-llm",
  "wisp-mcp",
+ "wisp-runs",
  "wisp-runtime",
  "wisp-skills",
+ "wisp-store",
  "wisp-tools",
 ]
 
 [[package]]
 name = "wisp-core"
-version = "1.6.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7189,6 +7467,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "wisp-dto",
  "wisp-llm",
  "wisp-skills",
  "wisp-tools",
@@ -7196,7 +7475,7 @@ dependencies = [
 
 [[package]]
 name = "wisp-dto"
-version = "1.6.0"
+version = "0.13.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7204,25 +7483,33 @@ dependencies = [
 
 [[package]]
 name = "wisp-llm"
-version = "1.6.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "futures-util",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "system-configuration",
  "tokio",
+ "tracing",
  "url",
+ "uuid",
+ "windows-registry",
 ]
 
 [[package]]
 name = "wisp-mcp"
-version = "1.6.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "futures-util",
+ "image",
  "libc",
+ "regex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -7230,50 +7517,98 @@ dependencies = [
  "tracing",
  "windows-sys 0.61.2",
  "wisp-llm",
- "wisp-paths",
  "wisp-tools",
 ]
 
 [[package]]
 name = "wisp-paths"
-version = "1.6.0"
+version = "0.13.0"
+
+[[package]]
+name = "wisp-runs"
+version = "0.13.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "dirs 5.0.1",
+ "dunce",
+ "glob",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "uuid",
+ "walkdir",
+ "wisp-core",
+ "wisp-llm",
+ "wisp-store",
+ "wisp-sync",
+ "wisp-tools",
+]
 
 [[package]]
 name = "wisp-runtime"
-version = "1.6.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "dunce",
+ "hex",
+ "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "uuid",
  "which",
+ "windows-sys 0.61.2",
  "wisp-llm",
  "wisp-paths",
  "wisp-tools",
+]
+
+[[package]]
+name = "wisp-service"
+version = "0.13.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "wisp-app",
+ "wisp-dto",
+ "wisp-store",
 ]
 
 [[package]]
 name = "wisp-skills"
-version = "1.6.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "hex",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2",
+ "tokio",
+ "url",
+ "uuid",
  "walkdir",
+ "wisp-dto",
  "wisp-llm",
  "wisp-paths",
  "wisp-tools",
+ "zip 2.4.2",
 ]
 
 [[package]]
 name = "wisp-store"
-version = "1.6.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7285,13 +7620,15 @@ dependencies = [
  "sha2",
  "sqlx",
  "tokio",
+ "tracing",
  "uuid",
+ "wisp-dto",
  "wisp-llm",
 ]
 
 [[package]]
 name = "wisp-sync"
-version = "1.6.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7312,7 +7649,7 @@ dependencies = [
 
 [[package]]
 name = "wisp-tauri"
-version = "1.6.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7328,6 +7665,9 @@ dependencies = [
  "ignore",
  "image",
  "mac-notification-sys",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "portable-pty",
  "pulldown-cmark",
  "qrcode",
@@ -7339,6 +7679,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tao",
  "tar",
  "tauri",
  "tauri-build",
@@ -7348,6 +7689,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
  "tauri-winrt-notification",
+ "tempfile",
  "tokio",
  "tokio-tungstenite",
  "tracing",
@@ -7356,14 +7698,17 @@ dependencies = [
  "uuid",
  "walkdir",
  "which",
- "windows",
+ "windows 0.61.3",
  "winreg 0.55.0",
  "wisp-acp",
+ "wisp-app",
+ "wisp-bio",
  "wisp-core",
  "wisp-dto",
  "wisp-llm",
  "wisp-mcp",
  "wisp-paths",
+ "wisp-runs",
  "wisp-runtime",
  "wisp-skills",
  "wisp-store",
@@ -7374,18 +7719,24 @@ dependencies = [
 
 [[package]]
 name = "wisp-tools"
-version = "1.6.0"
+version = "0.13.0"
 dependencies = [
  "anydoc",
  "async-trait",
  "base64 0.22.1",
+ "cap-fs-ext",
+ "cap-std",
  "dunce",
  "glob",
  "image",
+ "libc",
  "regex",
+ "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "walkdir",
+ "windows-sys 0.61.2",
  "wisp-llm",
 ]
 
@@ -7439,7 +7790,7 @@ dependencies = [
  "webkit2gtk",
  "webkit2gtk-sys",
  "webview2-com",
- "windows",
+ "windows 0.61.3",
  "windows-core 0.61.2",
  "windows-version",
  "x11-dl",

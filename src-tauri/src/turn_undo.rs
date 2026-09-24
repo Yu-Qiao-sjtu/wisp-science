@@ -389,7 +389,7 @@ async fn validate_undo_session(state: &AppState, frame_id: &str) -> Result<(), S
 #[tauri::command]
 pub(super) async fn preview_turn_undo(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     session_id: Option<String>,
     user_index: usize,
 ) -> Result<TurnUndoPreview, String> {
@@ -405,12 +405,17 @@ pub(super) async fn preview_turn_undo(
 pub(super) async fn undo_turn(
     state: State<'_, AppState>,
     app: AppHandle,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     session_id: Option<String>,
     user_index: usize,
 ) -> Result<TurnUndoPreview, String> {
     let (frame_id, project) = frame_and_project(state.inner(), window.label(), session_id).await?;
     let _project_activity = state.begin_project_activity(&project.id)?;
+    state
+        .store
+        .require_unarchived_session(&frame_id)
+        .await
+        .map_err(|e| e.to_string())?;
     let scope = state
         .store
         .frame_state_scope(&frame_id)
@@ -460,15 +465,18 @@ pub(super) async fn undo_turn(
     }
     if let Some(runtime) = runtime {
         *runtime.agent.lock().await = None;
-        runtime.set_last_seq(target.keep_seq);
+        runtime
+            .sync_last_seq_from_store(&state.store, &frame_id)
+            .await?;
     }
     for change in applied {
-        crate::emit_agent_event(
+        crate::emit_agent_event_in(
             &app,
             AgentEvent::FileChanged {
                 frame_id: frame_id.clone(),
                 path: change.path,
             },
+            Some(project.id.as_str()),
         );
     }
     Ok(preview)

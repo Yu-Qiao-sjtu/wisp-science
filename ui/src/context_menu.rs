@@ -2,8 +2,11 @@ use crate::app_support::{
     selection_targets_center_file, workspace_absolute_path, workspace_relative_path,
     SessionTransferMode,
 };
-use crate::dto::QuickAction;
+use crate::dto::{ChatItem, MessageResource, QuickAction};
 use crate::i18n::{self, Locale};
+use crate::text::{
+    decode_href, file_kind, is_external_href, is_runtime_code_selection, normalize_path,
+};
 use crate::window_capture_escape;
 use leptos::*;
 use wasm_bindgen::prelude::*;
@@ -64,6 +67,15 @@ fn item(action: &str, label: String, payload: String) -> CtxItem {
         payload,
         children: Vec::new(),
     }
+}
+
+pub(crate) fn motif_sequence_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [
+        ".dna", ".fa", ".fasta", ".fna", ".ffn", ".faa", ".frn", ".gb", ".gbk", ".genbank", ".seq",
+    ]
+    .iter()
+    .any(|extension| lower.ends_with(extension))
 }
 
 fn submenu(label: String, children: Vec<CtxItem>) -> CtxItem {
@@ -129,6 +141,113 @@ fn workspace_path_copy_items(
     items
 }
 
+fn local_workspace_menu_path(project_root: Option<&str>, path: &str) -> Option<String> {
+    let path = normalize_path(&decode_href(path));
+    if path.is_empty()
+        || is_external_href(&path)
+        || path.contains("://")
+        || path.starts_with("artifact:")
+        || path.starts_with("artifact-version:")
+        || path.starts_with("remote:")
+    {
+        return None;
+    }
+    workspace_relative_path(project_root.unwrap_or_default(), &path)
+        .filter(|relative| !relative.is_empty())
+}
+
+fn chat_workspace_path(target: &web_sys::Element, project_root: Option<&str>) -> Option<String> {
+    if let Some(reference) = closest(target, ".md [data-workspace-path]") {
+        let path = reference
+            .get_attribute("data-workspace-path")
+            .unwrap_or_default();
+        if let Some(path) = local_workspace_menu_path(project_root, &path) {
+            return Some(path);
+        }
+    }
+
+    // Ordinary Markdown links can also point at project files/directories.
+    // Keep anchors, section links and external URLs on their existing routes.
+    let link = closest(target, ".md a[href]")?;
+    let href = link.get_attribute("href").unwrap_or_default();
+    let decoded = normalize_path(&decode_href(&href));
+    let looks_like_workspace_entry = link.class_list().contains("workspace-path-link")
+        || file_kind(&decoded).is_some()
+        || decoded.ends_with(['/', '\\']);
+    looks_like_workspace_entry
+        .then(|| local_workspace_menu_path(project_root, &decoded))
+        .flatten()
+}
+
+fn chat_workspace_path_menu(
+    x: f64,
+    y: f64,
+    path: String,
+    project_root: Option<&str>,
+    locale: Locale,
+) -> CtxMenu {
+    let mut items = vec![
+        item(
+            "openWorkspacePathInSystem",
+            i18n::t(locale, "ctx.open_with_system"),
+            path.clone(),
+        ),
+        item(
+            "openWorkspaceFileCenter",
+            i18n::t(locale, "center.open_file"),
+            path.clone(),
+        ),
+    ];
+    items.extend(workspace_path_copy_items(&path, &[], project_root, locale));
+    items.push(item(
+        "revealInFileManager",
+        i18n::t(locale, "ctx.reveal_in_manager"),
+        path,
+    ));
+    CtxMenu { x, y, items }
+}
+
+// Bound links deliberately have href="#". Resolve their menu from the same
+// persisted identity used by left-click previews, never from that placeholder.
+fn bound_resource_menu(
+    x: f64,
+    y: f64,
+    resource: &MessageResource,
+    project_root: Option<&str>,
+    locale: Locale,
+) -> CtxMenu {
+    let mut menu = CtxMenu {
+        x,
+        y,
+        items: Vec::new(),
+    };
+    let Some(version_id) = resource
+        .artifact_version_id
+        .as_ref()
+        .filter(|_| resource.status == "ready")
+    else {
+        return menu;
+    };
+    if let Some(path) = local_workspace_menu_path(project_root, &resource.original_reference) {
+        menu = chat_workspace_path_menu(x, y, path, project_root, locale);
+        menu.items
+            .retain(|item| item.action != "openWorkspaceFileCenter");
+    }
+    let preview_path = format!("artifact-version:{version_id}");
+    menu.items.push(item(
+        "openBoundResourceCenter",
+        i18n::t(locale, "center.open_file"),
+        serde_json::to_string(&(&preview_path, &resource.display_name, &resource.kind))
+            .unwrap_or_default(),
+    ));
+    menu.items.push(item(
+        "downloadFile",
+        i18n::t(locale, "artifact.download"),
+        preview_path,
+    ));
+    menu
+}
+
 pub fn remote_file_download_uri(context_id: &str, path: &str) -> Option<String> {
     let alias = context_id.strip_prefix("ssh:")?;
     if alias.is_empty()
@@ -182,6 +301,24 @@ pub(crate) fn uses_native_text_menu(ev: &web_sys::MouseEvent) -> bool {
     event_target(ev)
         .and_then(|target| editable_text_entry(&target))
         .is_some()
+}
+
+/// True when this mouseup landed on a control that already has a click action
+/// (file/path link, artifact chip, attachment, copy button). A click that
+/// happens to select the control's own label must not also raise the quote
+/// popup on top of the preview or other action that click opens.
+pub(crate) fn selection_popup_blocked(ev: &web_sys::MouseEvent) -> bool {
+    event_element(ev)
+        .and_then(|target| closest(&target, "a, button"))
+        .is_some()
+}
+
+fn event_element(ev: &web_sys::MouseEvent) -> Option<web_sys::Element> {
+    let target = ev.target()?;
+    if let Ok(el) = target.clone().dyn_into::<web_sys::Element>() {
+        return Some(el);
+    }
+    target.dyn_into::<web_sys::Node>().ok()?.parent_element()
 }
 
 pub(crate) fn selection_text() -> Option<String> {
@@ -485,6 +622,7 @@ pub fn build(
     quick_actions: &[QuickAction],
     project_root: Option<&str>,
     selected_workspace_paths: &[String],
+    chat_items: &[ChatItem],
 ) -> Option<CtxMenu> {
     let target = event_target(ev)?;
     let x = ev.client_x() as f64;
@@ -513,6 +651,35 @@ pub fn build(
         }
     }
 
+    if let Some(reference) = closest(&target, ".md [data-resource-id]") {
+        let resource_id = reference
+            .get_attribute("data-resource-id")
+            .unwrap_or_default();
+        let resource = chat_items.iter().find_map(|item| match item {
+            ChatItem::Assistant { resources, .. } => {
+                resources.iter().find(|resource| resource.id == resource_id)
+            }
+            _ => None,
+        });
+        // An unresolved binding must not fall through to copying the message.
+        return Some(
+            resource
+                .map(|resource| bound_resource_menu(x, y, resource, project_root, locale))
+                .unwrap_or(CtxMenu {
+                    x,
+                    y,
+                    items: Vec::new(),
+                }),
+        );
+    }
+
+    // All workspace-path controls inside assistant Markdown own one
+    // file-focused menu: ordinary path links and collected-artifact chips.
+    // This must run before selection/message fallbacks.
+    if let Some(path) = chat_workspace_path(&target, project_root) {
+        return Some(chat_workspace_path_menu(x, y, path, project_root, locale));
+    }
+
     let text_entry = editable_text_entry(&target);
     // A stray text selection (e.g. an accidentally selected file name) must not
     // hijack the context menu of a structural row — file rows, artifact tiles,
@@ -522,8 +689,9 @@ pub fn build(
         closest(&target, ".fb-row, .rp-tile, .side-item.ses, .side-folder").is_some();
     if text_entry.is_none() && !on_structural_row {
         if let Some(text) = selection_text() {
-            // Mirror the selection popup's quote/explain actions so right-click
-            // offers everything in one menu instead of stacking popups.
+            // Mirror the selection popup so right-click offers the same
+            // destinations instead of stacking overlays. R/Python source
+            // keeps quote/explain and skips literature/review actions.
             let source = closest(&target, "[data-file-path]")
                 .and_then(|el| el.get_attribute("data-file-path"))
                 .filter(|source| !source.is_empty());
@@ -542,22 +710,24 @@ pub fn build(
                     quote_payload,
                 ),
             ];
-            items.extend(
-                quick_actions
-                    .iter()
-                    .filter(|action| action.enabled && action.context == "selection")
-                    .map(|action| {
-                        item(
-                            "runQuickAction",
-                            crate::app_support::quick_action_label(locale, action),
-                            format!(
-                                "{}\u{1e}{}\u{1e}{text}",
-                                action.id,
-                                source.as_deref().unwrap_or_default()
-                            ),
-                        )
-                    }),
-            );
+            if !is_runtime_code_selection(source.as_deref()) {
+                items.extend(
+                    quick_actions
+                        .iter()
+                        .filter(|action| action.enabled && action.context == "selection")
+                        .map(|action| {
+                            item(
+                                "runQuickAction",
+                                crate::app_support::quick_action_label(locale, action),
+                                format!(
+                                    "{}\u{1e}{}\u{1e}{text}",
+                                    action.id,
+                                    source.as_deref().unwrap_or_default()
+                                ),
+                            )
+                        }),
+                );
+            }
             items.push(item(
                 "explainSelection",
                 i18n::t(locale, "selection.explain"),
@@ -646,6 +816,16 @@ pub fn build(
                         location.clone(),
                     ),
                 );
+                if motif_sequence_path(&path) {
+                    items.insert(
+                        2,
+                        item(
+                            "addWorkspaceFileToMotif",
+                            i18n::t(locale, "ctx.add_to_motif"),
+                            location.clone(),
+                        ),
+                    );
+                }
                 items.push(item(
                     "downloadFile",
                     i18n::t(locale, "artifact.download"),
@@ -742,6 +922,15 @@ pub fn build(
                     i18n::t(locale, "ctx.attach_file"),
                     path.clone(),
                 ),
+            ]);
+            if motif_sequence_path(&path) {
+                items.push(item(
+                    "addWorkspaceFileToMotif",
+                    i18n::t(locale, "ctx.add_to_motif"),
+                    path.clone(),
+                ));
+            }
+            items.extend([
                 item(
                     "registerWorkspaceArtifact",
                     i18n::t(locale, "ctx.register_artifact"),
@@ -864,6 +1053,123 @@ mod remote_file_tests {
             })
         );
         assert_eq!(workspace_entry_action("renameWorkspaceFile", ""), None);
+    }
+}
+
+#[cfg(test)]
+mod chat_workspace_path_tests {
+    use super::local_workspace_menu_path;
+
+    #[test]
+    fn bound_file_menu_keeps_workspace_actions_separate_from_snapshot_actions() {
+        let mut resource = crate::dto::MessageResource {
+            id: "link".into(),
+            ordinal: 0,
+            original_reference: "results/quality%20report.html".into(),
+            artifact_id: Some("artifact".into()),
+            artifact_version_id: Some("version".into()),
+            display_name: "quality report.html".into(),
+            kind: "html".into(),
+            mime_type: "text/html".into(),
+            status: "ready".into(),
+            error: None,
+        };
+        for (root, reference, absolute) in [
+            (
+                "/work/project",
+                "results/quality%20report.html",
+                "/work/project/results/quality report.html",
+            ),
+            (
+                r"C:\work\project",
+                "c:%5CWORK%5Cproject%5Cresults%5Cquality%20report.html",
+                r"C:\work\project\results\quality report.html",
+            ),
+        ] {
+            resource.original_reference = reference.into();
+            let menu = super::bound_resource_menu(
+                0.0,
+                0.0,
+                &resource,
+                Some(root),
+                crate::i18n::Locale::En,
+            );
+            let payload = |action| {
+                menu.items
+                    .iter()
+                    .find(|item| item.action == action)
+                    .unwrap()
+                    .payload
+                    .as_str()
+            };
+            for action in [
+                "openWorkspacePathInSystem",
+                "revealInFileManager",
+                "copyRelativePath",
+            ] {
+                assert_eq!(payload(action), "results/quality report.html");
+            }
+            assert_eq!(payload("copyAbsolutePath"), absolute);
+            assert_eq!(payload("downloadFile"), "artifact-version:version");
+            let preview: (String, String, String) =
+                serde_json::from_str(payload("openBoundResourceCenter")).unwrap();
+            assert_eq!(
+                preview,
+                (
+                    "artifact-version:version".into(),
+                    "quality report.html".into(),
+                    "html".into()
+                )
+            );
+            assert!(!menu.items.iter().any(|item| item.action == "copyMessage"));
+        }
+        // Imported snapshots may no longer have a local source in this project.
+        let menu = super::bound_resource_menu(
+            0.0,
+            0.0,
+            &resource,
+            Some("/other/project"),
+            crate::i18n::Locale::En,
+        );
+        assert_eq!(menu.items.len(), 2);
+        resource.status = "unresolved".into();
+        assert!(super::bound_resource_menu(
+            0.0,
+            0.0,
+            &resource,
+            Some("/other/project"),
+            crate::i18n::Locale::En
+        )
+        .items
+        .is_empty());
+    }
+
+    #[test]
+    fn normalizes_local_paths_and_rejects_non_workspace_resources() {
+        assert_eq!(
+            local_workspace_menu_path(
+                Some(r"C:\work\project"),
+                r"c:\WORK\project\results\plot.png"
+            ),
+            Some("results/plot.png".into())
+        );
+        assert_eq!(
+            local_workspace_menu_path(Some("/work/project"), "results/"),
+            Some("results/".into())
+        );
+        assert_eq!(
+            local_workspace_menu_path(Some("/work/project"), "/other/report.md"),
+            None
+        );
+        for path in [
+            "https://example.com/report.pdf",
+            "ssh://gpu/results/report.pdf",
+            "artifact:abc",
+            "artifact-version:def",
+            "remote:ssh:gpu:/results/report.pdf",
+        ] {
+            assert_eq!(local_workspace_menu_path(Some("/work/project"), path), None);
+        }
     }
 }
 
@@ -1265,5 +1571,20 @@ pub fn ContextMenuPortal(
                 }}
             }.into_view())
         }}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::motif_sequence_path;
+
+    #[test]
+    fn motif_menu_accepts_sequence_files_but_not_unrelated_documents() {
+        for path in ["vector.dna", "refs/insert.FASTA", "plasmid.gbk", "read.seq"] {
+            assert!(motif_sequence_path(path), "{path}");
+        }
+        for path in ["notes.md", "results.csv", "figure.png", "archive.zip"] {
+            assert!(!motif_sequence_path(path), "{path}");
+        }
     }
 }

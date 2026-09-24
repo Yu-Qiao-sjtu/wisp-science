@@ -8,12 +8,20 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use wisp_core::{Agent, ContextManager, ExploreTool, GuidanceQueue, MemoryManager, Output};
+use wisp_core::{
+    build_release_gate, host_agent_observability, load_bundled_depmap_acu_corpus,
+    load_bundled_depmap_release_lock, load_bundled_depmap_server_contract, Agent, AgentTrace,
+    ContextManager, ExploreTool, GuidanceQueue, HostObservabilityConfig, MemoryManager,
+    ObservabilityHost, Output, ReleaseGateArtifact, ReleaseGateBlocker, ReleaseGateBlockerKind,
+    ReleaseGateInputs, ToolCatalog,
+};
 use wisp_llm::{
     Message, Provider, ProviderConfig, Role, ScriptedCompletion, ScriptedProvider,
     ScriptedProviderSnapshot, ToolSchema,
 };
+use wisp_runs::{open_project_store, RunManager};
 use wisp_skills::SkillIndex;
+use wisp_store::Store;
 use wisp_tools::{Approval, Tool, ToolEnv, ToolResult};
 
 const SUITE_SCHEMA: &str = "wisp.agent-eval-suite.v1";
@@ -26,6 +34,10 @@ const LIVE_COMPACTION_SUITE: &str = include_str!("../eval-suites/live-compaction
 const LIVE_MEMORY_SUITE: &str = include_str!("../eval-suites/live-memory-v1.yaml");
 #[cfg(test)]
 const MEMORY_SUITE: &str = include_str!("../eval-suites/memory-v1.yaml");
+#[cfg(test)]
+const DEPMAP_AGENT_SUITE: &str = include_str!("../eval-suites/depmap-agent-v1.yaml");
+#[cfg(test)]
+const DEPMAP_INTENT_SUITE: &str = include_str!("../eval-suites/depmap-intent-live-v1.yaml");
 const DEFAULT_MAX_CONTEXT: usize = 128_000;
 const DEFAULT_MAX_ROUNDS: usize = 12;
 const DEFAULT_TIMEOUT_MS: u64 = 60_000;
@@ -194,6 +206,11 @@ struct EvalCase {
     fixture_runtimes: bool,
     #[serde(default)]
     fixture_mcp: BTreeMap<String, String>,
+    /// Eager tools with explicit schemas for live/offline domain-contract
+    /// evaluation. Unlike `fixture_mcp`, these are visible to the model without
+    /// deferred discovery and therefore mirror native host tools.
+    #[serde(default)]
+    fixture_tools: BTreeMap<String, FixtureTool>,
     /// Register the project-memory `search_memory` tool, mirroring the host's
     /// memory setting. Seed notes with `files` under `.wisp/memory/*.md`.
     #[serde(default)]
@@ -217,6 +234,20 @@ struct EvalCase {
     limits: EvalLimits,
     #[serde(default)]
     expect: EvalExpectation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FixtureTool {
+    #[serde(default = "default_fixture_description")]
+    description: String,
+    schema: Value,
+    result: String,
+    #[serde(default)]
+    error: bool,
+}
+
+fn default_fixture_description() -> String {
+    "Deterministic native retrieval fixture for agent evaluation.".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -394,10 +425,11 @@ struct EvalOutput {
     approval_modes: BTreeMap<String, Approval>,
     decisions: Mutex<std::collections::VecDeque<bool>>,
     plan_mode: bool,
+    trace: AgentTrace,
 }
 
 impl EvalOutput {
-    fn new(approval: &EvalApproval, plan_mode: bool) -> Result<Self> {
+    fn new(approval: &EvalApproval, plan_mode: bool, root: &Path) -> Result<Self> {
         let approval_modes = approval
             .modes
             .iter()
@@ -419,6 +451,10 @@ impl EvalOutput {
             approval_modes,
             decisions: Mutex::new(approval.decisions.iter().copied().collect()),
             plan_mode,
+            trace: host_agent_observability(HostObservabilityConfig::for_host(
+                ObservabilityHost::Eval,
+                root,
+            )),
         })
     }
 
@@ -660,6 +696,10 @@ impl Output for EvalOutput {
             ),
         }
     }
+
+    fn agent_trace(&self) -> Option<&AgentTrace> {
+        Some(&self.trace)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -688,6 +728,8 @@ struct ScenarioResult {
     agent_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     trajectory_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observability_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     failed_workspace: Option<String>,
 }
@@ -755,6 +797,8 @@ struct EvalReport {
     summary: ReportSummary,
     #[serde(default)]
     model_summaries: Vec<ModelSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    release_gate: Option<ReleaseGateArtifact>,
     scenarios: Vec<ScenarioResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     comparison: Option<BaselineComparison>,
@@ -785,6 +829,11 @@ impl ProviderSource {
 struct FixtureMcpTool {
     name: String,
     result: String,
+}
+
+struct FixtureNativeTool {
+    name: String,
+    fixture: FixtureTool,
 }
 
 #[derive(Default)]
@@ -819,8 +868,24 @@ impl wisp_runtime::RuntimeKernel for EvalRuntimeKernel {
         &mut self,
         _id: &str,
         code: &str,
+        _source_name: Option<&str>,
+        required_objects: &[String],
         _output: &wisp_runtime::RuntimeOutput,
     ) -> Result<wisp_runtime::KernelResp> {
+        let missing = required_objects
+            .iter()
+            .filter(|name| name.as_str() != "value")
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Ok(wisp_runtime::KernelResp {
+                error: Some(format!(
+                    "required runtime objects are missing: {}",
+                    missing.join(", ")
+                )),
+                ..wisp_runtime::KernelResp::default()
+            });
+        }
         let stdout = if let Some(value) = code.strip_prefix("set:") {
             self.value = value.to_string();
             String::new()
@@ -886,10 +951,45 @@ impl Tool for FixtureMcpTool {
     }
 }
 
-pub async fn run(live_config: Option<ProviderConfig>, options: &EvalOptions) -> Result<()> {
+#[async_trait]
+impl Tool for FixtureNativeTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            &self.name,
+            &self.fixture.description,
+            self.fixture.schema.clone(),
+        )
+    }
+
+    fn read_only(&self) -> bool {
+        true
+    }
+
+    async fn run(&self, args: &Value, _env: &dyn ToolEnv) -> ToolResult {
+        if let Err(error) = wisp_mcp::validate_tool_arguments(&self.fixture.schema, args) {
+            return ToolResult::fail(format!("invalid fixture tool arguments: {error}"));
+        }
+        if self.fixture.error {
+            ToolResult::fail(&self.fixture.result)
+        } else {
+            ToolResult::ok(&self.fixture.result)
+        }
+    }
+}
+
+pub async fn run(
+    live_config: Option<ProviderConfig>,
+    live_vision: Option<ProviderConfig>,
+    options: &EvalOptions,
+) -> Result<()> {
     validate_options(options)?;
     let suite = load_suite(options.suite.as_deref())?;
     validate_suite(&suite, options.mode)?;
+    let release_gate = release_gate_for_suite(&suite)?;
     let selected = select_cases(&suite, options)?;
     if selected.is_empty() {
         bail!("no eval cases matched the requested filters");
@@ -925,12 +1025,21 @@ pub async fn run(live_config: Option<ProviderConfig>, options: &EvalOptions) -> 
                 let defaults = suite.defaults.clone();
                 let options = options.clone();
                 let live_config = model_config.clone();
+                let live_vision = live_vision.clone();
                 let cases_per_model = selected.len() * options.repeat;
                 tasks.spawn(async move {
                     let _permit = permit;
                     let order =
                         model_index * cases_per_model + case_index * options.repeat + repetition;
-                    let result = run_case(case, repetition, defaults, live_config, options).await;
+                    let result = run_case(
+                        case,
+                        repetition,
+                        defaults,
+                        live_config,
+                        live_vision,
+                        options,
+                    )
+                    .await;
                     (order, result)
                 });
             }
@@ -970,6 +1079,7 @@ pub async fn run(live_config: Option<ProviderConfig>, options: &EvalOptions) -> 
         repeat: options.repeat,
         summary: summarize(&scenarios),
         model_summaries: summarize_by_model(&scenarios),
+        release_gate,
         scenarios,
         comparison: None,
     };
@@ -981,6 +1091,18 @@ pub async fn run(live_config: Option<ProviderConfig>, options: &EvalOptions) -> 
             .with_context(|| format!("invalid eval v1 baseline {}", path.display()))?;
         report.comparison = Some(compare_reports(&report, &baseline, path, options));
     }
+
+    let comparison_failed = report.comparison.as_ref().is_some_and(|comparison| {
+        !options.allow_regressions
+            && (!comparison.regressions.is_empty() || !comparison.threshold_failures.is_empty())
+    });
+    let pass_rate_failed = report.summary.pass_rate_percent < options.min_pass_rate_percent;
+    record_model_quality_failures(
+        &mut report.release_gate,
+        report.summary.pass_rate_percent,
+        options.min_pass_rate_percent,
+        comparison_failed,
+    );
 
     let mut rendered = serde_json::to_string_pretty(&report)?;
     rendered.push('\n');
@@ -996,11 +1118,7 @@ pub async fn run(live_config: Option<ProviderConfig>, options: &EvalOptions) -> 
     }
     print!("{rendered}");
 
-    let comparison_failed = report.comparison.as_ref().is_some_and(|comparison| {
-        !options.allow_regressions
-            && (!comparison.regressions.is_empty() || !comparison.threshold_failures.is_empty())
-    });
-    if report.summary.pass_rate_percent < options.min_pass_rate_percent || comparison_failed {
+    if pass_rate_failed || comparison_failed {
         bail!(
             "agent eval failed: {}/{} attempts passed ({}%; required {}%)",
             report.summary.passed,
@@ -1010,6 +1128,85 @@ pub async fn run(live_config: Option<ProviderConfig>, options: &EvalOptions) -> 
         );
     }
     Ok(())
+}
+
+fn record_model_quality_failures(
+    release_gate: &mut Option<ReleaseGateArtifact>,
+    actual_pass_rate: u64,
+    required_pass_rate: u64,
+    comparison_failed: bool,
+) {
+    let Some(artifact) = release_gate.as_mut() else {
+        return;
+    };
+    if actual_pass_rate < required_pass_rate {
+        artifact.blockers.push(ReleaseGateBlocker {
+            kind: ReleaseGateBlockerKind::ModelQuality,
+            code: "model_pass_rate_below_threshold".into(),
+            detail: format!(
+                "model pass rate {actual_pass_rate}% is below required {required_pass_rate}%"
+            ),
+        });
+    }
+    if comparison_failed {
+        artifact.blockers.push(ReleaseGateBlocker {
+            kind: ReleaseGateBlockerKind::ModelQuality,
+            code: "model_regression".into(),
+            detail: "model comparison contains disallowed regressions or threshold failures".into(),
+        });
+    }
+    artifact.passed = artifact.blockers.is_empty();
+}
+
+fn release_gate_for_suite(suite: &EvalSuite) -> Result<Option<ReleaseGateArtifact>> {
+    if !suite
+        .cases
+        .iter()
+        .any(|case| case.tags.iter().any(|tag| tag == "depmap"))
+    {
+        return Ok(None);
+    }
+    let corpus = load_bundled_depmap_acu_corpus();
+    let contract = load_bundled_depmap_server_contract();
+    let release_lock = load_bundled_depmap_release_lock();
+    if contract.release != release_lock.release {
+        bail!(
+            "DepMap server contract release '{}' does not match release lock '{}'",
+            contract.release,
+            release_lock.release
+        );
+    }
+    let bridge = wisp_core::host_scientific_bridge(
+        &wisp_core::specialist_manifest::HostPolicy::bundled_depmap(),
+    )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let mut tools = ToolCatalog::default();
+    for (name, schema) in &contract.tool_schemas {
+        tools.insert(name.clone(), schema.clone());
+    }
+    let inputs = ReleaseGateInputs {
+        release: release_lock.release,
+        reader_modes: contract.reader_modes,
+        coverage: contract.coverage,
+        provider_contract: contract.provider_contract,
+        evidence_envelope_contract: contract.evidence_envelope_contract,
+        claim_validator_contract: wisp_core::CLAIM_RECORD_CONTRACT.into(),
+        expected_digests: Some(release_lock.digests),
+    };
+    let artifact = build_release_gate(
+        &corpus,
+        &bridge.catalog,
+        &bridge.specialist,
+        &tools,
+        &inputs,
+    );
+    if !artifact.passed {
+        bail!(
+            "release capability gate failed before eval dispatch: {}",
+            serde_json::to_string(&artifact.blockers)?
+        );
+    }
+    Ok(Some(artifact))
 }
 
 fn validate_options(options: &EvalOptions) -> Result<()> {
@@ -1135,6 +1332,7 @@ async fn run_case(
     repetition: usize,
     defaults: EvalLimits,
     live_config: Option<ProviderConfig>,
+    live_vision: Option<ProviderConfig>,
     options: EvalOptions,
 ) -> Result<ScenarioResult> {
     let model = live_config
@@ -1153,7 +1351,12 @@ async fn run_case(
     let mut workspace = TempWorkspace::new(&case.id, repetition)?;
     setup_workspace(&case, workspace.path())?;
     let before = snapshot_workspace(workspace.path())?;
-    let output = Arc::new(EvalOutput::new(&case.approval, case.plan_mode)?);
+    let output = Arc::new(EvalOutput::new(
+        &case.approval,
+        case.plan_mode,
+        workspace.path(),
+    )?);
+    let session_id = uuid::Uuid::new_v4().to_string();
     let provider_source = match options.mode {
         EvalMode::Offline => ProviderSource::Offline(ScriptedProvider::new(
             format!("scripted:{}", case.id),
@@ -1162,7 +1365,8 @@ async fn run_case(
         EvalMode::Live => ProviderSource::Live(
             live_config
                 .clone()
-                .context("live eval provider was not configured")?,
+                .context("live eval provider was not configured")?
+                .with_session_id(session_id.clone()),
         ),
     };
     let vision_source = match options.mode {
@@ -1172,10 +1376,15 @@ async fn run_case(
                 case.vision_script.clone(),
             )))
         }
+        EvalMode::Live => {
+            live_vision.map(|config| ProviderSource::Live(config.with_session_id(session_id)))
+        }
         _ => None,
     };
     let max_context = limits.max_context_tokens.unwrap_or(DEFAULT_MAX_CONTEXT);
     let max_rounds = limits.max_rounds.unwrap_or(DEFAULT_MAX_ROUNDS);
+    let run_store = open_project_store(workspace.path(), "eval", &case.id).await?;
+    let run_manager = RunManager::new();
     let mut agent = build_agent(
         &case,
         workspace.path(),
@@ -1183,6 +1392,8 @@ async fn run_case(
         vision_source.as_ref(),
         max_context,
         max_rounds,
+        run_store.clone(),
+        run_manager.clone(),
     )?;
     if let Some(enabled) = case.auto_compact {
         agent.set_auto_compact(enabled);
@@ -1226,6 +1437,8 @@ async fn run_case(
             max_rounds,
             output.as_ref(),
             cancel.as_ref(),
+            run_store.clone(),
+            run_manager.clone(),
         ),
     )
     .await;
@@ -1276,6 +1489,14 @@ async fn run_case(
     } else {
         None
     };
+    let observability_path = persist_eval_trace(
+        options.artifacts.as_deref(),
+        &case,
+        repetition,
+        &model,
+        workspace.path(),
+        &output,
+    )?;
     let failed_workspace = if !failures.is_empty() && options.keep_failed_workspace {
         let artifacts = options
             .artifacts
@@ -1321,6 +1542,7 @@ async fn run_case(
         completion: captured.completion,
         agent_error,
         trajectory_path: trajectory_path.map(|path| path.to_string_lossy().into_owned()),
+        observability_path: observability_path.map(|path| path.to_string_lossy().into_owned()),
         failed_workspace,
     })
 }
@@ -1384,16 +1606,31 @@ fn build_agent(
     vision: Option<&ProviderSource>,
     max_context: usize,
     max_rounds: usize,
+    run_store: Store,
+    run_manager: RunManager,
 ) -> Result<Agent> {
     let skill_paths = vec![root.join(".wisp").join("skills")];
     let skills = Arc::new(SkillIndex::load(&skill_paths));
+    if case.tags.iter().any(|tag| tag == "depmap") {
+        wisp_core::host_scientific_bridge(
+            &wisp_core::specialist_manifest::HostPolicy::bundled_depmap(),
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    }
     let memory = Arc::new(MemoryManager::new(root));
     let mut registry = wisp_core::build_registry(skills.clone(), memory, case.memory_enabled);
     registry.add(Box::new(wisp_tools::ask_user::AskUserTool));
+    crate::runs::register_run_tools(&mut registry, run_store, run_manager, "eval");
     for (name, result) in &case.fixture_mcp {
         registry.add(Box::new(FixtureMcpTool {
             name: name.clone(),
             result: result.clone(),
+        }));
+    }
+    for (name, fixture) in &case.fixture_tools {
+        registry.add(Box::new(FixtureNativeTool {
+            name: name.clone(),
+            fixture: fixture.clone(),
         }));
     }
     if !case.explore_script.is_empty() {
@@ -1415,6 +1652,9 @@ fn build_agent(
     if !case.allowed_tools.is_empty() {
         registry = registry.filtered(&case.allowed_tools);
     }
+    if case.tags.iter().any(|tag| tag == "depmap") {
+        wisp_core::install_scientific_intent_planner_in(&mut registry, "eval", "eval");
+    }
     let mut agent = Agent::with_provider(
         provider.build(),
         vision.map(ProviderSource::build),
@@ -1423,7 +1663,15 @@ fn build_agent(
         max_context,
         max_rounds,
     );
-    agent.seed_system_prompt(&skills, None);
+    // A dedicated vision provider describes images for a text-only primary.
+    // Native image parts would be sent to the primary instead.
+    if vision.is_some() {
+        agent.ctx.supports_vision = false;
+    }
+    agent.seed_system_prompt(&skills, Some(wisp_runs::runs_guidance()));
+    agent
+        .ctx
+        .set_claim_catalog(Some(wisp_core::ClaimGroundingCatalog::default()));
     Ok(agent)
 }
 
@@ -1454,6 +1702,8 @@ async fn run_actions(
     max_rounds: usize,
     output: &EvalOutput,
     cancel: &AtomicBool,
+    run_store: Store,
+    run_manager: RunManager,
 ) -> Result<()> {
     for action in actions {
         match action {
@@ -1519,7 +1769,16 @@ async fn run_actions(
             }
             EvalAction::Restart => {
                 agent.save();
-                *agent = build_agent(case, &agent.root, provider, vision, max_context, max_rounds)?;
+                *agent = build_agent(
+                    case,
+                    &agent.root,
+                    provider,
+                    vision,
+                    max_context,
+                    max_rounds,
+                    run_store.clone(),
+                    run_manager.clone(),
+                )?;
                 if let Some(enabled) = case.auto_compact {
                     agent.set_auto_compact(enabled);
                 }
@@ -1877,6 +2136,56 @@ fn write_trajectory(
     Ok(path)
 }
 
+fn persist_eval_trace(
+    artifacts: Option<&Path>,
+    case: &EvalCase,
+    repetition: usize,
+    model: &str,
+    workspace: &Path,
+    output: &EvalOutput,
+) -> Result<Option<PathBuf>> {
+    let Some(artifacts) = artifacts else {
+        return Ok(None);
+    };
+    let dir = artifacts.join("traces");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!(
+        "{}-{}-{repetition}.json",
+        safe_name(model),
+        safe_name(&case.id)
+    ));
+    if let Some(memory) = output.trace.memory() {
+        std::fs::write(&path, serde_json::to_vec_pretty(&memory.document())?)?;
+    }
+    let src = workspace.join(".wisp").join("traces");
+    if src.is_dir() {
+        let copy = dir.join(format!(
+            "{}-{}-{repetition}-jsonl",
+            safe_name(model),
+            safe_name(&case.id)
+        ));
+        copy_dir_if_present(&src, &copy)?;
+    }
+    Ok(Some(path))
+}
+
+fn copy_dir_if_present(src: &Path, dest: &Path) -> Result<()> {
+    if !src.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let target = dest.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_if_present(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
 fn summarize(results: &[ScenarioResult]) -> ReportSummary {
     let passed = results.iter().filter(|result| result.passed).count();
     let compaction_before_tokens = results
@@ -1920,8 +2229,11 @@ fn summarize(results: &[ScenarioResult]) -> ReportSummary {
             .sum(),
         compaction_before_tokens,
         compaction_after_tokens,
-        compaction_ratio_percent: (compaction_before_tokens > 0)
-            .then_some(compaction_after_tokens.saturating_mul(100) / compaction_before_tokens),
+        compaction_ratio_percent: if compaction_before_tokens > 0 {
+            Some(compaction_after_tokens.saturating_mul(100) / compaction_before_tokens)
+        } else {
+            None
+        },
     }
 }
 
@@ -2217,11 +2529,303 @@ mod tests {
             "delegation",
             "python",
             "r",
+            "runs",
         ] {
             assert!(
                 tags.contains(required),
                 "missing built-in coverage tag {required}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_wait_case_completes_without_shell_sleep() {
+        let suite: EvalSuite = serde_yaml::from_str(BUILTIN_SUITE).unwrap();
+        let case = suite
+            .cases
+            .iter()
+            .find(|case| case.id == "run-wait-without-sleep")
+            .cloned()
+            .expect("run-wait-without-sleep case");
+        let result = run_case(case, 1, suite.defaults, None, None, EvalOptions::default())
+            .await
+            .unwrap();
+        assert!(result.passed, "{:?}", result.failures);
+        assert!(
+            result
+                .tool_calls
+                .iter()
+                .any(|call| call.name == "run_in_context"),
+            "{:?}",
+            result.tool_calls
+        );
+        assert!(
+            result.tool_calls.iter().all(|call| call.name != "shell"),
+            "{:?}",
+            result.tool_calls
+        );
+    }
+
+    #[tokio::test]
+    async fn vision_fallback_case_uses_the_dedicated_vision_provider() {
+        let suite: EvalSuite = serde_yaml::from_str(BUILTIN_SUITE).unwrap();
+        let case = suite
+            .cases
+            .iter()
+            .find(|case| case.id == "vision-fallback")
+            .cloned()
+            .expect("vision-fallback case");
+        let result = run_case(case, 1, suite.defaults, None, None, EvalOptions::default())
+            .await
+            .unwrap();
+        assert!(result.passed, "{:?}", result.failures);
+        assert!(
+            result
+                .tool_calls
+                .iter()
+                .any(|call| call.name == "view_image"),
+            "{:?}",
+            result.tool_calls
+        );
+    }
+
+    #[test]
+    fn depmap_suite_is_valid_for_offline_and_live_regression() {
+        let suite: EvalSuite = serde_yaml::from_str(DEPMAP_AGENT_SUITE).unwrap();
+        validate_suite(&suite, EvalMode::Offline).unwrap();
+        validate_suite(&suite, EvalMode::Live).unwrap();
+        assert_eq!(suite.cases.len(), 17);
+        assert!(suite
+            .cases
+            .iter()
+            .all(|case| case.fixture_tools.contains_key("depmap_query")
+                || case.fixture_tools.contains_key("depmap_evidence")
+                || case.fixture_tools.contains_key("start_workflow")));
+        assert!(suite
+            .cases
+            .iter()
+            .any(|case| case.fixture_tools.contains_key("depmap_evidence")));
+        assert!(suite
+            .cases
+            .iter()
+            .any(|case| case.fixture_tools.contains_key("start_workflow")));
+        assert!(suite
+            .cases
+            .iter()
+            .any(|case| case.tags.iter().any(|tag| tag == "lineage-directions")));
+        assert!(suite
+            .cases
+            .iter()
+            .any(|case| case.tags.iter().any(|tag| tag == "support-mapping")));
+        let tags: BTreeSet<_> = suite
+            .cases
+            .iter()
+            .flat_map(|case| case.tags.iter().map(String::as_str))
+            .collect();
+        for required in [
+            "grounding",
+            "coverage-gap",
+            "negative-control",
+            "holdout",
+            "orchestration",
+        ] {
+            assert!(tags.contains(required), "missing DepMap tag {required}");
+        }
+    }
+
+    #[tokio::test]
+    async fn depmap_intent_suite_is_valid_and_passes_offline_contracts() {
+        let suite: EvalSuite = serde_yaml::from_str(DEPMAP_INTENT_SUITE).unwrap();
+        validate_suite(&suite, EvalMode::Offline).unwrap();
+        validate_suite(&suite, EvalMode::Live).unwrap();
+        assert_eq!(suite.cases.len(), 10);
+
+        let required_tags = [
+            "colloquial",
+            "typo",
+            "synonym",
+            "mixed-language",
+            "multi-intent",
+            "ambiguity",
+        ];
+        let tags: BTreeSet<_> = suite
+            .cases
+            .iter()
+            .flat_map(|case| case.tags.iter().map(String::as_str))
+            .collect();
+        for required in required_tags {
+            assert!(
+                tags.contains(required),
+                "missing intent-regression tag {required}"
+            );
+        }
+
+        for case in suite.cases {
+            assert!(case.fixture_tools.contains_key("depmap_agent_route"));
+            let result = run_case(
+                case,
+                1,
+                suite.defaults.clone(),
+                None,
+                None,
+                EvalOptions::default(),
+            )
+            .await
+            .unwrap();
+            assert!(result.passed, "{:?}", result.failures);
+        }
+    }
+
+    #[test]
+    fn depmap_suites_emit_a_closed_release_artifact_before_dispatch() {
+        let suite: EvalSuite = serde_yaml::from_str(DEPMAP_AGENT_SUITE).unwrap();
+        let artifact = release_gate_for_suite(&suite).unwrap().unwrap();
+        assert!(artifact.passed, "{:#?}", artifact.blockers);
+        assert_eq!(artifact.release, "26Q1");
+        assert!(artifact.rows.iter().all(|row| row.closed));
+        assert_eq!(artifact.capability_digest.len(), 64);
+        assert_eq!(artifact.coverage_digest.len(), 64);
+        assert_eq!(artifact.server_contract_digest.len(), 64);
+        assert_eq!(artifact.acu_suite_digest.len(), 64);
+
+        let mut failed_gate = Some(artifact);
+        record_model_quality_failures(&mut failed_gate, 50, 100, true);
+        let failed_gate = failed_gate.unwrap();
+        assert!(!failed_gate.passed);
+        assert_eq!(
+            failed_gate
+                .blockers
+                .iter()
+                .filter(|blocker| blocker.kind == ReleaseGateBlockerKind::ModelQuality)
+                .count(),
+            2
+        );
+
+        let ordinary: EvalSuite = serde_yaml::from_str(BUILTIN_SUITE).unwrap();
+        assert!(release_gate_for_suite(&ordinary).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn production_agent_assembly_replays_every_acu_terminal_response() {
+        let corpus = wisp_core::load_bundled_depmap_acu_corpus();
+        let catalog = wisp_core::IntentCatalog::bundled_depmap();
+        let release = corpus.release.clone();
+        for acu in corpus.cases {
+            let replay = wisp_core::replay_acu(&acu, &catalog);
+            assert!(replay.passed, "{}: {:#?}", acu.id, replay.failures);
+            for (variant_index, prompt) in acu.question_family.iter().enumerate() {
+                let prompt_replay = wisp_core::replay_acu_prompt(&acu, prompt, &catalog);
+                assert!(
+                    prompt_replay.passed,
+                    "{} prompt {prompt}: {:#?}",
+                    acu.id, prompt_replay.failures
+                );
+                let proposed_intent = acu
+                    .prompt_mappings
+                    .iter()
+                    .find(|mapping| mapping.prompt == *prompt)
+                    .unwrap()
+                    .proposed_intent
+                    .clone();
+                let evidence = acu.fixture.evidence.clone().unwrap();
+                let completion = serde_json::to_string(&evidence.completion).unwrap();
+                let mut allowed_tools = vec!["attempt_completion".to_string()];
+                let mut required_tools = vec![wisp_core::SCIENTIFIC_INTENT_PLAN_TOOL.to_string()];
+                let mut tool_order = required_tools.clone();
+                let mut fixture_tools = serde_json::Map::new();
+                let mut script = vec![json!({
+                    "tool_calls":[{
+                        "id":"plan-1",
+                        "name":wisp_core::SCIENTIFIC_INTENT_PLAN_TOOL,
+                        "arguments":{"intent":proposed_intent}
+                    }]
+                })];
+                if let (Some(tool), Some(arguments)) =
+                    (prompt_replay.tool.clone(), prompt_replay.arguments.clone())
+                {
+                    let schema = acu.fixture.tool_schemas.get(&tool).unwrap().clone();
+                    let tool_result = serde_json::to_string(&json!({
+                        "schema": "wisp.mcp-tool-result.v1",
+                        "structured_content": evidence.structured_content,
+                        "display_text": "bounded evidence"
+                    }))
+                    .unwrap();
+                    allowed_tools.push(tool.clone());
+                    required_tools.push(tool.clone());
+                    tool_order.push(tool.clone());
+                    fixture_tools.insert(
+                        tool.clone(),
+                        json!({"schema": schema, "result": tool_result}),
+                    );
+                    script.push(json!({
+                        "tool_calls":[{"id":"evidence-1","name":tool,"arguments":arguments}]
+                    }));
+                }
+                required_tools.push("attempt_completion".into());
+                tool_order.push("attempt_completion".into());
+                script.push(json!({
+                    "tool_calls":[{
+                        "id":"done-1",
+                        "name":"attempt_completion",
+                        "arguments":{"result":completion}
+                    }]
+                }));
+                let case: EvalCase = serde_json::from_value(json!({
+                    "id": format!("acu-{}-variant-{}", acu.id, variant_index + 1),
+                    "description": "production assembly ACU paraphrase replay",
+                    "tags": ["depmap", "acu", "release-gate"],
+                    "prompt": prompt,
+                    "allowed_tools": allowed_tools,
+                    "fixture_tools": fixture_tools,
+                    "script": script,
+                    "limits": {
+                        "max_tool_calls": acu.budget.max_tool_calls,
+                        "max_context_tokens": acu.budget.max_context_tokens,
+                        "max_rounds": 4
+                    },
+                    "expect": {
+                        "required_tools": required_tools,
+                        "forbidden_tools": acu.forbidden_tools,
+                        "tool_order": tool_order,
+                        "remaining_script": 0
+                    }
+                }))
+                .unwrap();
+                let id = case.id.clone();
+                let mut result = run_case(
+                    case,
+                    1,
+                    EvalLimits::default(),
+                    None,
+                    None,
+                    EvalOptions::default(),
+                )
+                .await
+                .unwrap();
+                let actual_completion: Option<wisp_core::AcuCompletionFixture> = result
+                    .completion
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str(value).ok());
+                if let Some(completion) = actual_completion {
+                    let observed = wisp_core::AcuEvidenceFixture {
+                        structured_content: evidence.structured_content.clone(),
+                        completion,
+                        uses_raw_matrix_io: evidence.uses_raw_matrix_io,
+                    };
+                    result.failures.extend(wisp_core::validate_acu_evidence(
+                        &acu,
+                        &prompt_replay.decision,
+                        Some(&observed),
+                        Some(&release),
+                    ));
+                } else {
+                    result
+                        .failures
+                        .push("completion did not satisfy the typed ACU evidence contract".into());
+                }
+                result.passed = result.failures.is_empty();
+                assert!(result.passed, "{id}: {:?}", result.failures);
+            }
         }
     }
 
@@ -2281,6 +2885,7 @@ mod tests {
                 case,
                 1,
                 suite.defaults.clone(),
+                None,
                 None,
                 EvalOptions::default(),
             )
@@ -2440,6 +3045,7 @@ mod tests {
                 1,
                 suite.defaults.clone(),
                 None,
+                None,
                 EvalOptions::default(),
             )
             .await
@@ -2496,6 +3102,7 @@ mod tests {
                 case,
                 1,
                 suite.defaults.clone(),
+                None,
                 None,
                 EvalOptions::default(),
             )
@@ -2572,6 +3179,7 @@ mod tests {
                 1,
                 suite.defaults.clone(),
                 None,
+                None,
                 EvalOptions::default(),
             )
             .await
@@ -2630,6 +3238,15 @@ mod tests {
     }
 
     #[test]
+    fn summary_without_compactions_has_no_ratio() {
+        let summary = summarize(&[]);
+
+        assert_eq!(summary.compaction_before_tokens, 0);
+        assert_eq!(summary.compaction_after_tokens, 0);
+        assert_eq!(summary.compaction_ratio_percent, None);
+    }
+
+    #[test]
     fn verifier_checks_tool_argument_json_pointer() {
         let case = EvalCase {
             id: "args".into(),
@@ -2645,6 +3262,7 @@ mod tests {
             explore_script: vec![],
             fixture_runtimes: false,
             fixture_mcp: BTreeMap::new(),
+            fixture_tools: BTreeMap::new(),
             memory_enabled: false,
             runtime_injections: vec![],
             context_seed: vec![],

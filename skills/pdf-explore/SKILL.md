@@ -1,6 +1,6 @@
 ---
 name: pdf-explore
-description: "Use this skill when the user has attached a PDF, paper, report, or other document and the answer needs its content: summarize a section, compare sections, read specific pages, check the table of contents, or read a value off a figure. The `read` tool cannot parse PDF binary — python is the extraction path. Provides `pdf_pages` (pages as text or rendered PNGs, cached) and `pdf_outline` (embedded-bookmark TOC) in the persistent python kernel; load them once via the Kernel Sidecar exec line that `use_skill` appends. For PDF creation/manipulation, use reportlab/pypdf directly."
+description: "Use this skill when the user has attached a PDF, paper, report, or other document and the answer needs its content: summarize a section, compare sections, read specific pages, check the table of contents, or read a value off a figure. The `read` tool cannot parse PDF binary — python is the extraction path. Provides `pdf_pages` (pages as text or rendered PNGs, cached) and `pdf_outline` (embedded-bookmark TOC) in the persistent python kernel; load them once via the Runtime Sidecar exec line that `use_skill` appends. For PDF creation/manipulation, use reportlab/pypdf directly."
 fold_cue: "instead_of=read use=pdf_pages/pdf_outline for PDFs — read cannot parse PDF binary; print ≤5 pages, else write to a file and read that"
 license: Apache-2.0
 ---
@@ -12,7 +12,7 @@ tokens. The sidecar parses once into the persistent Python kernel (memory +
 disk cached), after which you pull exactly the pages the question needs.
 
 **Setup, once per session:** run the `exec(...)` line from the "Python
-Kernel Sidecar" section at the end of this skill's `use_skill` output.
+Runtime Sidecar" section at the end of this skill's `use_skill` output.
 Definitions survive across cells until the kernel restarts. `pypdfium2` is
 required (`pillow` too for image mode); if the first call raises
 ImportError, follow its hint and re-run.
@@ -78,14 +78,18 @@ A whole-page render can't resolve axis labels on a dense figure. Render at
 high dpi, crop to the figure with PIL, and view the crop:
 
 ```python
-page = pdf_pages("report.pdf", mode="image", pages=[7], dpi=200)[0]
+import os
 from PIL import Image
-Image.open(page["image_path"]).crop((x0, y0, x1, y1)).save("panel7.png")
+page = pdf_pages("report.pdf", mode="image", pages=[7], dpi=200)[0]
+crop = os.path.join(os.path.dirname(page["image_path"]), "panel7.png")
+Image.open(page["image_path"]).crop((x0, y0, x1, y1)).save(crop)
 ```
 
 `view_image` the crop (or the full `image_path` once, to locate the
 figure). Every viewed image stays in context until `/compact` ages it out —
-view the few crops that matter, never the whole render set.
+view the few crops that matter, never the whole render set. Crops belong
+beside the renders under `.cache/`, never in the project's output
+directories: they are reading aids, not products.
 
 ## Boundaries
 

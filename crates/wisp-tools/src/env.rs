@@ -15,6 +15,11 @@ use std::sync::Arc;
 /// connection secrets stay on the host and are reused via the existing client.
 #[async_trait]
 pub trait McpAppServer: Send + Sync {
+    /// Cheap liveness probe, without sending a tool request or exposing the
+    /// connection to the guest. Implementations with weak clients override it.
+    fn is_connected(&self) -> bool {
+        true
+    }
     /// Host-readable connector identity for audit and approval UI.
     fn connector_id(&self) -> &str;
     /// Human app name for audit and approval UI.
@@ -202,7 +207,12 @@ pub trait ToolEnv: Send + Sync {
                 .join(filename));
         }
         if !self.restrict_read_paths_to_project() {
-            return Ok(PathBuf::from(path));
+            let path = Path::new(path);
+            return Ok(if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                self.project_root().join(path)
+            });
         }
         if allow_directory {
             crate::safety::resolve_under_root(self.project_root(), path)
@@ -242,6 +252,12 @@ pub trait ToolEnv: Send + Sync {
     fn approval_bypass(&self) -> bool {
         false
     }
+    /// When true, mutating tools (`plan_mode_blocks && !read_only`) require Ask
+    /// even if the host policy is Allow and even if [`Self::approval_bypass`]
+    /// is set. Used for unattended IM turns.
+    fn force_ask_mutations(&self) -> bool {
+        false
+    }
     /// Whether this session is in plan mode: the agent researches and drafts a
     /// plan, so `Registry::run` refuses every tool outside
     /// [`crate::PLAN_MODE_READ_ONLY`]. Default `false`.
@@ -254,6 +270,11 @@ pub trait ToolEnv: Send + Sync {
     /// must fail closed.
     fn project_write_locked(&self) -> bool {
         false
+    }
+    /// Query-only scientific turns default to chat envelopes. Hosts that must
+    /// not materialize `results/reports/**` or unsolicited CSV return false.
+    fn artifact_requested(&self) -> bool {
+        true
     }
     /// Whether the "full" approval scope is active — auto-approve everything,
     /// dangerous commands included. Only the shell danger check consults this;
@@ -269,6 +290,12 @@ pub trait ToolEnv: Send + Sync {
     /// don't support cancellation (e.g. tests).
     fn is_cancelled(&self) -> bool {
         false
+    }
+    /// Whether this particular caller stopped waiting, even when shared work
+    /// must continue for another authorized caller. Ordinary environments use
+    /// the aggregate cancellation signal.
+    fn caller_cancelled(&self) -> bool {
+        self.is_cancelled()
     }
     /// Whether mid-turn user guidance is waiting to be injected at the next
     /// agent-loop iteration. Long waits such as `monitor_run` poll this so they
@@ -300,17 +327,44 @@ pub trait ToolEnv: Send + Sync {
     /// Paths an interpreter reported writing during the current tool call.
     /// Default: dropped — hosts that do not track attribution lose nothing.
     fn report_written_paths(&self, _paths: &[String]) {}
+    /// Host-owned id of the in-flight user-visible turn. Browser tools use it
+    /// to attribute newly created tabs; CLI and tests leave this unset.
+    fn turn_id(&self) -> Option<&str> {
+        None
+    }
+    /// Conversation frame this tool call belongs to. Paired with [`turn_id`].
+    fn frame_id(&self) -> Option<&str> {
+        None
+    }
+    /// Host-owned project this tool call belongs to. Browser tools use it to
+    /// serialize access to the one shared Chrome session across windows.
+    /// CLI and tests leave this unset so occupancy is skipped.
+    fn project_id(&self) -> Option<&str> {
+        None
+    }
+    /// Non-secret identities used to isolate cache and single-flight work.
+    /// Empty fields disable caching but never disable backpressure.
+    fn tool_execution_scope(&self) -> crate::execution::ToolExecutionScope {
+        crate::execution::ToolExecutionScope::default()
+    }
+    /// Best-effort operational diagnostics. Implementations must not attach
+    /// arguments or cached evidence to telemetry.
+    fn note_tool_execution(&self, _event: &crate::execution::ToolExecutionDiagnostic) {}
 }
 
 #[derive(Debug, Clone)]
 pub struct ToolResult {
     pub success: bool,
     pub content: String,
-    pub image: Option<ImageData>,
+    /// Model-visible images accompanying (not replacing) the text result.
+    pub images: Vec<ImageData>,
     /// Code-level control flow for the agent loop. This keeps user-decision
     /// boundaries out of prompt wording: stale sibling calls can be skipped,
     /// and tools such as `ask_user` can end the turn outright.
     pub control: ToolControl,
+    /// Optional turn-scoped execution policy installed after this tool call.
+    /// Entries are exact tool names or a single trailing-`*` prefix pattern.
+    pub allowed_next_tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -334,16 +388,18 @@ impl ToolResult {
         Self {
             success: true,
             content: content.into(),
-            image: None,
+            images: Vec::new(),
             control: ToolControl::Continue,
+            allowed_next_tools: None,
         }
     }
     pub fn fail(content: impl Into<String>) -> Self {
         Self {
             success: false,
             content: content.into(),
-            image: None,
+            images: Vec::new(),
             control: ToolControl::Continue,
+            allowed_next_tools: None,
         }
     }
     pub fn image(img: ImageData) -> Self {
@@ -351,8 +407,9 @@ impl ToolResult {
         Self {
             success: true,
             content: label,
-            image: Some(img),
+            images: vec![img],
             control: ToolControl::Continue,
+            allowed_next_tools: None,
         }
     }
     /// Skip tool calls that the model placed later in the same batch, then let
@@ -365,6 +422,13 @@ impl ToolResult {
     /// issuing another model request.
     pub fn stop_turn(mut self) -> Self {
         self.control = ToolControl::StopTurn;
+        self
+    }
+
+    /// Restrict subsequent calls in the current agent turn at the execution
+    /// layer. This is stronger than returning advisory policy in tool text.
+    pub fn allow_next_tools(mut self, tools: Vec<String>) -> Self {
+        self.allowed_next_tools = Some(tools);
         self
     }
 }

@@ -22,8 +22,10 @@ pub struct ModelProfile {
     #[serde(default)]
     pub label: String,
     pub provider: String,
-    /// Shared credential root. Protocol-specific paths live in
-    /// `endpoint_suffix` so profiles on one service can reuse a key.
+    /// Shared credential root for one API access. Protocol-specific paths
+    /// live in `endpoint_suffix`. Profiles on the same root share a key only
+    /// when they currently hold the same stored secret; a second access on
+    /// this URL can keep a different key.
     pub api_url: String,
     #[serde(default)]
     pub endpoint_suffix: String,
@@ -42,6 +44,18 @@ pub struct ModelProfile {
     pub context_window: u64,
     #[serde(default)]
     pub reasoning_effort: String,
+    /// OpenAI-compatible HTTP `service_tier`. Empty = omit (provider default);
+    /// `priority` = Fast. Ignored for unsupported providers.
+    #[serde(default)]
+    pub service_tier: String,
+    #[serde(default)]
+    pub user_agent: String,
+    #[serde(default = "default_send_user_agent")]
+    pub send_user_agent: bool,
+    #[serde(default)]
+    pub send_session_id: Option<bool>,
+    #[serde(default)]
+    pub session_header_name: String,
     /// Capability marker: this API model can accept image input.
     #[serde(default)]
     pub supports_vision: bool,
@@ -53,6 +67,10 @@ pub struct ModelProfile {
     /// to the Scientific Illustrator's raster image-generation tool.
     #[serde(default)]
     pub use_for_image_generation: bool,
+    /// Persistent image role, separate from the one currently assigned image
+    /// profile. Custom IDs must not turn into chat models when deselected.
+    #[serde(default)]
+    pub image_generation_capable: bool,
     /// OpenAI image size (`auto`, `1024x1024`, …). Empty means the tool default.
     #[serde(default)]
     pub image_size: String,
@@ -80,16 +98,39 @@ pub struct ModelProfile {
     pub video_resolution: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImageGenerationOptions {
+    pub user_agent: String,
+    pub send_user_agent: bool,
+    pub send_session_id: Option<bool>,
+    pub session_header_name: String,
     pub size: String,
     pub quality: String,
     pub aspect_ratio: String,
     pub resolution: String,
 }
 
+impl Default for ImageGenerationOptions {
+    fn default() -> Self {
+        Self {
+            user_agent: String::new(),
+            send_user_agent: true,
+            send_session_id: None,
+            session_header_name: String::new(),
+            size: String::new(),
+            quality: String::new(),
+            aspect_ratio: String::new(),
+            resolution: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VideoGenerationOptions {
+    pub user_agent: String,
+    pub send_user_agent: bool,
+    pub send_session_id: Option<bool>,
+    pub session_header_name: String,
     pub duration_secs: u32,
     pub aspect_ratio: String,
     pub resolution: String,
@@ -98,6 +139,10 @@ pub(crate) struct VideoGenerationOptions {
 impl Default for VideoGenerationOptions {
     fn default() -> Self {
         Self {
+            user_agent: String::new(),
+            send_user_agent: true,
+            send_session_id: None,
+            session_header_name: String::new(),
             duration_secs: 5,
             aspect_ratio: "16:9".into(),
             resolution: "720p".into(),
@@ -156,10 +201,11 @@ fn effective_api_url(profile: &ModelProfile) -> String {
     join_api_url(&profile.api_url, &profile.endpoint_suffix)
 }
 
-/// Identity of an LLM credential: the API origin, not the provider enum and
-/// not the model id. `openai` covers DeepSeek, official OpenAI, and local
-/// gateways; those must not share a key. OpenAI Chat and Responses on the
-/// same host should.
+/// Identity of an LLM host: the API origin, not the provider enum and not the
+/// model id. `openai` covers DeepSeek, official OpenAI, and local gateways;
+/// those must not inherit a key from each other. OpenAI Chat and Responses on
+/// the same host may share a key, but a second pasted key on that host stays
+/// on its own batch.
 pub(crate) fn normalize_endpoint(url: &str) -> String {
     let url = url.trim();
     if url.is_empty() {
@@ -215,7 +261,13 @@ fn sibling_key(profiles: &[ModelProfile], api_url: &str, exclude_id: &str) -> St
         .unwrap_or_default()
 }
 
-/// Write a pasted key to this profile and every sibling on the same endpoint.
+/// Write a pasted key to this profile.
+///
+/// If this profile already had a key, also rotate every same-endpoint sibling
+/// that currently shares that previous key. A pasted key on a new profile
+/// (no previous key) stays on this profile, so a second credential can live
+/// on the same Base URL without overwriting an existing batch.
+///
 /// If no key is pasted and this profile has none, copy a sibling's key so
 /// adding another model on the same URL does not require pasting again.
 fn store_profile_key(
@@ -225,10 +277,16 @@ fn store_profile_key(
     profiles: &[ModelProfile],
 ) -> Result<(), String> {
     if let Some(key) = key.map(str::trim).filter(|key| !key.is_empty()) {
+        let previous = key_for(id);
         secret_set(&secret_name(id), key)?;
-        for profile in profiles {
-            if profile.id != id && same_endpoint(&profile.api_url, api_url) {
-                secret_set(&secret_name(&profile.id), key)?;
+        if !previous.is_empty() && previous != key {
+            for profile in profiles {
+                if profile.id != id
+                    && same_endpoint(&profile.api_url, api_url)
+                    && key_for(&profile.id) == previous
+                {
+                    secret_set(&secret_name(&profile.id), key)?;
+                }
             }
         }
         return Ok(());
@@ -347,6 +405,16 @@ const CREDENTIALS: &[Credential] = &[
         id: "ncbi_email",
         secret: "ncbi_email",
         env: "NCBI_EMAIL",
+    },
+    Credential {
+        id: "depmap_knowledge_api_token",
+        secret: "depmap_knowledge_api_token",
+        env: "DEPMAP_KNOWLEDGE_API_TOKEN",
+    },
+    Credential {
+        id: "openfda_api_key",
+        secret: "openfda_api_key",
+        env: "OPENFDA_API_KEY",
     },
 ];
 
@@ -539,6 +607,15 @@ pub fn credential_status() -> Vec<(String, bool)> {
     status
 }
 
+/// Read one registered service credential through the process-lifetime cache.
+/// Callers receive only the value they explicitly name; credential lists and
+/// tool results never include secret values.
+pub(crate) fn service_credential(id: &str) -> Option<String> {
+    let credential = credential(id)?;
+    let value = secret_get(credential.secret);
+    (!value.is_empty()).then_some(value)
+}
+
 /// Store (or clear, when `value` is blank) a credential by id. Returns an
 /// error for an unknown id.
 pub fn store_credential(id: &str, value: &str) -> Result<(), String> {
@@ -657,9 +734,15 @@ async fn ensure(store: &wisp_store::Store) -> Vec<ModelProfile> {
         max_tokens,
         context_window: DEFAULT_CONTEXT_WINDOW,
         reasoning_effort,
+        service_tier: String::new(),
+        user_agent: String::new(),
+        send_user_agent: true,
+        send_session_id: None,
+        session_header_name: String::new(),
         supports_vision: false,
         use_for_vision: false,
         use_for_image_generation: false,
+        image_generation_capable: false,
         image_size: String::new(),
         image_quality: String::new(),
         image_aspect_ratio: String::new(),
@@ -705,6 +788,13 @@ pub async fn active_profile_id(store: &wisp_store::Store) -> String {
 }
 
 pub async fn session_profile_id(store: &wisp_store::Store, frame_id: &str) -> String {
+    resolve_session_profile(store, frame_id).await.0
+}
+
+/// Chat profile for `frame_id`. A leftover id (deleted LM Studio profile, etc.)
+/// falls back to the active chat model and is rewritten on the frame so later
+/// turns do not keep resolving a dead binding (#1070).
+pub async fn resolve_session_profile(store: &wisp_store::Store, frame_id: &str) -> (String, bool) {
     let profiles = ensure(store).await;
     let bound = store
         .frame_model(frame_id)
@@ -716,10 +806,33 @@ pub async fn session_profile_id(store: &wisp_store::Store, frame_id: &str) -> St
         .iter()
         .any(|profile| profile.id == bound && is_chat_model(profile))
     {
-        bound
-    } else {
-        active_id(store, &profiles).await
+        return (bound, false);
     }
+    let fallback = active_id(store, &profiles).await;
+    let rebound = !bound.is_empty() && !fallback.is_empty() && bound != fallback;
+    if rebound {
+        if let Ok(Some(project_id)) = store.frame_project_id(frame_id).await {
+            if let Err(error) = store
+                .set_frame_model(frame_id, &project_id, &fallback)
+                .await
+            {
+                tracing::warn!(
+                    frame_id,
+                    bound,
+                    fallback,
+                    "session model {bound} is gone; could not persist fallback {fallback}: {error}"
+                );
+            } else {
+                tracing::warn!(
+                    frame_id,
+                    bound,
+                    fallback,
+                    "session model {bound} is gone; rebound to {fallback}"
+                );
+            }
+        }
+    }
+    (fallback, rebound)
 }
 
 pub async fn session_label(store: &wisp_store::Store, frame_id: &str) -> String {
@@ -749,6 +862,26 @@ pub async fn session_reasoning_effort(
     profile_default.to_string()
 }
 
+fn normalize_service_tier(raw: &str) -> String {
+    match raw.trim() {
+        "priority" | "fast" => "priority".into(),
+        _ => String::new(),
+    }
+}
+
+/// Effective service tier for a conversation. Unlike reasoning effort, an
+/// empty frame value is an explicit Fast-off override; NULL inherits.
+pub async fn session_service_tier(
+    store: &wisp_store::Store,
+    frame_id: &str,
+    profile_default: &str,
+) -> String {
+    match store.frame_service_tier(frame_id).await {
+        Ok(Some(value)) => normalize_service_tier(&value),
+        _ => normalize_service_tier(profile_default),
+    }
+}
+
 /// Key for a profile, falling back to the legacy `api_key` secret for the
 /// migrated "default" profile (so a not-yet-re-saved default still works).
 fn key_for(id: &str) -> String {
@@ -764,25 +897,28 @@ fn key_for(id: &str) -> String {
 pub async fn active_config(store: &wisp_store::Store) -> (String, String, String, String) {
     let profiles = ensure(store).await;
     let id = active_id(store, &profiles).await;
-    let p = profiles
+    let Some(p) = profiles
         .iter()
         .find(|p| p.id == id)
         .cloned()
-        .unwrap_or_else(|| profiles[0].clone());
+        .or_else(|| profiles.first().cloned())
+    else {
+        return ("openai".into(), String::new(), String::new(), String::new());
+    };
     let api_url = effective_api_url(&p);
     (p.provider, api_url, p.model, key_for(&p.id))
 }
 
 pub(crate) const IMAGE_GENERATION_UNSUPPORTED: &str =
-    "Image generation currently supports OpenAI gpt-image-2 and xAI grok-imagine-image-2.0.";
+    "Image generation requires an OpenAI-compatible Images API protocol and a non-empty model ID.";
 
 pub(crate) fn model_id_tail(model: &str) -> &str {
     let model = model.trim();
     model.rsplit('/').next().unwrap_or(model)
 }
 
-/// Raster image-generation model IDs. Gateway `vendor/model` ids match on the
-/// last path segment. Exact IDs only.
+/// Known IDs used only for backwards-compatible automatic classification.
+/// This is a hint, not an allowlist: explicit image profiles accept custom IDs.
 pub(crate) fn is_image_generation_model(model: &str) -> bool {
     let tail = model_id_tail(model);
     tail.eq_ignore_ascii_case("gpt-image-2") || tail.eq_ignore_ascii_case("grok-imagine-image-2.0")
@@ -809,8 +945,22 @@ pub(crate) fn is_video_generation_model(model: &str) -> bool {
         || tail.eq_ignore_ascii_case("grok-imagine-video-1.5-preview")
 }
 
+fn profile_is_image_model(profile: &ModelProfile) -> bool {
+    profile.image_generation_capable
+        || profile.use_for_image_generation
+        || is_image_generation_model(&profile.model)
+}
+
+fn normalize_image_role(profile: &mut ModelProfile, existing: Option<&ModelProfile>) {
+    profile.image_generation_capable = profile.use_for_image_generation
+        || is_image_generation_model(&profile.model)
+        || existing.is_some_and(|old| {
+            old.model.trim() == profile.model.trim() && profile_is_image_model(old)
+        });
+}
+
 fn normalize_image_options(profile: &mut ModelProfile) -> Result<(), String> {
-    if !is_image_generation_model(&profile.model) {
+    if !profile_is_image_model(profile) {
         profile.image_size.clear();
         profile.image_quality.clear();
         profile.image_aspect_ratio.clear();
@@ -870,7 +1020,7 @@ pub(crate) fn supports_image_generation(provider: &str, model: &str) -> bool {
     matches!(
         provider.trim(),
         "openai" | "openai_compatible" | "openai_responses" | "openai-responses" | "responses"
-    ) && is_image_generation_model(model)
+    ) && !model.trim().is_empty()
 }
 
 /// Out-of-range or unknown video options are dropped back to the tool
@@ -905,7 +1055,7 @@ pub(crate) fn supports_video_generation(provider: &str, model: &str) -> bool {
 }
 
 fn is_chat_model(p: &ModelProfile) -> bool {
-    !is_image_generation_model(&p.model) && !is_video_generation_model(&p.model)
+    !profile_is_image_model(p) && !is_video_generation_model(&p.model)
 }
 
 fn can_describe_images(p: &ModelProfile) -> bool {
@@ -913,7 +1063,7 @@ fn can_describe_images(p: &ModelProfile) -> bool {
 }
 
 fn can_generate_images(p: &ModelProfile) -> bool {
-    supports_image_generation(&p.provider, &p.model)
+    profile_is_image_model(p) && supports_image_generation(&p.provider, &p.model)
 }
 
 fn can_generate_videos(p: &ModelProfile) -> bool {
@@ -951,10 +1101,22 @@ async fn image_generation_id(
 }
 
 /// The assigned vision profile's `(provider, api_url, model, api_key,
-/// max_tokens, reasoning_effort)`, if the user configured one.
+/// max_tokens, reasoning_effort, service_tier, user_agent, send_user_agent, send_session_id, session_header_name)`, if configured.
 pub async fn vision_config(
     store: &wisp_store::Store,
-) -> Option<(String, String, String, String, u64, String)> {
+) -> Option<(
+    String,
+    String,
+    String,
+    String,
+    u64,
+    String,
+    String,
+    String,
+    bool,
+    Option<bool>,
+    String,
+)> {
     let profiles = ensure(store).await;
     let id = vision_id(store, &profiles).await?;
     let p = profiles.iter().find(|p| p.id == id)?.clone();
@@ -966,6 +1128,11 @@ pub async fn vision_config(
         key_for(&p.id),
         p.max_tokens,
         p.reasoning_effort,
+        p.service_tier,
+        p.user_agent.clone(),
+        p.send_user_agent,
+        p.send_session_id,
+        p.session_header_name.clone(),
     ))
 }
 
@@ -983,6 +1150,10 @@ pub async fn image_generation_config(
         p.model.clone(),
         key_for(&p.id),
         ImageGenerationOptions {
+            user_agent: p.user_agent.clone(),
+            send_user_agent: p.send_user_agent,
+            send_session_id: p.send_session_id,
+            session_header_name: p.session_header_name.clone(),
             size: p.image_size.clone(),
             quality: p.image_quality.clone(),
             aspect_ratio: p.image_aspect_ratio.clone(),
@@ -1022,6 +1193,10 @@ pub async fn video_generation_config(
         p.model.clone(),
         key_for(&p.id),
         VideoGenerationOptions {
+            user_agent: p.user_agent.clone(),
+            send_user_agent: p.send_user_agent,
+            send_session_id: p.send_session_id,
+            session_header_name: p.session_header_name.clone(),
             duration_secs: p.video_duration_secs.unwrap_or(defaults.duration_secs),
             aspect_ratio: p
                 .video_aspect_ratio
@@ -1074,7 +1249,9 @@ pub async fn active_label(store: &wisp_store::Store) -> String {
 
 /// Per-model advanced LLM options for the active profile, falling back to
 /// legacy global store keys when a profile has no values yet.
-pub async fn active_llm_advanced(store: &wisp_store::Store) -> (u64, String) {
+pub async fn active_llm_advanced(
+    store: &wisp_store::Store,
+) -> (u64, String, String, String, bool, Option<bool>, String) {
     let profiles = ensure(store).await;
     let id = active_id(store, &profiles).await;
     if let Some(p) = profiles.iter().find(|p| p.id == id) {
@@ -1097,7 +1274,15 @@ pub async fn active_llm_advanced(store: &wisp_store::Store) -> (u64, String) {
                 .flatten()
                 .unwrap_or_default();
         }
-        return (max_tokens, reasoning_effort);
+        return (
+            max_tokens,
+            reasoning_effort,
+            p.service_tier.clone(),
+            p.user_agent.clone(),
+            p.send_user_agent,
+            p.send_session_id,
+            p.session_header_name.clone(),
+        );
     }
     let max_tokens = store
         .get_setting("max_tokens")
@@ -1112,7 +1297,15 @@ pub async fn active_llm_advanced(store: &wisp_store::Store) -> (u64, String) {
         .ok()
         .flatten()
         .unwrap_or_default();
-    (max_tokens, reasoning_effort)
+    (
+        max_tokens,
+        reasoning_effort,
+        String::new(),
+        String::new(),
+        true,
+        None,
+        String::new(),
+    )
 }
 
 fn effective_context_window(profile: &ModelProfile) -> u64 {
@@ -1132,6 +1325,9 @@ fn effective_context_window(profile: &ModelProfile) -> u64 {
 /// Clamp `context_window`/`max_tokens` to the model's catalog ceilings.
 /// `max_tokens = 0` means "unset" and is left alone.
 fn clamp_to_catalog(profile: &mut ModelProfile) {
+    if !is_chat_model(profile) {
+        return;
+    }
     if let Some(entry) =
         crate::model_catalog::lookup(&profile.provider, &profile.api_url, &profile.model)
     {
@@ -1161,11 +1357,23 @@ pub async fn profile_context_window(store: &wisp_store::Store, id: &str) -> Opti
 }
 
 /// Full LLM config for one profile id: (provider, api_url, model, api_key,
-/// max_tokens, reasoning_effort). None when the id doesn't exist.
+/// max_tokens, reasoning_effort, service_tier, user_agent, send_user_agent, send_session_id, session_header_name). None when absent.
 pub async fn profile_llm(
     store: &wisp_store::Store,
     id: &str,
-) -> Option<(String, String, String, String, u64, String)> {
+) -> Option<(
+    String,
+    String,
+    String,
+    String,
+    u64,
+    String,
+    String,
+    String,
+    bool,
+    Option<bool>,
+    String,
+)> {
     let profiles = ensure(store).await;
     let p = profiles.iter().find(|p| p.id == id)?;
     if !is_chat_model(p) {
@@ -1178,6 +1386,11 @@ pub async fn profile_llm(
         key_for(&p.id),
         p.max_tokens,
         p.reasoning_effort.clone(),
+        p.service_tier.clone(),
+        p.user_agent.clone(),
+        p.send_user_agent,
+        p.send_session_id,
+        p.session_header_name.clone(),
     ))
 }
 
@@ -1221,6 +1434,7 @@ async fn decorated(store: &wisp_store::Store) -> Vec<ModelProfile> {
     profiles
         .into_iter()
         .map(|mut p| {
+            p.image_generation_capable = profile_is_image_model(&p);
             p.has_api_key = !key_for(&p.id).is_empty();
             p.active = p.id == id;
             p.use_for_vision = vision.as_deref() == Some(p.id.as_str());
@@ -1258,10 +1472,10 @@ pub async fn list_models(state: State<'_, crate::AppState>) -> Result<Vec<ModelP
 #[tauri::command]
 pub async fn get_session_model(
     state: State<'_, crate::AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     session_id: String,
 ) -> Result<String, String> {
-    let project = state.active(window.label());
+    let project = state.require_active(window.label())?;
     if state
         .store
         .frame_project_id(&session_id)
@@ -1287,10 +1501,10 @@ pub async fn get_session_model(
 #[tauri::command]
 pub async fn get_session_reasoning_effort(
     state: State<'_, crate::AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     session_id: String,
 ) -> Result<Option<String>, String> {
-    let project = state.active(window.label());
+    let project = state.require_active(window.label())?;
     if state
         .store
         .frame_project_id(&session_id)
@@ -1304,6 +1518,30 @@ pub async fn get_session_reasoning_effort(
     state
         .store
         .frame_reasoning_effort(&session_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_session_service_tier(
+    state: State<'_, crate::AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+    session_id: String,
+) -> Result<Option<String>, String> {
+    let project = state.require_active(window.label())?;
+    if state
+        .store
+        .frame_project_id(&session_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .as_deref()
+        != Some(project.id.as_str())
+    {
+        return Err("Session not found".into());
+    }
+    state
+        .store
+        .frame_service_tier(&session_id)
         .await
         .map_err(|error| error.to_string())
 }
@@ -1330,6 +1568,9 @@ pub async fn save_model(
     profile.use_for_vision = assign_vision;
     profile.use_for_image_generation = assign_image_generation;
     profile.use_for_video_generation = assign_video_generation;
+    if assign_image_generation && assign_video_generation {
+        return Err("Choose either image or video generation for a model profile.".into());
+    }
     let mut profiles = ensure(&state.store).await;
     if profile.model.trim().is_empty() {
         return Err("Model is required.".into());
@@ -1339,6 +1580,12 @@ pub async fn save_model(
     }
     profile.api_url = profile.api_url.trim().trim_end_matches('/').to_string();
     profile.endpoint_suffix = normalize_endpoint_suffix(&profile.endpoint_suffix)?;
+    profile.service_tier = normalize_service_tier(&profile.service_tier);
+    profile.user_agent = wisp_llm::provider::normalize_user_agent(&profile.user_agent)?;
+    profile.session_header_name =
+        wisp_llm::provider::normalize_session_header_name(&profile.session_header_name)?;
+    let existing = profiles.iter().find(|old| old.id == profile.id);
+    normalize_image_role(&mut profile, existing);
     if assign_vision && !can_describe_images(&profile) {
         return Err("Image analysis requires an API model marked as vision-capable.".into());
     }
@@ -1513,7 +1760,7 @@ pub async fn reorder_models(
 #[tauri::command]
 pub async fn set_active_model(
     state: State<'_, crate::AppState>,
-    _window: tauri::WebviewWindow,
+    _window: crate::workspace_surface::WorkspaceSurface,
     id: String,
     session_id: Option<String>,
 ) -> Result<Vec<ModelProfile>, String> {
@@ -1594,6 +1841,36 @@ pub async fn set_session_reasoning_effort(
     Ok(())
 }
 
+#[tauri::command]
+pub async fn set_session_service_tier(
+    state: State<'_, crate::AppState>,
+    service_tier: Option<String>,
+    session_id: String,
+) -> Result<(), String> {
+    let normalized = match service_tier.as_deref().map(str::trim) {
+        None => None,
+        Some("") | Some("default") => Some(String::new()),
+        Some("priority") | Some("fast") => Some("priority".into()),
+        Some(_) => return Err("Unknown service tier.".into()),
+    };
+    let (project, scope) =
+        crate::exploration_commands::working_project_for_frame(&state, &session_id).await?;
+    let _activity = state.begin_project_activity(&project.id)?;
+    let _project_write_locked = crate::exploration_commands::conversation_project_write_locked(
+        &state.store,
+        &scope,
+        Some(&session_id),
+    )
+    .await?;
+    state
+        .store
+        .set_frame_service_tier(&session_id, &project.id, normalized.as_deref())
+        .await
+        .map_err(|error| error.to_string())?;
+    crate::clear_session_agent(&state, &session_id).await;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1611,9 +1888,15 @@ mod tests {
             max_tokens: 0,
             context_window: DEFAULT_CONTEXT_WINDOW,
             reasoning_effort: String::new(),
+            service_tier: String::new(),
+            user_agent: String::new(),
+            send_user_agent: true,
+            send_session_id: None,
+            session_header_name: String::new(),
             supports_vision: false,
             use_for_vision: false,
             use_for_image_generation: false,
+            image_generation_capable: false,
             image_size: String::new(),
             image_quality: String::new(),
             image_aspect_ratio: String::new(),
@@ -1708,6 +1991,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dangling_session_model_rebinds_to_active_chat_profile() {
+        let tmp = std::env::temp_dir().join(format!(
+            "wisp_session_model_rebind_{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let store = wisp_store::Store::open(&tmp).await.unwrap();
+        store.create_project("p", "project", "").await.unwrap();
+        save_raw(
+            &store,
+            &[
+                test_profile("m1", "first", "model-1"),
+                test_profile("m2", "second", "model-2"),
+            ],
+        )
+        .await
+        .unwrap();
+        store.set_setting(ACTIVE_KEY, "m2").await.unwrap();
+        store
+            .create_frame("lmstudio", "p", "OPERON", "m3")
+            .await
+            .unwrap();
+        store.create_frame("ok", "p", "OPERON", "m1").await.unwrap();
+
+        let (id, rebound) = resolve_session_profile(&store, "lmstudio").await;
+        assert_eq!(id, "m2");
+        assert!(rebound);
+        assert_eq!(
+            store.frame_model("lmstudio").await.unwrap().as_deref(),
+            Some("m2")
+        );
+        assert_eq!(session_profile_id(&store, "ok").await, "m1");
+        assert_eq!(
+            store.frame_model("ok").await.unwrap().as_deref(),
+            Some("m1")
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
     async fn session_reasoning_override_does_not_change_profile_or_sibling() {
         let tmp = std::env::temp_dir().join(format!(
             "wisp_session_reasoning_{}.sqlite",
@@ -1730,6 +2053,7 @@ mod tests {
         assert_eq!(session_reasoning_effort(&store, "a", "max").await, "high");
         assert_eq!(session_reasoning_effort(&store, "b", "max").await, "max");
         assert_eq!(profile_llm(&store, "m1").await.unwrap().5, "max");
+        assert_eq!(profile_llm(&store, "m1").await.unwrap().6, "");
         drop(store);
         let _ = std::fs::remove_file(&tmp);
     }
@@ -1769,6 +2093,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_service_tier_is_tristate_and_session_scoped() {
+        let tmp = std::env::temp_dir().join(format!(
+            "wisp_session_service_tier_{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let store = wisp_store::Store::open(&tmp).await.unwrap();
+        store.create_project("p", "project", "").await.unwrap();
+        store.create_frame("a", "p", "OPERON", "m1").await.unwrap();
+        store.create_frame("b", "p", "OPERON", "m1").await.unwrap();
+
+        assert_eq!(
+            session_service_tier(&store, "a", "priority").await,
+            "priority"
+        );
+        assert_eq!(session_service_tier(&store, "b", "").await, "");
+        store
+            .set_frame_service_tier("a", "p", Some(""))
+            .await
+            .unwrap();
+        assert_eq!(session_service_tier(&store, "a", "priority").await, "");
+        assert_eq!(
+            session_service_tier(&store, "b", "priority").await,
+            "priority"
+        );
+        store
+            .set_frame_service_tier("a", "p", Some("fast"))
+            .await
+            .unwrap();
+        assert_eq!(session_service_tier(&store, "a", "").await, "priority");
+        store.set_frame_service_tier("a", "p", None).await.unwrap();
+        assert_eq!(
+            session_service_tier(&store, "a", "priority").await,
+            "priority"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
     async fn vision_capability_follows_the_input_profile() {
         let tmp =
             std::env::temp_dir().join(format!("wisp_input_vision_{}.sqlite", uuid::Uuid::new_v4()));
@@ -1803,6 +2167,84 @@ mod tests {
             "use_for_image_generation dropped on deserialize"
         );
         assert_eq!(p.context_window, DEFAULT_CONTEXT_WINDOW);
+        assert!(p.user_agent.is_empty());
+        assert!(p.send_user_agent);
+        assert_eq!(p.send_session_id, None);
+        assert!(p.session_header_name.is_empty());
+        assert!(
+            p.service_tier.is_empty(),
+            "missing service_tier should default empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_agent_persists_and_follows_the_selected_profile() {
+        let path =
+            std::env::temp_dir().join(format!("wisp_user_agent_{}.sqlite", uuid::Uuid::new_v4()));
+        let store = wisp_store::Store::open(&path).await.unwrap();
+        let mut custom = test_profile("custom", "custom", "model-1");
+        custom.user_agent = "research-client/1.0".into();
+        custom.send_user_agent = false;
+        custom.send_session_id = Some(true);
+        custom.session_header_name = "x-custom-session".into();
+        custom.supports_vision = true;
+        save_raw(
+            &store,
+            &[custom, test_profile("default", "default", "model-2")],
+        )
+        .await
+        .unwrap();
+        store.set_setting(ACTIVE_KEY, "custom").await.unwrap();
+        store.set_setting(VISION_KEY, "custom").await.unwrap();
+        let advanced = active_llm_advanced(&store).await;
+        assert!(!advanced.4);
+        assert_eq!(advanced.5, Some(true));
+        assert_eq!(advanced.6, "x-custom-session");
+        for config in [
+            profile_llm(&store, "custom").await.unwrap(),
+            vision_config(&store).await.unwrap(),
+        ] {
+            assert!(!config.8);
+            assert_eq!(config.9, Some(true));
+            assert_eq!(config.10, "x-custom-session");
+        }
+        let defaults = profile_llm(&store, "default").await.unwrap();
+        assert!(defaults.8);
+        assert_eq!(defaults.9, None);
+        assert!(defaults.10.is_empty());
+        assert_eq!(active_llm_advanced(&store).await.3, "research-client/1.0");
+        assert_eq!(
+            profile_llm(&store, "custom").await.unwrap().7,
+            "research-client/1.0"
+        );
+        assert_eq!(
+            vision_config(&store).await.unwrap().7,
+            "research-client/1.0"
+        );
+        assert_eq!(profile_llm(&store, "default").await.unwrap().7, "");
+        let mut profiles = ensure(&store).await;
+        profiles
+            .iter_mut()
+            .find(|p| p.id == "custom")
+            .unwrap()
+            .user_agent
+            .clear();
+        save_raw(&store, &profiles).await.unwrap();
+        assert_eq!(active_llm_advanced(&store).await.3, "");
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn service_tier_roundtrips_on_model_profile() {
+        let mut profile = test_profile("m1", "codex", "gpt-5.6-sol");
+        profile.provider = "openai_responses".into();
+        profile.service_tier = "priority".into();
+        profile.reasoning_effort = "high".into();
+        let json = serde_json::to_string(&profile).unwrap();
+        let restored: ModelProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.service_tier, "priority");
+        assert_eq!(restored.reasoning_effort, "high");
     }
 
     #[test]
@@ -1833,12 +2275,15 @@ mod tests {
 
     #[test]
     fn clamp_to_catalog_caps_over_declared_limits() {
+        let ceiling =
+            crate::model_catalog::lookup("openai", "https://api.kimi.com/coding/v1", "k3-256k")
+                .expect("k3-256k must resolve under kimi-for-coding");
         let mut profile = kimi_coding_profile("k3-256k");
-        profile.context_window = 1_000_000;
-        profile.max_tokens = 999_999;
+        profile.context_window = ceiling.c.saturating_add(1);
+        profile.max_tokens = ceiling.o.saturating_add(1);
         clamp_to_catalog(&mut profile);
-        assert_eq!(profile.context_window, 262_144);
-        assert_eq!(profile.max_tokens, 131_072);
+        assert_eq!(profile.context_window, ceiling.c);
+        assert_eq!(profile.max_tokens, ceiling.o);
     }
 
     #[test]
@@ -1859,9 +2304,12 @@ mod tests {
 
     #[test]
     fn effective_context_window_respects_catalog_ceiling() {
+        let ceiling =
+            crate::model_catalog::lookup("openai", "https://api.kimi.com/coding/v1", "k3-256k")
+                .expect("k3-256k must resolve under kimi-for-coding");
         let mut over = kimi_coding_profile("k3-256k");
-        over.context_window = 1_000_000;
-        assert_eq!(effective_context_window(&over), 262_144);
+        over.context_window = ceiling.c.saturating_add(1);
+        assert_eq!(effective_context_window(&over), ceiling.c);
         // Unknown models keep their declared value.
         let mut unknown = test_profile("m2", "x", "totally-unknown");
         unknown.context_window = 500_000;
@@ -1919,6 +2367,15 @@ mod tests {
         assert!(!can_generate_images(&profile));
         profile.model = "grok-imagine-image".into();
         assert!(!can_generate_images(&profile));
+        profile.use_for_image_generation = true;
+        for model in ["gpt-image-2.5", "vendor/custom-raster-v3", "dall-e-3"] {
+            profile.model = model.into();
+            assert!(can_generate_images(&profile), "{model}");
+            assert!(!is_chat_model(&profile));
+        }
+        profile.provider = "anthropic".into();
+        assert!(!can_generate_images(&profile));
+        assert!(!supports_image_generation("openai", "  "));
         assert!(!is_chat_model(&test_profile(
             "image",
             "image",
@@ -1951,7 +2408,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn image_generation_requires_an_explicit_gpt_image_2_assignment() {
+    async fn image_generation_requires_an_explicit_assignment() {
         let tmp =
             std::env::temp_dir().join(format!("wisp_image_gen_{}.sqlite", uuid::Uuid::new_v4()));
         let store = wisp_store::Store::open(&tmp).await.unwrap();
@@ -1987,6 +2444,58 @@ mod tests {
             ["chat"]
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn custom_image_role_survives_deselection_reload_and_retains_options() {
+        let tmp =
+            std::env::temp_dir().join(format!("wisp_custom_image_{}.sqlite", uuid::Uuid::new_v4()));
+        let store = wisp_store::Store::open(&tmp).await.unwrap();
+        let chat = test_profile("chat", "chat", "gpt-5.5");
+        let mut image = test_profile("image", "image", "gpt-image-2.5");
+        image.use_for_image_generation = true;
+        image.image_size = "1536x1024".into();
+        image.image_quality = "high".into();
+        normalize_image_role(&mut image, None);
+        normalize_image_options(&mut image).unwrap();
+        assert!(image.image_generation_capable);
+        save_raw(&store, &[chat.clone(), image.clone()])
+            .await
+            .unwrap();
+        store
+            .set_setting(IMAGE_GENERATION_KEY, "image")
+            .await
+            .unwrap();
+        let (_, model, _, options) = image_generation_config(&store).await.unwrap();
+        assert_eq!(model, "gpt-image-2.5");
+        assert_eq!(options.size, "1536x1024");
+        assert_eq!(options.quality, "high");
+        store.set_setting(IMAGE_GENERATION_KEY, "").await.unwrap();
+        let mut deselected = decorated(&store)
+            .await
+            .into_iter()
+            .find(|p| p.id == "image")
+            .unwrap();
+        assert!(!deselected.use_for_image_generation);
+        assert!(deselected.image_generation_capable);
+        assert!(!is_chat_model(&deselected));
+        normalize_image_role(&mut deselected, Some(&image));
+        save_raw(&store, &[chat, deselected.clone()]).await.unwrap();
+        assert_eq!(
+            delegation_profiles(&store)
+                .await
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["chat"]
+        );
+        assert!(image_generation_config(&store).await.is_none());
+        deselected.model = "renamed-chat-id".into();
+        normalize_image_role(&mut deselected, Some(&image));
+        assert!(!deselected.image_generation_capable);
+        assert!(is_chat_model(&deselected));
+        drop(store);
+        let _ = std::fs::remove_file(tmp);
     }
 
     #[test]
@@ -2315,13 +2824,14 @@ mod tests {
     }
 
     #[test]
-    fn pasted_key_rotates_every_sibling_on_the_same_endpoint() {
+    fn pasted_key_on_existing_profile_rotates_siblings_that_share_that_key() {
         let prefix = uuid::Uuid::new_v4();
         let first_id = format!("{prefix}-a");
         let second_id = format!("{prefix}-b");
         let _ = secret_del(&secret_name(&first_id));
         let _ = secret_del(&secret_name(&second_id));
         secret_set(&secret_name(&first_id), "sk-old").unwrap();
+        secret_set(&secret_name(&second_id), "sk-old").unwrap();
         let mut first = test_profile(&first_id, "flash", "deepseek-v4-flash");
         first.api_url = "https://api.deepseek.com".into();
         let mut second = test_profile(&second_id, "pro", "deepseek-v4-pro");
@@ -2332,6 +2842,60 @@ mod tests {
         assert_eq!(key_for(&second_id), "sk-new");
         let _ = secret_del(&secret_name(&first_id));
         let _ = secret_del(&secret_name(&second_id));
+    }
+
+    #[test]
+    fn pasted_key_on_new_profile_does_not_overwrite_an_existing_batch() {
+        let prefix = uuid::Uuid::new_v4();
+        let existing_id = format!("{prefix}-a");
+        let new_id = format!("{prefix}-b");
+        let _ = secret_del(&secret_name(&existing_id));
+        let _ = secret_del(&secret_name(&new_id));
+        secret_set(&secret_name(&existing_id), "sk-one").unwrap();
+        let mut existing = test_profile(&existing_id, "flash", "deepseek-v4-flash");
+        existing.api_url = "https://api.deepseek.com".into();
+        let mut added = test_profile(&new_id, "pro", "deepseek-v4-pro");
+        added.api_url = "https://api.deepseek.com".into();
+        let added_url = added.api_url.clone();
+        store_profile_key(&new_id, Some("sk-two"), &added_url, &[existing, added]).unwrap();
+        assert_eq!(key_for(&existing_id), "sk-one");
+        assert_eq!(key_for(&new_id), "sk-two");
+        let _ = secret_del(&secret_name(&existing_id));
+        let _ = secret_del(&secret_name(&new_id));
+    }
+
+    #[test]
+    fn rotating_one_key_leaves_a_different_key_on_the_same_endpoint() {
+        let prefix = uuid::Uuid::new_v4();
+        let one_a = format!("{prefix}-a");
+        let one_b = format!("{prefix}-b");
+        let two_id = format!("{prefix}-c");
+        for id in [&one_a, &one_b, &two_id] {
+            let _ = secret_del(&secret_name(id));
+        }
+        secret_set(&secret_name(&one_a), "sk-one").unwrap();
+        secret_set(&secret_name(&one_b), "sk-one").unwrap();
+        secret_set(&secret_name(&two_id), "sk-two").unwrap();
+        let mut first = test_profile(&one_a, "flash", "deepseek-v4-flash");
+        first.api_url = "https://api.deepseek.com".into();
+        let mut second = test_profile(&one_b, "pro", "deepseek-v4-pro");
+        second.api_url = "https://api.deepseek.com".into();
+        let mut other = test_profile(&two_id, "other", "deepseek-v4-flash");
+        other.api_url = "https://api.deepseek.com".into();
+        let first_url = first.api_url.clone();
+        store_profile_key(
+            &one_a,
+            Some("sk-one-rotated"),
+            &first_url,
+            &[first, second, other],
+        )
+        .unwrap();
+        assert_eq!(key_for(&one_a), "sk-one-rotated");
+        assert_eq!(key_for(&one_b), "sk-one-rotated");
+        assert_eq!(key_for(&two_id), "sk-two");
+        for id in [&one_a, &one_b, &two_id] {
+            let _ = secret_del(&secret_name(id));
+        }
     }
 
     /// Restores each captured secret on drop (even when an assert panics), so
@@ -2502,4 +3066,8 @@ mod tests {
         let _ = secret_del(&secret_name("glm"));
         let _ = std::fs::remove_file(&tmp);
     }
+}
+
+fn default_send_user_agent() -> bool {
+    true
 }

@@ -16,6 +16,7 @@ pub(crate) const CHAT_THREAD_ID: &str = "chat-thread";
 #[wasm_bindgen(module = "/src/highlight.js")]
 extern "C" {
     async fn highlight_by_id(id: &str) -> JsValue;
+    async fn highlight_set_code(id: &str, text: &str) -> JsValue;
 }
 
 #[wasm_bindgen(module = "/src/pet.js")]
@@ -27,6 +28,8 @@ extern "C" {
 #[wasm_bindgen(module = "/src/api.js")]
 extern "C" {
     pub(crate) async fn invoke(cmd: &str, args: JsValue) -> JsValue;
+    pub(crate) fn start_ui_health();
+    pub(crate) fn report_ui_health();
     #[wasm_bindgen(catch, js_name = invoke_strict)]
     pub(crate) async fn invoke_checked(cmd: &str, args: JsValue) -> Result<JsValue, JsValue>;
     #[wasm_bindgen(catch, js_name = invoke_timeout)]
@@ -49,10 +52,32 @@ extern "C" {
     pub(crate) fn mount_mcp_app(instance_id: &str, el_id: &str, payload_json: &str) -> bool;
     #[wasm_bindgen(js_name = park_mcp_app)]
     pub(crate) fn park_mcp_app(instance_id: &str);
+    #[wasm_bindgen(catch, js_name = import_motif_dna_file)]
+    pub(crate) async fn import_motif_dna_file(instance_id: &str) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(catch, js_name = add_workspace_file_to_motif)]
+    pub(crate) async fn add_workspace_file_to_motif(
+        instance_id: &str,
+        path: &str,
+    ) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(catch, js_name = request_motif_selection)]
+    pub(crate) async fn request_motif_selection(instance_id: &str) -> Result<JsValue, JsValue>;
     #[wasm_bindgen(js_name = close_mcp_app)]
     pub(crate) fn close_mcp_app(instance_id: &str);
     #[wasm_bindgen(js_name = pasted_image_count)]
     pub(crate) fn pasted_image_count(event: JsValue) -> usize;
+    pub(crate) fn paste_has_files(event: JsValue) -> bool;
+    pub(crate) fn clipboard_paste_snapshot(event: JsValue) -> JsValue;
+    #[wasm_bindgen(catch)]
+    pub(crate) async fn clipboard_file_paths(event: JsValue) -> Result<JsValue, JsValue>;
+    /// Chat media as a cached blob object URL (never a base64 data URL) —
+    /// `null` when the file cannot be read, so callers paint their fallback.
+    /// `owner_id` is a unique mounted element that owns the URL until removal.
+    #[wasm_bindgen(js_name = media_url)]
+    pub(crate) async fn media_url(path: &str, owner_id: &str) -> JsValue;
+    /// Small canvas-downscaled variant of [`media_url`] for thumbnail-sized
+    /// cards, so long histories do not keep full-size decoded bitmaps alive.
+    #[wasm_bindgen(js_name = media_thumbnail_url)]
+    pub(crate) async fn media_thumbnail_url(path: &str, owner_id: &str) -> JsValue;
     #[wasm_bindgen(js_name = drag_has_files)]
     pub(crate) fn drag_has_files(event: JsValue) -> bool;
     #[wasm_bindgen(js_name = set_drag_copy)]
@@ -61,6 +86,8 @@ extern "C" {
     pub(crate) fn is_windows() -> bool;
     pub(crate) fn is_mac() -> bool;
     pub(crate) async fn window_control(action: &str);
+    #[wasm_bindgen(js_name = set_window_title)]
+    pub(crate) async fn set_window_title(title: &str);
     pub(crate) async fn start_window_move();
     #[wasm_bindgen(js_name = arm_caption_drag)]
     pub(crate) async fn arm_caption_drag(start_x: f64, start_y: f64);
@@ -73,7 +100,7 @@ extern "C" {
     #[wasm_bindgen(js_name = upload_input_files)]
     pub(crate) async fn upload_input_files(input_id: &str) -> JsValue;
     #[wasm_bindgen(js_name = preview_selection)]
-    pub(crate) fn preview_selection() -> String;
+    pub(crate) fn preview_selection(fallback_x: i32, fallback_y: i32) -> String;
     #[wasm_bindgen(js_name = clear_selection)]
     pub(crate) fn clear_selection();
     #[wasm_bindgen(catch, js_name = render_share_png)]
@@ -140,7 +167,7 @@ pub(crate) fn force_chat_bottom() {
     force_chat_scroll_bottom(CHAT_SCROLLER_ID);
 }
 
-/// Save the previous conversation's position and restore this conversation.
+/// Open the conversation at latest, including after asynchronous hydration.
 pub(crate) fn restore_chat_session_scroll(session_id: &str) {
     switch_chat_scroll(CHAT_SCROLLER_ID, session_id);
 }
@@ -177,6 +204,14 @@ pub(crate) fn schedule_highlight(id: String) {
     });
 }
 
+/// Replace and re-highlight the editable code node with the given DOM id.
+/// The editor owns that node's children, outside the reactive renderer.
+pub(crate) fn set_highlighted_code(id: String, text: String) {
+    spawn_local(async move {
+        let _ = highlight_set_code(&id, &text).await;
+    });
+}
+
 /// Open an http(s)/mailto/tel link in the OS default handler (not the app webview).
 pub(crate) fn open_external_url(url: String) {
     spawn_local(async move {
@@ -184,4 +219,10 @@ pub(crate) fn open_external_url(url: String) {
             .unwrap_or(JsValue::UNDEFINED);
         let _ = invoke("open_external_url", args).await;
     });
+}
+
+/// Ask the backend to open the first available browser on its extension
+/// manager page; resolves to the `BrowserExtensionSetup` reply.
+pub(crate) async fn open_browser_extension_page() -> JsValue {
+    invoke("open_browser_extension_page", JsValue::UNDEFINED).await
 }

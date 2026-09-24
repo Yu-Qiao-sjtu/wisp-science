@@ -7,7 +7,7 @@
 
 use super::*;
 
-/// Per-session runtime: one agent (with its own MCP clients), one cancel flag,
+/// Per-session runtime: one agent (with Host-managed MCP handles), one cancel flag,
 /// and the persisted-seq cursor. Python processes live in the project-scoped
 /// `RuntimeManager`, so rebuilding or deleting a conversation preserves them.
 /// Keyed by frame id in `AppState.sessions`, so different conversations run
@@ -29,7 +29,13 @@ pub(crate) struct SessionRuntime {
     pub(crate) workflow: Arc<tokio::sync::Mutex<()>>,
     pub(crate) cancel: Arc<AtomicBool>,
     pub(crate) deleted: AtomicBool,
+    /// Last persisted message seq (`COALESCE(MAX(seq),0)`), not a message count.
     pub(crate) last_seq: StdMutex<i64>,
+    /// Weak so navigation cannot keep a completed turn's writer alive.
+    pub(crate) ui_event_writer:
+        StdMutex<Option<tokio::sync::mpsc::WeakUnboundedSender<SessionUiMessage>>>,
+    pub(crate) live_event_writer:
+        StdMutex<Option<tokio::sync::mpsc::WeakUnboundedSender<SessionUiMessage>>>,
     /// Guide (#410): mid-turn messages the running loop drains into user
     /// messages at its next iteration; ids let queued senders detect that.
     pub(crate) pending_guidance: wisp_core::GuidanceQueue,
@@ -45,10 +51,15 @@ pub(crate) struct SessionRuntime {
     /// FIFO into fresh turns. ponytail: in-memory only — lost on app restart,
     /// same as the optimistic bubbles, which are never persisted either.
     pub(crate) queued: StdMutex<Vec<QueuedItem>>,
+    /// Cut-ins offered to the current loop, with their original payload kept
+    /// until the queue driver observes consumption or starts them first.
+    pub(crate) queued_cutins: StdMutex<Vec<(u64, QueuedItem)>>,
     /// True while a driver task owns draining `queued`. Flipped only under the
     /// `queued` lock so an enqueue can never strand behind a driver that is
     /// about to exit on an empty queue.
     pub(crate) draining: AtomicBool,
+    /// Reserve replacement priority before cancelling the active workflow.
+    pub(crate) replacing: std::sync::atomic::AtomicUsize,
 }
 
 /// One parked follow-up turn (#433). `id` is assigned by the frontend so the
@@ -73,12 +84,16 @@ impl SessionRuntime {
             cancel: Arc::new(AtomicBool::new(false)),
             deleted: AtomicBool::new(false),
             last_seq: StdMutex::new(0),
+            ui_event_writer: StdMutex::new(None),
+            live_event_writer: StdMutex::new(None),
             pending_guidance: wisp_core::GuidanceQueue::default(),
             guidance_seq: std::sync::atomic::AtomicU64::new(0),
             interrupted_turn_start: StdMutex::new(None),
             mcp_app_contexts: StdMutex::new(HashMap::new()),
             queued: StdMutex::new(Vec::new()),
+            queued_cutins: StdMutex::new(Vec::new()),
             draining: AtomicBool::new(false),
+            replacing: std::sync::atomic::AtomicUsize::new(0),
         }
     }
     pub(crate) fn invalidate_cached_agent(&self) {
@@ -112,6 +127,21 @@ impl SessionRuntime {
     pub(crate) fn set_last_seq(&self, v: i64) {
         *self.last_seq.lock().unwrap() = v;
     }
+
+    /// Refresh `last_seq` from the durable `MAX(seq)` cursor. Recovery paths
+    /// must not use `messages.len()`.
+    pub(crate) async fn sync_last_seq_from_store(
+        &self,
+        store: &Store,
+        frame_id: &str,
+    ) -> Result<i64, String> {
+        let seq = store
+            .max_message_seq(frame_id)
+            .await
+            .map_err(|error| format!("reading MAX(seq) failed: {error}"))?;
+        self.set_last_seq(seq);
+        Ok(seq)
+    }
     pub(crate) fn set_mcp_app_context(&self, instance_id: String, context: Option<McpAppContext>) {
         let mut contexts = self.mcp_app_contexts.lock().unwrap();
         if let Some(context) = context {
@@ -142,9 +172,13 @@ impl SessionRuntime {
 pub(crate) struct McpAppContext {
     pub(crate) app_name: String,
     pub(crate) body: String,
+    /// Text-only projection used by the transcript notice. The full body is
+    /// still retained separately for the next Agent turn.
+    pub(crate) summary: String,
+    pub(crate) structured_preview: Option<String>,
 }
 
-pub(crate) fn mcp_app_frame_id(instance_id: &str) -> Result<&str, String> {
+pub(crate) fn mcp_app_identity(instance_id: &str) -> Result<(&str, &str), String> {
     if instance_id.len() > MAX_MCP_APP_INSTANCE_ID_BYTES {
         return Err("MCP App instance id is too long.".into());
     }
@@ -157,7 +191,32 @@ pub(crate) fn mcp_app_frame_id(instance_id: &str) -> Result<&str, String> {
     if frame_id.is_empty() || identity.is_empty() {
         return Err("Invalid MCP App instance id.".into());
     }
-    Ok(frame_id)
+    Ok((frame_id, identity))
+}
+
+pub(crate) fn mcp_app_frame_id(instance_id: &str) -> Result<&str, String> {
+    mcp_app_identity(instance_id).map(|(frame_id, _)| frame_id)
+}
+
+/// Stable tab/bridge identity for one MCP App. Same UI resource (ignoring
+/// query/hash) or tool name reuses the existing center tab; a unique
+/// presentation UUID must not mint a new window.
+pub(crate) fn mcp_app_resource_identity(payload: &serde_json::Value) -> &str {
+    let raw = payload
+        .pointer("/resource/uri")
+        .or_else(|| payload.pointer("/tool/name"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("app");
+    raw.split_once(['?', '#'])
+        .map(|(base, _)| base)
+        .filter(|base| !base.is_empty())
+        .unwrap_or(raw)
+}
+
+pub(crate) fn mcp_app_instance_id(frame_id: &str, payload: &serde_json::Value) -> String {
+    format!("mcp-app:{frame_id}:{}", mcp_app_resource_identity(payload))
 }
 
 pub(crate) fn normalize_mcp_app_context(
@@ -175,7 +234,7 @@ pub(crate) fn normalize_mcp_app_context(
     let object = context
         .as_object()
         .ok_or_else(|| "MCP App model context must be an object.".to_string())?;
-    let mut parts = Vec::new();
+    let mut text_parts = Vec::new();
     if let Some(content) = object.get("content").filter(|value| !value.is_null()) {
         let blocks = content
             .as_array()
@@ -193,26 +252,29 @@ pub(crate) fn normalize_mcp_app_context(
                 .ok_or_else(|| "MCP App text context is missing its text value.".to_string())?
                 .trim();
             if !text.is_empty() {
-                parts.push(text.to_string());
+                text_parts.push(text.to_string());
             }
         }
     }
-    if let Some(structured) = object
+    let structured_for_model = if let Some(structured) = object
         .get("structuredContent")
         .filter(|value| !value.is_null())
     {
         let structured = structured
             .as_object()
             .ok_or_else(|| "MCP App structuredContent must be an object.".to_string())?;
-        if !structured.is_empty() {
-            parts.push(format!(
-                "Structured state: {}",
+        if structured.is_empty() {
+            None
+        } else {
+            Some(
                 serde_json::to_string(structured)
-                    .map_err(|error| format!("Invalid MCP App structured state: {error}"))?
-            ));
+                    .map_err(|error| format!("Invalid MCP App structured state: {error}"))?,
+            )
         }
-    }
-    if parts.is_empty() {
+    } else {
+        None
+    };
+    if text_parts.is_empty() && structured_for_model.is_none() {
         return Ok(None);
     }
     let app_name = app_name.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -221,10 +283,56 @@ pub(crate) fn normalize_mcp_app_context(
     } else {
         app_name.chars().take(MAX_MCP_APP_NAME_CHARS).collect()
     };
+    let mut parts = text_parts.clone();
+    if let Some(structured) = &structured_for_model {
+        parts.push(format!("Structured state: {structured}"));
+    }
+    let structured_preview = object
+        .get("structuredContent")
+        .filter(|value| !value.is_null())
+        .map(redact_mcp_app_structured_preview)
+        .transpose()?
+        .filter(|value| !value.is_empty());
     Ok(Some(McpAppContext {
         app_name,
         body: parts.join("\n\n"),
+        summary: text_parts.join("\n\n"),
+        structured_preview,
     }))
+}
+
+fn redact_mcp_app_structured_preview(value: &serde_json::Value) -> Result<String, String> {
+    fn redact(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.retain(|key, _| {
+                    let key = key.to_ascii_lowercase();
+                    ![
+                        "token",
+                        "secret",
+                        "password",
+                        "api_key",
+                        "apikey",
+                        "authorization",
+                        "credential",
+                        "environment",
+                        "env",
+                        "_meta",
+                    ]
+                    .iter()
+                    .any(|needle| key == *needle || key.contains(needle))
+                });
+                for child in map.values_mut() {
+                    redact(child);
+                }
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(redact),
+            _ => {}
+        }
+    }
+    let mut safe = value.clone();
+    redact(&mut safe);
+    serde_json::to_string(&safe).map_err(|error| format!("Invalid MCP App preview: {error}"))
 }
 
 #[derive(Clone)]
@@ -238,10 +346,11 @@ pub(crate) struct ActiveProject {
 /// Host-side `serverTools` binding for one live MCP App instance. Registered
 /// when an `mcp_app` presentation flows to the UI and revoked on teardown or
 /// session delete; the `server` handle keeps only a `Weak` reference to the
-/// MCP client, so an agent rebuild or connector restart naturally makes the
-/// instance stale instead of pinning the server process.
+/// MCP client. Host ownership preserves it across Agent rebuilds; connection
+/// and view generations revoke stale callbacks without making the view a process owner.
 #[derive(Clone)]
 pub(crate) struct McpAppToolBridge {
+    pub(crate) generation: u64,
     pub(crate) frame_id: String,
     pub(crate) server: Arc<dyn wisp_tools::McpAppServer>,
     pub(crate) limiter: Arc<McpAppCallLimiter>,
@@ -257,11 +366,29 @@ pub(crate) const MCP_APP_CALL_WINDOW: std::time::Duration = std::time::Duration:
 #[derive(Default)]
 pub(crate) struct McpAppBridges {
     bridges: StdMutex<HashMap<String, McpAppToolBridge>>,
+    next_generation: std::sync::atomic::AtomicU64,
 }
 
 impl McpAppBridges {
-    pub(crate) fn register(&self, instance_id: String, bridge: McpAppToolBridge) {
-        self.bridges.lock().unwrap().insert(instance_id, bridge);
+    pub(crate) fn register(&self, instance_id: String, mut bridge: McpAppToolBridge) {
+        bridge.generation = self.next_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(old) = self.bridges.lock().unwrap().insert(instance_id, bridge) {
+            old.limiter.closed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn close_generation(&self, instance_id: &str, generation: Option<u64>) -> bool {
+        let mut bridges = self.bridges.lock().unwrap();
+        if bridges
+            .get(instance_id)
+            .is_some_and(|b| Some(b.generation) == generation)
+        {
+            if let Some(old) = bridges.remove(instance_id) {
+                old.limiter.closed.store(true, Ordering::SeqCst);
+            }
+            return true;
+        }
+        false
     }
 
     pub(crate) fn get(&self, instance_id: &str) -> Option<McpAppToolBridge> {
@@ -269,19 +396,48 @@ impl McpAppBridges {
     }
 
     pub(crate) fn close(&self, instance_id: &str) -> bool {
-        self.bridges.lock().unwrap().remove(instance_id).is_some()
-    }
-
-    pub(crate) fn remove_for_frame(&self, frame_id: &str) {
         self.bridges
             .lock()
             .unwrap()
-            .retain(|_, bridge| bridge.frame_id != frame_id);
+            .remove(instance_id)
+            .is_some_and(|old| {
+                old.limiter.closed.store(true, Ordering::SeqCst);
+                true
+            })
+    }
+
+    pub(crate) fn cancel_all(&self) {
+        for bridge in self.bridges.lock().unwrap().values() {
+            bridge.limiter.cancel_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    pub(crate) fn cancel_for_frame(&self, frame_id: &str) {
+        for bridge in self
+            .bridges
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|b| b.frame_id == frame_id)
+        {
+            bridge.limiter.cancel_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    pub(crate) fn remove_for_frame(&self, frame_id: &str) {
+        self.bridges.lock().unwrap().retain(|_, bridge| {
+            if bridge.frame_id == frame_id {
+                bridge.limiter.closed.store(true, Ordering::SeqCst);
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct McpAppCallLimiter {
+    pub(crate) cancel_epoch: std::sync::atomic::AtomicU64,
+    pub(crate) closed: AtomicBool,
     max_concurrent: usize,
     max_per_window: usize,
     window: std::time::Duration,
@@ -303,6 +459,14 @@ impl Drop for McpAppCallPermit {
 }
 
 impl McpAppCallLimiter {
+    pub(crate) fn was_cancelled(&self, epoch: u64) -> bool {
+        self.closed.load(Ordering::SeqCst) || self.cancel_epoch.load(Ordering::SeqCst) != epoch
+    }
+    pub(crate) async fn cancelled(&self, epoch: u64) {
+        while !self.was_cancelled(epoch) {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
     pub(crate) fn new() -> Arc<Self> {
         Self::with_limits(
             MCP_APP_MAX_CONCURRENT_CALLS,
@@ -317,6 +481,8 @@ impl McpAppCallLimiter {
         window: std::time::Duration,
     ) -> Arc<Self> {
         Arc::new(Self {
+            cancel_epoch: std::sync::atomic::AtomicU64::new(0),
+            closed: AtomicBool::new(false),
             max_concurrent,
             max_per_window,
             window,
@@ -385,6 +551,7 @@ impl ProjectActivityLocks {
 }
 
 pub(crate) struct AppState {
+    pub(crate) desktop: tauri::AppHandle,
     pub(crate) app_data: PathBuf,
     pub(crate) store: Store,
     pub(crate) library: LibraryStore,
@@ -399,7 +566,9 @@ pub(crate) struct AppState {
     /// one conversation — different conversations never block each other.
     pub(crate) sessions: tokio::sync::Mutex<HashMap<String, Arc<SessionRuntime>>>,
     pub(crate) acp_sessions: acp::AcpRuntimeMap,
-    pub(crate) acp_permissions: tokio::sync::Mutex<HashMap<String, String>>,
+    /// Live ACP permission requests keyed by protocol request id. Each value
+    /// retains the exact options plus a separate one-shot remote approval id.
+    pub(crate) acp_permissions: tokio::sync::Mutex<HashMap<String, acp::PendingAcpPermission>>,
     /// Live ACP `ask_user` requests (request id → frame id), mirroring
     /// `acp_permissions`. Membership also marks a reloaded pending row as
     /// still answerable; rows absent here expire on reload.
@@ -431,16 +600,17 @@ pub(crate) struct AppState {
     /// frame id explicitly (`TauriOutput.frame_id`).
     pub(crate) active_frame: std::sync::RwLock<HashMap<String, String>>,
     /// Window that most recently submitted a user-routed turn for each session.
-    /// Agent events are process-wide, so every frontend window asks for the
-    /// same desktop notification. This origin lets the backend choose exactly
-    /// one window without conflating two conversations in the same project.
+    /// Live agent/approval UI is scoped to windows of the session's project;
+    /// this origin still picks which window owns the desktop notification.
     pub(crate) notification_window: std::sync::RwLock<HashMap<String, String>>,
     /// Per-session confirm channels, keyed by frame id.
     pub(crate) confirms: ConfirmMap,
     /// Sessions blocked on an inline approval card (Projects dashboard → Needs you).
     pub(crate) awaiting_confirm: Arc<StdMutex<HashSet<String>>>,
     /// Live per-tool approval policy, read on every tool call by `TauriOutput`.
-    pub(crate) approvals: Arc<StdRwLock<ApprovalPolicy>>,
+    /// Project overlays sit beside the process-wide default so two windows can
+    /// keep different scopes.
+    pub(crate) approvals: Arc<StdRwLock<LiveApprovals>>,
     /// Scoped approvals granted from the inline confirmation card.
     pub(crate) approval_grants: Arc<StdMutex<ApprovalGrants>>,
     /// Conversations whose approval prompts are bypassed for this app run.
@@ -492,12 +662,11 @@ impl AppState {
     }
     /// Snapshot a window's active project. Falls back to the "main" window's
     /// project (always initialized at startup) for un-scoped or early calls.
-    pub(crate) fn active(&self, label: &str) -> ActiveProject {
-        let map = self.active.read().unwrap();
-        map.get(label)
-            .or_else(|| map.get("main"))
-            .cloned()
-            .expect("main window active project is initialized at startup")
+    /// File → New Window views (`home-*`) never inherit another window's
+    /// workspace — they must open a project first, and commands must return
+    /// that error instead of panicking (a panic exits every window).
+    pub(crate) fn require_active(&self, label: &str) -> Result<ActiveProject, String> {
+        lookup_window_binding(&self.active.read().unwrap(), label).cloned()
     }
     pub(crate) fn set_active(&self, label: &str, ap: ActiveProject) {
         self.active.write().unwrap().insert(label.to_string(), ap);
@@ -507,6 +676,7 @@ impl AppState {
         self.active_frame.read().unwrap().get(label).cloned()
     }
     pub(crate) fn set_active_frame(&self, label: &str, frame: Option<String>) {
+        let changed = self.active_frame(label) != frame;
         match frame {
             Some(f) => {
                 self.active_frame
@@ -517,6 +687,12 @@ impl AppState {
             None => {
                 self.active_frame.write().unwrap().remove(label);
             }
+        }
+        // Drop active_frame before touching the child registry. Native
+        // suspend is a no-op when the isolation manager is not installed
+        // (unit tests without a full desktop runtime).
+        if changed {
+            crate::mcp_app_child_commands::suspend_owner(&self.desktop, label);
         }
     }
     pub(crate) fn set_notification_window(&self, frame_id: &str, label: &str) {
@@ -540,6 +716,7 @@ impl AppState {
     /// Revoke every app bridge owned by a conversation (session delete).
     pub(crate) fn remove_mcp_app_bridges_for_frame(&self, frame_id: &str) {
         self.mcp_app_tool_bridges.remove_for_frame(frame_id);
+        crate::mcp_app_child_commands::remove_frame(&self.desktop, frame_id);
     }
     pub(crate) fn preferred_notification_window(
         &self,
@@ -560,5 +737,116 @@ impl AppState {
             &active_projects,
             &active_frames,
         )
+    }
+
+    /// Windows currently bound to this session's project. Live agent, approval,
+    /// and browser-cleanup events use this set so a second project window never
+    /// receives another workspace's stream.
+    pub(crate) fn session_surface_labels(
+        &self,
+        frame_id: &str,
+        project_id: Option<&str>,
+    ) -> Vec<String> {
+        let active = self.active.read().unwrap();
+        let active_projects = active
+            .iter()
+            .map(|(label, project)| (label.clone(), project.id.clone()))
+            .collect::<HashMap<_, _>>();
+        let active_frames = self.active_frame.read().unwrap();
+        let inferred = project_id.map(str::to_string).or_else(|| {
+            active_frames.iter().find_map(|(label, viewed)| {
+                (viewed.as_str() == frame_id)
+                    .then(|| active.get(label).map(|project| project.id.clone()))
+                    .flatten()
+            })
+        });
+        let origin = self.notification_window.read().unwrap();
+        session_surface_window_labels(
+            origin.get(frame_id).map(String::as_str),
+            frame_id,
+            inferred.as_deref(),
+            &active_projects,
+            &active_frames,
+        )
+    }
+}
+
+pub(crate) const BLANK_WINDOW_NO_PROJECT: &str =
+    "Open a project in this window before running that action.";
+
+/// File → New Window labels (`home-<uuid>`). Those views are not restored on
+/// launch, so they must not be written into `window_active_projects`.
+pub(crate) fn is_blank_window_label(label: &str) -> bool {
+    label.starts_with("home-") && label.len() > "home-".len()
+}
+
+/// Resolve which project a window command may touch.
+///
+/// A File → New Window view has its own label and no binding until the user
+/// opens a project in that GUI. Falling back to `main` would let that window
+/// read or mutate another project's workspace, sessions, and runtimes.
+pub(crate) fn lookup_window_binding<'a, T>(
+    bound: &'a HashMap<String, T>,
+    label: &str,
+) -> Result<&'a T, String> {
+    if let Some(value) = bound.get(label) {
+        return Ok(value);
+    }
+    if is_blank_window_label(label) {
+        return Err(BLANK_WINDOW_NO_PROJECT.into());
+    }
+    bound
+        .get("main")
+        .ok_or_else(|| "main window active project is initialized at startup".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_blank_window_label, lookup_window_binding, BLANK_WINDOW_NO_PROJECT};
+    use std::collections::HashMap;
+
+    #[test]
+    fn blank_window_labels_are_home_prefixed() {
+        assert!(is_blank_window_label(
+            "home-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        ));
+        assert!(!is_blank_window_label("home-"));
+        assert!(!is_blank_window_label("home"));
+        assert!(!is_blank_window_label("main"));
+        assert!(!is_blank_window_label("proj-default"));
+        assert!(!is_blank_window_label("pet"));
+    }
+
+    #[test]
+    fn blank_windows_do_not_inherit_the_main_project() {
+        let mut bound = HashMap::new();
+        bound.insert("main".to_string(), "project-a");
+        assert_eq!(
+            lookup_window_binding(&bound, "home-1").unwrap_err(),
+            BLANK_WINDOW_NO_PROJECT
+        );
+        assert_eq!(
+            *lookup_window_binding(&bound, "proj-default").unwrap(),
+            "project-a"
+        );
+        bound.insert("home-1".to_string(), "project-b");
+        assert_eq!(
+            *lookup_window_binding(&bound, "home-1").unwrap(),
+            "project-b"
+        );
+        assert_eq!(*lookup_window_binding(&bound, "main").unwrap(), "project-a");
+    }
+
+    #[test]
+    fn unbound_home_window_lookup_is_a_returned_error() {
+        let mut bound = HashMap::new();
+        bound.insert("main".to_string(), "project-a");
+        let err =
+            lookup_window_binding(&bound, "home-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap_err();
+        assert_eq!(err, BLANK_WINDOW_NO_PROJECT);
+        assert!(
+            !err.contains("panic"),
+            "window commands must return this error; panicking exits every window"
+        );
     }
 }

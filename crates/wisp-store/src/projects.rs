@@ -22,6 +22,31 @@ impl Store {
         Ok(())
     }
 
+    pub async fn project_default_specialist(&self, project_id: &str) -> Result<Option<String>> {
+        let value: Option<String> = sqlx::query_scalar(
+            "SELECT NULLIF(TRIM(default_specialist_id),'') FROM projects WHERE id=?",
+        )
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        Ok(value)
+    }
+
+    pub async fn set_project_default_specialist(
+        &self,
+        project_id: &str,
+        specialist_id: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE projects SET default_specialist_id=?, updated_at=? WHERE id=?")
+            .bind(specialist_id.trim())
+            .bind(chrono::Utc::now().timestamp())
+            .bind(project_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_project(&self, id: &str) -> Result<Option<(String, String)>> {
         let row: Option<(String, String)> = sqlx::query_as(
             "SELECT COALESCE(name,''), COALESCE(workspace_dir,'') FROM projects WHERE id=?",
@@ -54,12 +79,47 @@ impl Store {
         Ok(())
     }
 
-    /// All projects, newest-updated first, each with its session count
+    /// Set a local pin without changing the project's activity timestamp.
+    pub async fn set_project_starred(&self, id: &str, starred: bool) -> Result<()> {
+        anyhow::ensure!(
+            Self::has_column(&self.pool, "projects", "starred").await?,
+            "This database needs a desktop schema upgrade before project stars can be saved. Open it with the current WebView desktop first."
+        );
+        let result =
+            sqlx::query("UPDATE projects SET starred=? WHERE id=? AND id NOT LIKE 'scratch:%'")
+                .bind(starred)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        anyhow::ensure!(result.rows_affected() == 1, "Project not found");
+        Ok(())
+    }
+
+    pub async fn starred_project_ids(&self) -> Result<std::collections::HashSet<String>> {
+        // Read-only native clients may inspect a desktop database from before
+        // project stars were introduced. Reading must not force a migration.
+        if !Self::has_column(&self.pool, "projects", "starred").await? {
+            return Ok(std::collections::HashSet::new());
+        }
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM projects WHERE starred=1 AND id NOT LIKE 'scratch:%'",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ids.into_iter().collect())
+    }
+
+    /// All projects, starred first then newest-updated first, each with its session count
     /// (root frames with a user turn or an explicit title — matches
     /// `list_sessions_page`, #888) and artifact count.
     pub async fn list_projects(
         &self,
     ) -> Result<Vec<(String, String, String, i64, i64, i64, String, i64)>> {
+        let starred_order = if Self::has_column(&self.pool, "projects", "starred").await? {
+            "p.starred DESC, "
+        } else {
+            ""
+        };
         let sql = format!(
             "SELECT p.id AS id, COALESCE(p.name,'') AS name, COALESCE(p.workspace_dir,'') AS ws, \
                     p.created_at AS created_at, p.updated_at AS updated_at, \
@@ -71,7 +131,7 @@ impl Store {
                        AND a.exploration_id IS NULL) AS artifacts \
              FROM projects p \
              WHERE p.id NOT LIKE 'scratch:%' \
-             ORDER BY p.updated_at DESC, p.rowid DESC",
+             ORDER BY {starred_order}p.updated_at DESC, p.rowid DESC",
             listable = SESSION_IS_LISTABLE_SQL,
         );
         let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;

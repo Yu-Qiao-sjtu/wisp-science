@@ -1,7 +1,7 @@
 // Wisp Real Browser Bridge protocol constants (Protocol v2).
 var WISP_PROTOCOL = {
   version: 2,
-  extensionVersion: "0.3.0",
+  extensionVersion: "0.3.1",
   capabilities: [
     "article_scan",
     "asset_download",
@@ -11,7 +11,9 @@ var WISP_PROTOCOL = {
     "conditional_wait",
     "session",
     "pause_control",
-    "chatgpt_turn"
+    "runtime_reload",
+    "chatgpt_turn",
+    "chat_turn"
   ]
 };
 

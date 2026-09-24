@@ -5,10 +5,102 @@ Wisp has two complementary headless interfaces:
 - `wisp-science eval` runs repeatable agent conformance and regression suites.
 - `wisp-science rpc` runs a long-lived agent over a versioned JSONL stdin/stdout protocol.
 
-Both exercise the production `Agent` loop and tool registry. The default eval
-suite uses a deterministic scripted provider, temporary workspaces, and fixture
-MCP/subagent boundaries, so it requires no API key, network, SSH host, GPU,
-scheduler, Python, or R installation.
+Both exercise the production `Agent` loop and tool registry, including the Run
+control plane (`run_in_context`, `monitor_run`, `get_run`, `cancel_run`,
+harvest/cleanup/transfer). Interactive/`run`/`rpc` open `.wisp/wisp.sqlite` in
+the project (override with `WISP_STORE`) so long jobs wait through
+`monitor_run` instead of shell `sleep` polling. SSH/WSL contexts in that store
+are used when present; the desktop app's host registry is a separate database
+unless `WISP_STORE` points at it.
+
+The default eval suite uses a deterministic scripted provider, temporary
+workspaces, and fixture MCP/subagent boundaries, so it requires no API key,
+network, SSH host, GPU, scheduler, Python, or R installation.
+
+## Independent Workflow conversion (CLI)
+
+Interactive, `run`, and `rpc` Agents expose `create_workflow`,
+`explain_workflow`, and `run_workflow`. `create_workflow` uses the configured
+LLM to turn an installed Skill and its complete Markdown references into the
+existing Workflow proposal format. Each node has explicit instructions,
+capabilities and a JSON output contract. Source documents and their SHA-256
+are retained for provenance; the saved nodes have no runtime Skill bindings.
+Updating or removing the original Skill does not change a converted Workflow.
+
+Use `WISP_PROVIDER`, `WISP_API_URL`, `WISP_MODEL`, and `WISP_API_KEY` as for
+ordinary CLI conversations. Install the source package under
+`.wisp/skills/<name>/` in a disposable project, including its reference files.
+For example, with bear-support installed:
+
+```bash
+wisp-science run 'Use create_workflow to convert bear-support into an independent Workflow named bear-support-independent. Inspect it with explain_workflow. Do not run it yet.'
+wisp-science run 'Use run_workflow to test the saved bear-support-independent Workflow on this claim: Open access articles receive more citations. Report the actual result and trace directory.'
+```
+
+The Agent discovers the saved ID with `explain_workflow` (`workflow_id: "*"`).
+Execution displays the resolved plan and asks for approval before starting
+nodes. Console mode accepts `y`; RPC uses the existing `approval_response`
+protocol. Noninteractive `run --output jsonl` reports approval required and
+does not start nodes. Creating a template never approves execution.
+If a child command triggers the existing safety rules, its confirmation is
+forwarded to the same console/RPC host. Approval of the Workflow plan does not
+bypass these command-specific decisions.
+
+CLI Workflow children use the core capability resolver and dependency-aware
+executor with fresh contexts and filtered tools. This first implementation
+supports reasoning, project reads/writes and synchronous local Runs. It does
+not expose shell, MCP, Python/R REPL, remote contexts, nested delegation,
+Specialist overrides or isolation to children. It rejects unavailable
+capabilities instead of inheriting parent tools. CLI commands run through
+`run_in_context` with `context_id: "local"` and `wait_for_completion: true`.
+Command execution is not an OS sandbox: an approved local command can access
+the host environment, including its CLI credentials and network.
+
+The converter currently accepts method documents and external CLI
+dependencies. Skill packages containing executable scripts, runtime
+sidecars, assets or non-Markdown references are rejected until those resources can be snapshotted for independent
+execution. In particular, this experiment preserves bear-support's SciMaster
+CLI requirement; it does not substitute an unrelated literature MCP. A live
+run requires the user's working `sci` installation and authentication.
+
+Node output must satisfy its explicit JSON contract, including
+`status: "succeeded"`, `summary`, and an `artifacts` array of project-relative
+file paths. Fixed deliverables can be required using `artifacts.const` in the
+existing output schema. The host verifies declared files and captures their
+bytes and SHA-256 (32 MiB per file). Contract mismatches, failed tool/Run calls,
+missing files and escaped paths fail the node and block dependent nodes.
+This initial strict runner also fails a node with an earlier tool error even
+if the Agent later claims recovery. Semantic evidence assessment remains an
+Agent task; file snapshots alone do not prove scientific correctness.
+
+Templates use the existing `workflow_templates` setting. Runs persist
+`plan.json`, per-node message traces and results, `result.json`, `status.json`,
+and verified file snapshots under `.wisp/workflow-runs/<run-id>/`. A completed
+failed run can be retried by passing its `retry_run_id` to `run_workflow` with
+the saved `workflow_id`. Omit `request` to reuse the original input. Successful
+nodes are reused only when the plan, authorization, output contracts and file
+hashes still match. Changed files or templates require a fresh run. The retry
+gets a new log directory and preserves the previous attempt; `reused.json`
+records which nodes were reused. Each retry requires approval. Inspect a
+leftover `running` status after a process interruption; recovery of interrupted
+CLI processes is not implemented yet. These run logs do not currently populate
+the desktop Workflow timeline. Legacy Skill-bound templates are rejected by this CLI
+runner and must be converted again. Desktop Workflow Studio and its chat
+conversion tool use the same independent conversion boundary; see
+[Agent delegation](agent-delegation.md#convert-skills-into-independent-workflows)
+for desktop migration and approval behavior.
+
+Run the offline conversion/execution regressions without model or search keys:
+
+```bash
+cargo test -p wisp-cli workflows::tests
+```
+
+They use synthetic method documents and scripted providers through the real
+Agent loop, plus the real capability resolver, executor and file tools. The
+manual bear-support acceptance uses upstream files from
+[`c31d6eb9`](https://github.com/fei0810/bear-research-skills/tree/c31d6eb9c63ca5b29de0f75f439ee43e51571f34/skills/bear-support).
+Its source remains subject to its upstream license; it is not bundled here.
 
 ## Offline evaluation
 
@@ -20,11 +112,14 @@ cargo run -p wisp-cli -- eval \
   --save target/headless-agent-eval/report.json
 ```
 
-The suite covers reads and exact edits, shell execution, persistent Python and
-R runtime cells, approval denial, skills, deferred MCP discovery, read-only
-subagent delegation, resume without tool replay, session restart, queued
-guidance, cancellation, vision fallback, manual compaction, plan-mode gating,
-and project path containment.
+The suite covers reads and exact edits, shell execution, persisted local Runs
+(`run_in_context` / `monitor_run` instead of shell `sleep` polling), persistent
+Python and R runtime cells, approval denial, skills, deferred MCP discovery,
+read-only subagent delegation, resume without tool replay, session restart,
+queued guidance, cancellation, vision fallback, manual compaction, plan-mode
+refusals, and the shared agent observability contract (local JSONL traces under
+`.wisp/traces/`; see [agent observability](agent-observability.md)).
+gating, and project path containment.
 
 Useful selection and stress controls:
 
@@ -73,8 +168,46 @@ are zero. Cached input is excluded from the billable input estimate.
 
 Use `--mode live` to run the same declarative suite against the configured
 provider. Live mode requires the normal `WISP_API_KEY`, `WISP_PROVIDER`, and
-`WISP_MODEL` environment variables. Scripted steps are ignored in live mode;
-live suites should use tolerant semantic assertions rather than exact prose.
+`WISP_MODEL` environment variables. For a text-only primary model, set
+`WISP_VISION_MODEL` (and optionally `WISP_VISION_PROVIDER`,
+`WISP_VISION_API_URL`, `WISP_VISION_API_KEY`) so `view_image` is described by
+a dedicated vision model instead of being sent to the chat model. Scripted
+steps are ignored in live mode; live suites should use tolerant semantic
+assertions rather than exact prose.
+
+### DepMap natural-language intent regression
+
+`crates/wisp-cli/eval-suites/depmap-intent-live-v1.yaml` exercises the
+user-language boundary before any scientific query. It covers colloquial
+Chinese, a common typo, mixed Chinese-English terminology, synonyms,
+mutation/dependency direction reversal, critical ambiguity, and a multi-intent
+request. The assertions inspect the structured arguments sent to
+`depmap_agent_route`; prose similarity alone cannot pass a case.
+
+Run the deterministic contract version without a provider key:
+
+```bash
+cargo run -p wisp-cli -- eval \
+  --suite crates/wisp-cli/eval-suites/depmap-intent-live-v1.yaml \
+  --artifacts target/depmap-intent-offline \
+  --save target/depmap-intent-offline/report.json
+```
+
+Run the same prompts through a configured real model:
+
+```bash
+cargo run -p wisp-cli -- eval \
+  --mode live \
+  --suite crates/wisp-cli/eval-suites/depmap-intent-live-v1.yaml \
+  --repeat 3 \
+  --parallel 1 \
+  --artifacts target/depmap-intent-live \
+  --save target/depmap-intent-live/report.json
+```
+
+The live run is model-specific. A passing model does not remove the runtime
+clarification boundary: `critical_direction` and `out_of_scope` must still
+stop scientific execution and ask the user to choose or supply missing context.
 
 ### Memory and compaction dataset
 

@@ -7,8 +7,8 @@
 //! bridge.
 
 use crate::{
-    active_skill_index, bio_domains, kernel_worker_path, load_disabled_connectors,
-    load_mcp_connections, r_kernel_worker_path, ActiveProject,
+    bio_domains, kernel_worker_path, load_disabled_connectors, load_mcp_connections,
+    r_kernel_worker_path, ActiveProject,
 };
 use serde::Serialize;
 use std::{collections::HashSet, path::Path};
@@ -74,7 +74,11 @@ impl ScientificResourceCatalog {
         frame_id: Option<&str>,
         app_data: &Path,
     ) -> Result<Self, String> {
-        let skills = active_skill_index(store, project).await;
+        let specialist = match frame_id {
+            Some(frame_id) => crate::specialists::session_specialist(store, frame_id).await,
+            None => None,
+        };
+        let skills = crate::specialist_skill_index(store, project, specialist.as_ref()).await;
         let enabled_skills = skills
             .all()
             .iter()
@@ -126,7 +130,7 @@ impl ScientificResourceCatalog {
         let mut connectors = if dev_command.is_some() {
             Vec::new()
         } else {
-            bundled_connector_resources(bio_domains(), &disabled, managed_python)
+            bundled_connector_resources(bio_domains(), &disabled)
         };
         connectors.extend(
             load_mcp_connections(store)
@@ -196,11 +200,9 @@ impl ScientificResourceCatalog {
     }
 
     pub(crate) fn has_literature(&self) -> bool {
-        !self.literature_skills.is_empty()
-            || self
-                .connectors
-                .iter()
-                .any(|connector| connector.class == ConnectorClass::Literature)
+        self.connectors
+            .iter()
+            .any(|connector| connector.class == ConnectorClass::Literature)
     }
 
     pub(crate) fn has_external(&self) -> bool {
@@ -213,8 +215,35 @@ impl ScientificResourceCatalog {
         self.python || self.r
     }
 
+    pub(crate) fn has_depmap(&self) -> bool {
+        self.enabled_skills
+            .iter()
+            .any(|skill| skill == "depmap-knowledge-query")
+    }
+
+    /// Exact resource ids advertised to the capability resolver. Enabling a
+    /// capability is not sufficient on its own: definitions such as
+    /// `depmap_read` also require the backing Skill to be present in the host
+    /// policy's `available_skills` set.
+    pub(crate) fn available_skill_ids(&self) -> Vec<String> {
+        self.enabled_skills.clone()
+    }
+
+    pub(crate) fn available_connector_ids(&self) -> Vec<String> {
+        self.connectors
+            .iter()
+            .map(|connector| connector.id.clone())
+            .collect()
+    }
+
     pub(crate) fn revision(&self) -> String {
-        let bytes = serde_json::to_vec(self).unwrap_or_default();
+        // Source Skills are conversion inputs. Updating their documentation
+        // must not invalidate an independent Workflow's execution authority.
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "contexts":self.context_fingerprints,"connectors":self.connectors,
+            "python":self.python,"r":self.r,
+        }))
+        .unwrap_or_default();
         let hash = bytes.into_iter().fold(0xcbf29ce484222325u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
         });
@@ -263,6 +292,7 @@ impl ScientificResourceCatalog {
         self.grant(&spec.capabilities, &spec.skill_bindings, specialist(spec))
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve_skill_bindings(
         &self,
         skill_ids: &[String],
@@ -300,15 +330,13 @@ impl ScientificResourceCatalog {
         if capabilities
             .iter()
             .any(|capability| capability == "literature_search")
-            && grant.skills.is_empty()
             && !grant
                 .connectors
                 .iter()
                 .any(|id| self.connector_class(id) == Some(ConnectorClass::Literature))
         {
             return Err(
-                "literature_search has no enabled Skill or connector allowed by this Specialist"
-                    .into(),
+                "literature_search has no enabled connector allowed by this Specialist".into(),
             );
         }
         if capabilities
@@ -662,7 +690,8 @@ fn json_string(raw: &str, keys: &[&str]) -> Option<String> {
 fn custom_connector_fingerprint(connection: &crate::McpConnection) -> String {
     // Include secret-bearing env/header changes in policy invalidation without
     // retaining their plaintext in the catalog or authorization snapshot.
-    let bytes = serde_json::to_vec(connection).unwrap_or_default();
+    let mut bytes = serde_json::to_vec(connection).unwrap_or_default();
+    bytes.extend_from_slice(crate::mcp_secrets::hydrated_secret_digest(connection).as_bytes());
     let hash = bytes.into_iter().fold(0xcbf29ce484222325u64, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
     });
@@ -672,14 +701,11 @@ fn custom_connector_fingerprint(connection: &crate::McpConnection) -> String {
 fn bundled_connector_resources(
     domains: Vec<crate::BioDomain>,
     disabled: &HashSet<String>,
-    managed_python: bool,
 ) -> Vec<ConnectorResource> {
-    if !managed_python {
-        return Vec::new();
-    }
     domains
         .into_iter()
         .filter(|domain| !disabled.contains(&domain.slug))
+        .filter(|domain| !domain.tools.is_empty())
         .map(|domain| ConnectorResource {
             class: if LITERATURE_CONNECTORS.contains(&domain.slug.as_str()) {
                 ConnectorClass::Literature
@@ -776,6 +802,22 @@ mod tests {
     }
 
     #[test]
+    fn depmap_skill_enables_only_the_bounded_query_capability() {
+        let catalog =
+            ScientificResourceCatalog::fake(&["depmap-knowledge-query"], &[], &[], &[], &[]);
+        assert!(catalog.has_depmap());
+        let registry = catalog.capability_registry().unwrap();
+        let capability = registry.get("depmap_read").unwrap();
+        assert_eq!(
+            capability.permissions.tools,
+            ["depmap_query", "depmap_evidence"]
+        );
+        assert!(capability.permissions.network);
+        assert!(!capability.permissions.write);
+        assert!(!capability.permissions.execute);
+    }
+
+    #[test]
     fn tasks_receive_only_explicitly_bound_skills() {
         let catalog = ScientificResourceCatalog::fake(
             &["analysis-workflow", "figure-style", "literature-review"],
@@ -823,27 +865,15 @@ mod tests {
     }
 
     #[test]
-    fn disabled_bundled_connector_is_not_discovered() {
-        let domains = || {
-            vec![
-                crate::BioDomain {
-                    slug: "pubmed".into(),
-                    name: "PubMed".into(),
-                    tools: vec!["search_pubmed".into()],
-                },
-                crate::BioDomain {
-                    slug: "uniprot".into(),
-                    name: "UniProt".into(),
-                    tools: vec!["search_uniprot".into()],
-                },
-            ]
-        };
-        let resources =
-            bundled_connector_resources(domains(), &HashSet::from(["pubmed".into()]), true);
-        assert_eq!(resources.len(), 1);
-        assert_eq!(resources[0].id, "uniprot");
-        assert_eq!(resources[0].class, ConnectorClass::External);
-        assert!(bundled_connector_resources(domains(), &HashSet::new(), false).is_empty());
+    fn native_connectors_are_discovered_without_a_python_environment() {
+        let domains = crate::bio_domains();
+        let resources = bundled_connector_resources(domains.clone(), &HashSet::new());
+        assert_eq!(resources.len(), domains.len());
+        let pubmed = resources.iter().find(|r| r.id == "pubmed").unwrap();
+        assert!(pubmed.fingerprint.contains("search_articles"));
+        let filtered = bundled_connector_resources(domains, &HashSet::from(["pubmed".into()]));
+        assert_eq!(filtered.len() + 1, resources.len());
+        assert!(filtered.iter().all(|r| r.id != "pubmed"));
     }
 
     #[test]
@@ -861,5 +891,31 @@ mod tests {
             execution_context_fingerprint(&first),
             execution_context_fingerprint(&second)
         );
+    }
+    #[test]
+    fn skill_documents_do_not_satisfy_execution_resources_or_change_authority_revision() {
+        let without = ScientificResourceCatalog::fake(&[], &[], &["pubmed"], &[], &[]);
+        let with = ScientificResourceCatalog::fake(
+            &["literature-review"],
+            &["literature-review"],
+            &["pubmed"],
+            &[],
+            &[],
+        );
+        assert_eq!(without.revision(), with.revision());
+        let skill_only = ScientificResourceCatalog::fake(
+            &["literature-review"],
+            &["literature-review"],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(!skill_only.has_literature());
+        let bindings = skill_only
+            .resolve_skill_bindings(&["literature-review".into()], None)
+            .unwrap();
+        assert!(skill_only
+            .validate_task(&["literature_search".into()], &bindings, None)
+            .is_err());
     }
 }

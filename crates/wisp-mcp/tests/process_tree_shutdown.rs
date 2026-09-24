@@ -38,7 +38,8 @@ async fn run_regressions() -> Result<(), String> {
     drop_client_terminates_wrapper_and_grandchild().await?;
     explicit_shutdown_is_idempotent_and_terminates_process_tree().await?;
     cancelled_shutdown_terminates_process_tree().await?;
-    cancelled_request_terminates_process_tree().await
+    cancelled_request_keeps_process_tree().await?;
+    cancelled_isolated_request_keeps_process_tree().await
 }
 
 fn fake_wrapper(root: Option<PathBuf>, fail_initialize: bool) -> ExitCode {
@@ -207,7 +208,7 @@ async fn cancelled_shutdown_terminates_process_tree() -> Result<(), String> {
     assert_fixture_stopped(fixture.root, fixture.wrapper, fixture.grandchild).await
 }
 
-async fn cancelled_request_terminates_process_tree() -> Result<(), String> {
+async fn cancelled_request_keeps_process_tree() -> Result<(), String> {
     let fixture = launch_fixture().await?;
     let arguments = json!({});
     let request = fixture.client.tool_call("hang", &arguments);
@@ -218,26 +219,41 @@ async fn cancelled_request_terminates_process_tree() -> Result<(), String> {
         ));
     }
 
-    // The outer timeout cancels the in-flight request future. Its cancellation
-    // guard must synchronously terminate the whole tree and schedule direct-
-    // child reaping; this must complete while the client owner remains alive,
-    // before any explicit shutdown supplies a second cleanup path.
-    let wrapper_stopped = wait_until_stopped(fixture.wrapper, Duration::from_secs(3)).await;
-    let grandchild_stopped = wait_until_stopped(fixture.grandchild, Duration::from_secs(3)).await;
-    if !wrapper_stopped || !grandchild_stopped {
+    // A stopped wait must not terminate either the server or its children.
+    if !process_exists(fixture.wrapper) || !process_exists(fixture.grandchild) {
         cleanup_fixture(&fixture.root, fixture.wrapper, fixture.grandchild);
-        return Err(format!(
-            "cancelled MCP request left processes alive before shutdown: wrapper_alive={}, grandchild_alive={}",
-            !wrapper_stopped, !grandchild_stopped
-        ));
+        return Err("request cancellation terminated the shared plugin".into());
     }
-
-    // Explicit shutdown remains safe and idempotent after the cancellation
-    // path has already killed and reaped the direct child.
     let cleanup_result = fixture.client.shutdown().await;
     drop(fixture.client);
     cleanup_result
         .map_err(|error| format!("shutdown after request cancellation failed: {error}"))?;
+    assert_fixture_stopped(fixture.root, fixture.wrapper, fixture.grandchild).await
+}
+
+async fn cancelled_isolated_request_keeps_process_tree() -> Result<(), String> {
+    let fixture = launch_fixture().await?;
+    let hang_args = json!({});
+    let request = fixture.client.tool_call_rich_isolated("hang", &hang_args);
+    if let Ok(result) = tokio::time::timeout(Duration::from_millis(150), request).await {
+        cleanup_fixture(&fixture.root, fixture.wrapper, fixture.grandchild);
+        return Err(format!(
+            "isolated hanging request unexpectedly completed: {result:?}"
+        ));
+    }
+
+    // App iframe cancel must fail only this call. The shared stdio tree stays
+    // up so sibling App calls and the presenting agent connection survive.
+    if wait_until_stopped(fixture.wrapper, Duration::from_millis(250)).await
+        || wait_until_stopped(fixture.grandchild, Duration::from_millis(250)).await
+    {
+        cleanup_fixture(&fixture.root, fixture.wrapper, fixture.grandchild);
+        return Err("isolated MCP request cancel tore down the process tree".into());
+    }
+
+    let cleanup_result = fixture.client.shutdown().await;
+    drop(fixture.client);
+    cleanup_result.map_err(|error| format!("shutdown after isolated cancel failed: {error}"))?;
     assert_fixture_stopped(fixture.root, fixture.wrapper, fixture.grandchild).await
 }
 

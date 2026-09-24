@@ -207,7 +207,7 @@ async fn register_artifact_at(
 #[tauri::command]
 pub(super) async fn upload_file(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     filename: String,
     data_base64: String,
 ) -> Result<ArtifactInfo, String> {
@@ -236,7 +236,7 @@ pub(super) async fn upload_file(
 #[tauri::command]
 pub(super) async fn register_artifact(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     path: String,
     content_type: Option<String>,
 ) -> Result<ArtifactInfo, String> {
@@ -327,7 +327,7 @@ mod tests {
 #[tauri::command]
 pub(super) async fn list_artifacts(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     session_id: Option<String>,
 ) -> Result<Vec<ArtifactInfo>, String> {
     let frame_id = match session_id.as_deref().filter(|s| !s.is_empty()) {
@@ -374,7 +374,7 @@ pub(super) async fn list_artifacts(
 #[tauri::command]
 pub(super) async fn search_artifacts(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     query: Option<String>,
     limit: Option<i64>,
     project_id: Option<String>,
@@ -453,10 +453,10 @@ pub(super) async fn search_artifacts(
 #[tauri::command]
 pub(super) fn missing_files(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     paths: Vec<String>,
 ) -> Result<Vec<String>, String> {
-    let ap = state.active(window.label());
+    let ap = state.require_active(window.label())?;
     Ok(paths
         .into_iter()
         .filter(|p| {
@@ -470,7 +470,7 @@ pub(super) fn missing_files(
 #[tauri::command]
 pub(super) async fn read_artifact(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     id: String,
 ) -> Result<FileContent, String> {
     let (working_project, scope) =
@@ -509,7 +509,7 @@ pub(super) async fn read_artifact(
 #[tauri::command]
 pub(super) async fn read_artifact_bytes(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     id: String,
     max_bytes: Option<u64>,
 ) -> Result<Response, String> {
@@ -554,7 +554,7 @@ pub(super) async fn read_artifact_bytes(
 pub(super) async fn download_artifact(
     app: AppHandle,
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     id: String,
 ) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
@@ -621,7 +621,7 @@ pub(super) async fn download_artifact(
 #[tauri::command]
 pub(super) async fn read_artifact_version(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     version_id: String,
 ) -> Result<FileContent, String> {
     let version = state
@@ -662,7 +662,7 @@ pub(super) async fn read_artifact_version(
 #[tauri::command]
 pub(super) async fn read_artifact_version_bytes(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     version_id: String,
     max_bytes: Option<u64>,
 ) -> Result<Response, String> {
@@ -702,4 +702,72 @@ pub(super) async fn read_artifact_version_bytes(
     .await
     .map_err(|e| format!("{e}"))??;
     Ok(Response::new(bytes))
+}
+
+/// Save the immutable artifact version behind an `artifact-version:` preview
+/// path. This is the download counterpart of `read_artifact_version`: it must
+/// never follow the artifact's mutable latest-version pointer, so previews
+/// pinned by branch/exploration views download the exact bytes they display.
+#[tauri::command]
+pub(super) async fn download_artifact_version(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+    version_id: String,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let version = state
+        .store
+        .get_artifact_version(&version_id)
+        .await
+        .map_err(|e| format!("{e}"))?
+        .ok_or_else(|| format!("artifact version '{version_id}' not found"))?;
+    let (working_project, scope) =
+        crate::exploration_commands::working_project_for_active_frame(&state, window.label())
+            .await?;
+    if !state
+        .store
+        .artifact_visible_in_scope(&version.artifact_id, &scope)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Err(format!(
+            "artifact version '{version_id}' not found in the active state"
+        ));
+    }
+    let artifact = state
+        .store
+        .get_artifact_detail(&version.artifact_id)
+        .await
+        .map_err(|e| format!("{e}"))?
+        .ok_or_else(|| format!("artifact '{}' not found", version.artifact_id))?;
+    let root = if matches!(&scope, wisp_store::StateScope::Exploration { .. }) {
+        working_project.root
+    } else {
+        PathBuf::from(artifact.project_root)
+    };
+    let source = wisp_tools::safety::validate_file_path(&root, &version.storage_path)?;
+    if !source.is_file() {
+        return Err(format!(
+            "artifact '{}' is no longer readable",
+            artifact.name
+        ));
+    }
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_file_name(&artifact.name)
+        .save_file(move |path| {
+            let _ = tx.send(path);
+        });
+    let Some(destination) = rx.await.map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+    let destination = PathBuf::from(destination.to_string());
+    tokio::fs::copy(source, &destination)
+        .await
+        .map_err(|error| format!("copy failed: {error}"))?;
+    Ok(Some(destination.display().to_string()))
 }

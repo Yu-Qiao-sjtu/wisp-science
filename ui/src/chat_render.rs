@@ -5,19 +5,181 @@ use crate::dto::*;
 use crate::i18n::{self, t, tf, use_locale, Locale};
 use crate::research;
 use crate::text::{event_target_value, format_duration_ms, md_to_html, tool_card_label};
+use crate::window_capture_escape;
 use leptos::*;
 use serde_wasm_bindgen::to_value;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+#[derive(Clone, Copy)]
+pub(crate) struct CompactionRowActions {
+    pub undo: Callback<u64>,
+    pub rewind_before: Callback<usize>,
+}
+
+/// The submission result is the durable link between a transcript row and a Run.
+/// Never infer ownership from a command, title, or nearby timestamp.
+pub(crate) fn submitted_run_id(name: &str, output: &str) -> Option<String> {
+    if !matches!(
+        name,
+        "run_in_context" | "wisp_run_in_context" | "transfer_between_contexts"
+    ) {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(output).ok()?;
+    value
+        .get("run_id")
+        .or_else(|| value.get("id"))?
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_owned)
+}
+
+pub(crate) fn completed_run_owners(
+    items: &[ChatItem],
+    runs: &[RunSummary],
+    frame_id: &str,
+) -> HashMap<String, usize> {
+    let mut owners = HashMap::new();
+    for (index, item) in items.iter().enumerate() {
+        let ChatItem::Tool { name, output, .. } = item else {
+            continue;
+        };
+        let Some(id) = submitted_run_id(name, output) else {
+            continue;
+        };
+        let fallback = serde_json::from_str::<RunRecord>(output).ok();
+        let run = runs
+            .iter()
+            .find(|run| run.id == id)
+            .cloned()
+            .or_else(|| fallback.as_ref().map(RunSummary::from));
+        if run.is_some_and(|run| {
+            run.frame_id.as_deref() == Some(frame_id)
+                && matches!(
+                    run.status.as_str(),
+                    "succeeded" | "failed" | "cancelled" | "timed_out" | "lost"
+                )
+        }) {
+            owners.entry(id).or_insert(index);
+        }
+    }
+    owners
+}
+
+#[cfg(test)]
+mod submitted_run_id_tests {
+    use super::{completed_run_owners, submitted_run_id};
+    use crate::dto::{ChatItem, RunSummary};
+
+    fn tool(name: &str, output: &str) -> ChatItem {
+        ChatItem::Tool {
+            name: name.into(),
+            ok: Some(true),
+            input: "ssh:CPU3:/data/file.png".into(),
+            output: output.into(),
+            started_at_ms: None,
+            duration_ms: Some(46),
+        }
+    }
+
+    fn run(id: &str, frame_id: &str, status: &str) -> RunSummary {
+        RunSummary {
+            id: id.into(),
+            frame_id: Some(frame_id.into()),
+            context_id: "ssh:CPU3".into(),
+            title: "Download file.png from CPU3".into(),
+            kind: "file_transfer".into(),
+            status: status.into(),
+            created_at: 1,
+            started_at: Some(1),
+            ended_at: Some(2),
+            exit_code: Some(0),
+            remote_workdir: None,
+            timeout_secs: None,
+            last_polled_at: None,
+            last_poll_error: None,
+            progress_json: "{}".into(),
+            harvested_at: None,
+            cleaned_at: None,
+            cleanup_error: None,
+            output_fingerprint: String::new(),
+        }
+    }
+
+    #[test]
+    fn extracts_ids_from_compute_and_transfer_submissions() {
+        let output = r#"{"run_id":"xfer-1","status":"submitted"}"#;
+        assert_eq!(
+            submitted_run_id("run_in_context", r#"{"run_id":"run-1"}"#).as_deref(),
+            Some("run-1")
+        );
+        assert_eq!(
+            submitted_run_id("wisp_run_in_context", r#"{"id":"run-2"}"#).as_deref(),
+            Some("run-2")
+        );
+        assert_eq!(
+            submitted_run_id("transfer_between_contexts", output).as_deref(),
+            Some("xfer-1")
+        );
+        assert_eq!(submitted_run_id("monitor_run", output), None);
+        assert_eq!(submitted_run_id("harvest_run", output), None);
+        assert_eq!(submitted_run_id("shell", output), None);
+    }
+
+    #[test]
+    fn completed_transfers_are_owned_by_their_submission_row() {
+        let items = vec![
+            ChatItem::User("download results".into()),
+            tool(
+                "transfer_between_contexts",
+                r#"{"run_id":"xfer-1","status":"submitted"}"#,
+            ),
+            tool("shell", r#"{"run_id":"xfer-1"}"#),
+        ];
+        let owners = completed_run_owners(
+            &items,
+            &[run("xfer-1", "live-session", "succeeded")],
+            "live-session",
+        );
+        assert_eq!(owners.get("xfer-1"), Some(&1));
+    }
+
+    #[test]
+    fn running_transfers_stay_unowned_until_they_settle() {
+        let items = vec![tool(
+            "transfer_between_contexts",
+            r#"{"run_id":"xfer-1","status":"submitted"}"#,
+        )];
+        let owners = completed_run_owners(
+            &items,
+            &[run("xfer-1", "live-session", "running")],
+            "live-session",
+        );
+        assert!(owners.is_empty());
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CompletedRunCards {
+    pub owners: Memo<HashMap<String, usize>>,
+    pub runs: RwSignal<Vec<RunSummary>>,
+    pub clock: ReadSignal<i64>,
+    pub dismissed: RwSignal<HashSet<String>>,
+}
+
 /// True for items whose `render_item` produces an empty view, so the thread
 /// loop can drop their wrapper `<div>` and avoid a dangling `.thread` gap (#19).
 pub(crate) fn renders_nothing(item: &ChatItem) -> bool {
+    if item.is_context_tombstone() {
+        return false;
+    }
     matches!(item, ChatItem::Assistant { text, .. } if text.trim().is_empty())
         || matches!(item, ChatItem::Tool { name, .. } if name == "attempt_completion")
         || matches!(item, ChatItem::FileChanged(_))
         || matches!(item, ChatItem::QueuedUser { .. })
+        || matches!(item, ChatItem::AppContextNotice(_))
 }
 
 pub(crate) fn class_for(item: &ChatItem) -> &'static str {
@@ -25,6 +187,7 @@ pub(crate) fn class_for(item: &ChatItem) -> &'static str {
         ChatItem::User(_) => "msg user",
         ChatItem::QueuedUser { .. } => "msg user queued",
         ChatItem::Assistant { text, .. } if text.starts_with("Error: ") => "tool-wrap",
+        item if item.is_context_tombstone() => "msg context-tombstone-row",
         ChatItem::Assistant { .. } => "msg assistant",
         ChatItem::BranchMerge { .. } => "branch-merge-card-row",
         ChatItem::Reasoning(_) => "msg reasoning",
@@ -46,7 +209,42 @@ pub(crate) fn class_for(item: &ChatItem) -> &'static str {
         ChatItem::Review(_) => "tool-wrap",
         ChatItem::Plan(_) => "tool-wrap plan-wrap",
         ChatItem::Question(_) => "tool-wrap plan-question-wrap",
+        ChatItem::AppContextNotice(_) => "app-context-notice-row",
+        ChatItem::System(_) => "msg system context-system-row",
+        ChatItem::Checkpoint(_) => "msg checkpoint context-checkpoint-row",
     }
+}
+
+fn render_context_tombstone(item: &ChatItem, locale: ReadSignal<Locale>) -> View {
+    let (name, body) = match item {
+        ChatItem::Tool { name, output, .. } => (name.clone(), output.clone()),
+        ChatItem::Assistant { text, .. } => (String::new(), text.clone()),
+        _ => return view! {}.into_view(),
+    };
+    let archive = context_tombstone_archive_ref(&body)
+        .unwrap_or("")
+        .to_string();
+    let named = !name.is_empty() && name != "attempt_completion";
+    view! {
+        <details class="context-tombstone-row" data-testid="context-tombstone-row">
+            <summary>
+                {compose_icon("archive")}
+                <span class="context-tombstone-name">{move || {
+                    let loc = locale.get();
+                    if named {
+                        tf(loc, "chat.context_tombstone_named", &[("name", &name)])
+                    } else {
+                        t(loc, "chat.context_tombstone").to_string()
+                    }
+                }}</span>
+                {(!archive.is_empty()).then(|| view! {
+                    <code class="context-tombstone-ref">{archive.clone()}</code>
+                })}
+            </summary>
+            <pre class="context-tombstone-body">{body}</pre>
+        </details>
+    }
+    .into_view()
 }
 
 /// "482" below 1k, "12.3k" above — same scale the status bar uses.
@@ -239,12 +437,38 @@ mod token_format_tests {
 
     #[test]
     fn queued_turns_do_not_occupy_a_transcript_row() {
-        use crate::dto::ChatItem;
+        use crate::dto::{AppContextNotice, ChatItem};
         assert!(renders_nothing(&ChatItem::QueuedUser {
             id: 1,
             text: "later".into(),
         }));
         assert!(!renders_nothing(&ChatItem::User("sent".into())));
+        assert!(renders_nothing(&ChatItem::AppContextNotice(
+            AppContextNotice {
+                context_id: "app".into(),
+                app_name: "plot".into(),
+                state: "ready".into(),
+                summary: String::new(),
+                structured_preview: None,
+            }
+        )));
+        let tombstone = "[compacted; full content archived at wisp-history:abc — retrieve only narrow ranges with read/grep; do not load the whole archive back into context]";
+        assert!(renders_nothing(&ChatItem::Tool {
+            name: "attempt_completion".into(),
+            ok: Some(true),
+            input: String::new(),
+            output: "final report".into(),
+            started_at_ms: None,
+            duration_ms: None,
+        }));
+        assert!(!renders_nothing(&ChatItem::Tool {
+            name: "attempt_completion".into(),
+            ok: Some(true),
+            input: String::new(),
+            output: tombstone.into(),
+            started_at_ms: None,
+            duration_ms: None,
+        }));
     }
 
     #[test]
@@ -379,7 +603,7 @@ fn streaming_reasoning_text(text: &str, max_bytes: usize) -> String {
 /// bounded so repeated signal flushes cannot copy an ever-growing string.
 #[component]
 pub(crate) fn StreamingReasoningMessage(
-    items: RwSignal<Vec<ChatItem>>,
+    items: Signal<Vec<ChatItem>>,
     source_item: usize,
     session_id: String,
     disclosure_state: RwSignal<HashMap<String, bool>>,
@@ -446,6 +670,47 @@ pub(crate) fn toggle_disclosure(
     });
 }
 
+pub(crate) fn nested_links_toggle(
+    locale: Locale,
+    label_key: &'static str,
+    expand_key: &'static str,
+    collapse_key: &'static str,
+    count: usize,
+    open_id: String,
+    states: RwSignal<HashMap<String, bool>>,
+    test_id: &'static str,
+) -> impl IntoView {
+    let id_expanded = open_id.clone();
+    let id_class = open_id.clone();
+    let id_click = open_id.clone();
+    let id_title = open_id.clone();
+    let id_label = open_id;
+    let count_label = count.to_string();
+    view! {
+        <button type="button" class="message-nest-toggle"
+            data-testid=test_id
+            aria-expanded=move || disclosure_open(states, &id_expanded, true).to_string()
+            title=move || t(
+                locale,
+                if disclosure_open(states, &id_title, true) { collapse_key } else { expand_key },
+            )
+            aria-label=move || {
+                let action = t(
+                    locale,
+                    if disclosure_open(states, &id_label, true) { collapse_key } else { expand_key },
+                );
+                format!("{action} ({count})")
+            }
+            on:click=move |_| toggle_disclosure(states, &id_click, true)>
+            <span class="message-nest-caret" class:collapsed=move || !disclosure_open(states, &id_class, true) aria-hidden="true">
+                {compose_icon("chevron-down")}
+            </span>
+            <span class="message-nest-label">{t(locale, label_key)}</span>
+            <span class="message-nest-count">{count_label}</span>
+        </button>
+    }
+}
+
 /// Collapsed-header label for a step group. `elapsed` is the pre-formatted run
 /// duration, and is only ever `Some` for a settled step-count header — the
 /// running and activity-done headers show it in the meta slot instead.
@@ -459,7 +724,7 @@ pub(crate) fn steps_title(
 ) -> String {
     match (completed_turn, live, model_wait_message, n_tools, elapsed) {
         (true, _, _, _, _) => t(locale, "chat.activity_done").to_string(),
-        (_, true, Some(message), _, _) => message.to_string(),
+        (_, true, Some(_), _, _) => t(locale, "chat.model_waiting").to_string(),
         (_, true, None, _, _) => t(locale, "chat.steps_running").to_string(),
         (_, _, _, 1, None) => t(locale, "chat.steps_1").to_string(),
         (_, _, _, 1, Some(d)) => tf(locale, "chat.steps_1_time", &[("t", d)]),
@@ -515,7 +780,7 @@ mod steps_title_tests {
                 1,
                 None
             ),
-            "The model is consulting its neurons…"
+            "Waiting for the model…"
         );
         assert_eq!(
             steps_title(
@@ -526,14 +791,14 @@ mod steps_title_tests {
                 1,
                 None
             ),
-            "模型正在和神经元商量…"
+            "等待模型继续…"
         );
     }
 }
 
 pub(crate) fn render_steps_group(
     indices: Vec<usize>,
-    source: RwSignal<Vec<ChatItem>>,
+    source: Signal<Vec<ChatItem>>,
     live: bool,
     completed_turn: bool,
     turn_duration_ms: Option<u64>,
@@ -601,8 +866,8 @@ pub(crate) fn render_steps_group(
         .bytes()
         .fold(0usize, |sum, byte| sum + byte as usize)
         % 4;
-    let title = move || {
-        let model_wait_message = waiting_for_model.then(|| {
+    let model_wait_message = move || {
+        waiting_for_model.then(|| {
             t(
                 locale.get(),
                 match model_wait_variant {
@@ -612,12 +877,14 @@ pub(crate) fn render_steps_group(
                     _ => "chat.model_wait_4",
                 },
             )
-        });
+        })
+    };
+    let title = move || {
         steps_title(
             locale.get(),
             completed_turn,
             live,
-            model_wait_message.as_deref(),
+            model_wait_message().as_deref(),
             n_tools,
             inline_time.as_deref(),
         )
@@ -626,19 +893,43 @@ pub(crate) fn render_steps_group(
     let toggle_group_id = group_id.clone();
     let rows_group_id = group_id;
     let group_open = create_memo(move |_| disclosure_open(disclosure_state, &class_group_id, live));
+    // A settled group can contain failed or interrupted tools. Keep those
+    // neutral instead of turning their activity indicator into a success tick.
+    let settled_ok = source.with_untracked(|items| {
+        indices
+            .iter()
+            .filter_map(|index| items.get(*index))
+            .all(|item| match item {
+                ChatItem::Tool { ok, .. } => *ok == Some(true),
+                ChatItem::AcpTool { status, .. } => status == "completed",
+                _ => true,
+            })
+    });
     view! {
         <div class="steps"
             class=("activity-summary", completed_turn)
+            class=("is-live", live)
             class:open=move || group_open.get()>
             <button type="button" class="steps-head"
                 aria-expanded=move || group_open.get().to_string()
                 on:click=move |_| {
                 toggle_disclosure(disclosure_state, &toggle_group_id, live)
             }>
-                <span class="steps-chevron"></span>
-                <span class="steps-title">{title}</span>
-                {now_line.map(|text| view! { <span class="steps-now">{text}</span> })}
+                <span class="steps-indicator" class:running=live
+                    data-testid="steps-indicator"
+                    data-state=if live { "running" } else if settled_ok { "complete" } else { "stopped" }
+                    aria-hidden="true">
+                    {compose_icon(if live { "activity-orbit" } else if settled_ok { "circle-check" } else { "circle-minus" })}
+                </span>
+                <span class="steps-copy">
+                    <span class="steps-title">{title}</span>
+                    {waiting_for_model.then(|| view! {
+                        <span class="steps-note" data-testid="steps-wait-note">{model_wait_message}</span>
+                    })}
+                </span>
+                {now_line.filter(|_| !waiting_for_model).map(|text| view! { <span class="steps-now">{text}</span> })}
                 {meta_label.map(|label| view! { <span class="steps-meta">{label}</span> })}
+                <span class="steps-chevron" aria-hidden="true">{compose_icon("chevron-right")}</span>
             </button>
             {move || group_open.get().then(|| view! {
                 <div class="steps-body">{
@@ -659,7 +950,7 @@ pub(crate) fn render_steps_group(
 
 fn render_step_rows(
     indices: &[usize],
-    source: RwSignal<Vec<ChatItem>>,
+    source: Signal<Vec<ChatItem>>,
     live: bool,
     group_id: &str,
     disclosure_state: RwSignal<HashMap<String, bool>>,
@@ -687,7 +978,7 @@ fn render_step_rows(
 
 #[allow(clippy::too_many_arguments)]
 fn render_step_row(
-    source: RwSignal<Vec<ChatItem>>,
+    source: Signal<Vec<ChatItem>>,
     index: usize,
     position: usize,
     live: bool,
@@ -775,6 +1066,9 @@ fn render_step_row(
             duration_ms,
         }) => {
             let step_id = format!("{group_id}:tool:{position}");
+            if name == "update_plan" {
+                return render_execution_plan(input, output, *ok, *duration_ms, step_id, disclosure_state);
+            }
             let automatic = ok.is_none() && live;
             let toggle_id = step_id.clone();
             let (badge_key, title) = tool_card_label(name, input);
@@ -799,6 +1093,17 @@ fn render_step_row(
             let has_input = !input.is_empty();
             let has_output = !output.is_empty();
             let has_body = has_input || has_output;
+            let completed_card = submitted_run_id(name, output)
+                .zip(use_context::<CompletedRunCards>())
+                .map(|(id, context)| {
+                    let owner_id = id.clone();
+                    let owned = create_memo(move |_| {
+                        context
+                            .owners
+                            .with(|owners| owners.get(&owner_id) == Some(&index))
+                    });
+                    (id, context, owned)
+                });
             let icon = match ok {
                 Some(true) => view! { <span class="step-icon ok">"✓"</span> }.into_view(),
                 Some(false) => view! { <span class="step-icon fail">"✗"</span> }.into_view(),
@@ -840,6 +1145,18 @@ fn render_step_row(
                         });
                         view! {
                             <div class="step-body">
+                                {completed_card.clone().map(|(id, context, owned)| {
+                                    let output = output.clone();
+                                    view! {
+                                        {move || owned.get().then(|| view! {
+                                            <div class="completed-run-monitor" data-testid="completed-run-monitor">
+                                                <RunMonitorCard run_id=id.clone() runs=context.runs
+                                                    clock=context.clock tool_ok=None tool_output=output.clone()
+                                                    dismissed_runs=context.dismissed embedded=true />
+                                            </div>
+                                        })}
+                                    }
+                                })}
                                 {has_input.then(|| view! { <pre class="tool-input">{input}</pre> })}
                                 {has_output.then(|| view! { <pre class="tool-output">{output}</pre> })}
                             </div>
@@ -912,8 +1229,238 @@ fn render_step_row(
             }
             .into_view()
         }
+        Some(item @ (ChatItem::Usage { .. } | ChatItem::Compaction { .. })) => {
+            view! { <div class=class_for(item)>{render_process_metadata(item, locale)}</div> }.into_view()
+        }
         _ => view! {}.into_view(),
     })
+}
+
+// Shared by standalone metadata rows and metadata between folded phases.
+fn render_process_metadata(item: &ChatItem, locale: ReadSignal<Locale>) -> View {
+    match item {
+        ChatItem::Usage {
+            input,
+            output,
+            reasoning,
+            cached,
+            ..
+        } => {
+            let (input, output, reasoning, cached) = (*input, *output, *reasoning, *cached);
+            view! {
+                <div class="usage-line" title=move || t(locale.get(), "msg.usage_title")>
+                    {move || {
+                        let loc = locale.get();
+                        let mut s = tf(loc, "msg.usage", &[
+                            ("in", &fmt_tokens(input)),
+                            ("out", &fmt_tokens(output)),
+                        ]);
+                        if cached > 0 {
+                            s.push_str(&tf(loc, "msg.usage.cached", &[("c", &fmt_tokens(cached))]));
+                        }
+                        if reasoning > 0 {
+                            s.push_str(&tf(loc, "msg.usage.reasoning", &[("r", &fmt_tokens(reasoning))]));
+                        }
+                        s
+                    }}
+                </div>
+            }.into_view()
+        }
+        ChatItem::Compaction {
+            before,
+            after,
+            strategy,
+            epoch,
+            checkpoint,
+            kept_from_user_index,
+            undone,
+            can_undo,
+            undo_reason,
+        } => render_compaction_row(
+            *before,
+            *after,
+            strategy,
+            *epoch,
+            checkpoint.clone(),
+            *kept_from_user_index,
+            *undone,
+            *can_undo,
+            undo_reason.clone(),
+            locale,
+        ),
+        _ => view! {}.into_view(),
+    }
+}
+
+fn render_compaction_row(
+    before: usize,
+    after: usize,
+    strategy: &str,
+    epoch: Option<u64>,
+    checkpoint: Option<String>,
+    kept_from_user_index: Option<usize>,
+    undone: bool,
+    can_undo: bool,
+    undo_reason: Option<String>,
+    locale: ReadSignal<Locale>,
+) -> View {
+    if strategy == "auto_continue" {
+        let count = before.to_string();
+        let limit = after.to_string();
+        return view! {
+            <div class="context-compaction-flag auto" data-testid="auto-continue-flag">
+                {compose_icon("sync")}
+                <span>{move || tf(
+                    locale.get(),
+                    "chat.auto_continued",
+                    &[("count", count.as_str()), ("limit", limit.as_str())],
+                )}</span>
+            </div>
+        }
+        .into_view();
+    }
+    let automatic = strategy == "auto";
+    let strategy_key = if automatic {
+        "chat.compaction_strategy_auto"
+    } else {
+        "chat.compaction_strategy_manual"
+    };
+    let counts = format!(
+        "{} → {} tokens",
+        fmt_tokens(before as u64),
+        fmt_tokens(after as u64)
+    );
+    let reduction = (before > after).then(|| {
+        let percent = ((before - after) as f64 / before as f64 * 100.0).round();
+        format!("{percent:.0}")
+    });
+    let checkpoint_html = checkpoint
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+        .map(md_to_html);
+    let expanded = create_rw_signal(false);
+    window_capture_escape(move || {
+        if !expanded.get() {
+            return false;
+        }
+        expanded.set(false);
+        true
+    });
+    let undo_reason_key = undo_reason.as_deref().map(compaction_undo_reason_key);
+    let actions = use_context::<CompactionRowActions>();
+    let undo_compaction = actions.map(|actions| actions.undo);
+    let rewind_before = actions.map(|actions| actions.rewind_before);
+    view! {
+        <div
+            class="context-compaction-status context-compaction-complete"
+            class:undone=undone
+            data-testid="context-compaction-flag"
+            data-undone=undone.to_string()
+        >
+            <button
+                type="button"
+                class="context-compaction-toggle"
+                data-testid="context-compaction-expand"
+                aria-expanded=move || expanded.get().to_string()
+                title=move || t(
+                    locale.get(),
+                    if expanded.get() { "chat.compaction_collapse" } else { "chat.compaction_expand" },
+                )
+                on:click=move |_| expanded.update(|open| *open = !*open)
+            >
+                <span class="context-compaction-mark" aria-hidden="true">{compose_icon("check")}</span>
+                <span class="context-compaction-copy">
+                    <strong>{move || t(
+                        locale.get(),
+                        if undone {
+                            "chat.compaction_undone"
+                        } else if automatic {
+                            "chat.context_auto_compacted"
+                        } else {
+                            "chat.context_compacted"
+                        },
+                    )}</strong>
+                    <span class="context-compaction-detail">
+                        <span class="context-compaction-count">{counts}</span>
+                        {reduction.map(|percent| view! {
+                            <span class="context-compaction-reduction">{move || tf(locale.get(), "chat.compaction_reduction", &[("percent", &percent)])}</span>
+                        })}
+                    </span>
+                </span>
+                <span class="context-compaction-chevron" aria-hidden="true">
+                    {move || compose_icon(if expanded.get() { "chevron-up" } else { "chevron-down" })}
+                </span>
+                <span class="context-compaction-rule" aria-hidden="true"></span>
+            </button>
+            {move || expanded.get().then(|| {
+                let checkpoint_html = checkpoint_html.clone();
+                let undo_reason_key = undo_reason_key;
+                view! {
+                    <div class="context-compaction-details" data-testid="context-compaction-details">
+                        {checkpoint_html.map(|html| view! {
+                            <div class="context-compaction-checkpoint">
+                                <span class="context-compaction-checkpoint-label">{move || t(locale.get(), "chat.compaction_checkpoint")}</span>
+                                <div class="md" inner_html=html></div>
+                            </div>
+                        })}
+                        <div class="context-compaction-meta">
+                            <span>{move || tf(
+                                locale.get(),
+                                "chat.compaction_strategy",
+                                &[("strategy", &t(locale.get(), strategy_key))],
+                            )}</span>
+                            {epoch.map(|epoch| view! {
+                                <span>{move || tf(locale.get(), "chat.compaction_epoch", &[("epoch", &epoch.to_string())])}</span>
+                            })}
+                            {kept_from_user_index.map(|index| {
+                                let turn = (index + 1).to_string();
+                                view! {
+                                    <span>{move || tf(locale.get(), "chat.compaction_kept_from", &[("turn", turn.as_str())])}</span>
+                                }
+                            })}
+                        </div>
+                        <div class="context-compaction-actions">
+                            <button
+                                type="button"
+                                class="tool-btn"
+                                data-testid="undo-compaction"
+                                disabled=!can_undo
+                                title=move || undo_reason_key.map(|key| t(locale.get(), key)).unwrap_or_default()
+                                on:click=move |ev| {
+                                    ev.stop_propagation();
+                                    if !can_undo {
+                                        return;
+                                    }
+                                    if let Some(undo) = undo_compaction {
+                                        undo.call(epoch.unwrap_or(0));
+                                    }
+                                }
+                            >
+                                {compose_icon("undo-compact")}
+                                <span>{move || t(locale.get(), "chat.compaction_undo")}</span>
+                            </button>
+                            {kept_from_user_index.and_then(|index| rewind_before.map(|rewind| view! {
+                                <button
+                                    type="button"
+                                    class="tool-btn"
+                                    data-testid="rewind-before-compact"
+                                    disabled=undone
+                                    on:click=move |ev| {
+                                        ev.stop_propagation();
+                                        rewind.call(index);
+                                    }
+                                >
+                                    {compose_icon("arrow-left")}
+                                    <span>{move || t(locale.get(), "chat.compaction_rewind")}</span>
+                                </button>
+                            }))}
+                        </div>
+                    </div>
+                }
+            })}
+        </div>
+    }
+    .into_view()
 }
 
 /// Latest step of a live run as "name · detail", shown in the collapsed
@@ -921,6 +1468,392 @@ fn render_step_row(
 #[cfg(test)]
 pub(crate) fn steps_now_line(items: &[ChatItem]) -> Option<String> {
     items.iter().rev().find_map(step_now_line)
+}
+
+/// Results carry the authoritative checklist. Before they arrive the existing
+/// tool preview contains only counts, so never invent step titles or treat a
+/// successful plan update as successful execution of its steps.
+fn execution_plan_data(
+    input: &str,
+    output: &str,
+    ok: Option<bool>,
+) -> (Vec<(&'static str, String)>, Option<(usize, usize)>) {
+    let steps = if ok == Some(true) {
+        parse_plan_steps(output)
+    } else {
+        vec![]
+    };
+    let counts = if !steps.is_empty() {
+        Some((
+            steps.iter().filter(|(status, _)| *status == "done").count(),
+            steps.len(),
+        ))
+    } else if ok.is_none() {
+        input.trim().strip_suffix(" steps done").and_then(|value| {
+            let (done, total) = value.split_once('/')?;
+            let (done, total) = (done.parse::<usize>().ok()?, total.parse::<usize>().ok()?);
+            (total > 0 && done <= total).then_some((done, total))
+        })
+    } else {
+        None
+    };
+    (steps, counts)
+}
+
+/// The composer follows the latest accepted snapshot in the current user turn.
+/// Pending/rejected updates must not replace accepted progress; queued messages
+/// must not hide it before their turn actually starts.
+fn composer_plan_steps(items: &[ChatItem]) -> Vec<(&'static str, String)> {
+    for item in items.iter().rev() {
+        match item {
+            ChatItem::User(_) => break,
+            ChatItem::Tool {
+                name,
+                ok: Some(true),
+                output,
+                ..
+            } if name == "update_plan" => {
+                return parse_plan_steps(output);
+            }
+            _ => {}
+        }
+    }
+    vec![]
+}
+
+fn plan_step_status_key(status: &str) -> &'static str {
+    match status {
+        "done" => "execution_plan.done",
+        "running" => "execution_plan.running",
+        "cancelled" => "execution_plan.cancelled",
+        _ => "execution_plan.pending",
+    }
+}
+
+fn plan_step_icon(status: &str) -> &'static str {
+    match status {
+        "done" => "circle-check",
+        "running" => "activity-orbit",
+        "cancelled" => "circle-minus",
+        _ => "circle",
+    }
+}
+
+fn composer_plan_dismiss_key(session_id: Option<&str>, steps: &[(&str, String)]) -> String {
+    let mut key = session_id.unwrap_or_default().to_string();
+    key.push('\n');
+    for (status, text) in steps {
+        key.push_str(status);
+        key.push('\0');
+        key.push_str(text);
+        key.push('\n');
+    }
+    key
+}
+
+#[component]
+pub(crate) fn ComposerPlanProgress(
+    items: RwSignal<Vec<ChatItem>>,
+    busy: RwSignal<bool>,
+    session_id: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let locale = use_locale();
+    let open = create_rw_signal(false);
+    let dismissed = create_rw_signal(None::<String>);
+    // Equality prevents unrelated token/tool events from restarting animations.
+    let steps = create_memo(move |_| items.with(|items| composer_plan_steps(items)));
+    let done = create_memo(move |_| {
+        steps.with(|steps| steps.iter().filter(|(status, _)| *status == "done").count())
+    });
+    let total = create_memo(move |_| steps.with(Vec::len));
+    let complete = create_memo(move |_| total.get() > 0 && done.get() == total.get());
+    let current = create_memo(move |_| {
+        steps.with(|steps| {
+            steps
+                .iter()
+                .find(|(status, _)| *status == "running")
+                .or_else(|| steps.iter().find(|(status, _)| *status == "pending"))
+                .cloned()
+        })
+    });
+    let animating = create_memo(move |_| {
+        busy.get() && current.get().is_some_and(|(status, _)| status == "running")
+    });
+    let plan_key = create_memo(move |_| {
+        steps.with(|steps| composer_plan_dismiss_key(session_id.get().as_deref(), steps))
+    });
+    let hidden = create_memo(move |_| dismissed.get().as_deref() == Some(plan_key.get().as_str()));
+    create_effect(move |_| {
+        if total.get() == 0 {
+            open.set(false);
+        }
+    });
+    view! {
+        <Show when=move || { total.get() > 0 && !hidden.get() }>
+            <section class="composer-plan-progress" data-testid="composer-plan-progress"
+                class:is-running=move || animating.get() class:is-complete=move || complete.get()
+                class:is-open=move || open.get()
+                aria-label=move || t(locale.get(), "execution_plan.title")>
+                <div class="composer-plan-head">
+                    <button type="button" class="composer-plan-toggle" data-testid="composer-plan-toggle"
+                        aria-expanded=move || open.get().to_string()
+                        on:click=move |_| open.update(|open| *open = !*open)>
+                        <span class="composer-plan-mark" aria-hidden="true">
+                            {move || compose_icon(if complete.get() { "circle-check" } else if animating.get() { "activity-orbit" } else { "plan" })}
+                        </span>
+                        <div class="composer-plan-copy" role="status" aria-live="polite" aria-atomic="true">
+                            <div class="composer-plan-summary">
+                                <span class="composer-plan-label">{move || t(locale.get(), if complete.get() {
+                                    "execution_plan.complete"
+                                } else if current.get().is_none() {
+                                    "execution_plan.ended"
+                                } else if !busy.get() {
+                                    "execution_plan.idle"
+                                } else { "execution_plan.title" })}</span>
+                                <span class="composer-plan-count">{move || tf(locale.get(), "execution_plan.count", &[("done", &done.get().to_string()), ("total", &total.get().to_string())])}</span>
+                            </div>
+                            <For each=move || {
+                                if open.get() { Vec::new() } else { current.get().into_iter().collect() }
+                            } key=|step| step.clone()
+                                children=move |(_, text)| view! {
+                                    <div class="composer-plan-current" title=text.clone()>{text}</div>
+                                } />
+                        </div>
+                        <span class="execution-plan-chevron" class:expanded=move || open.get() aria-hidden="true">{compose_icon("chevron-right")}</span>
+                    </button>
+                    {move || complete.get().then(|| {
+                        let tip = t(locale.get(), "execution_plan.dismiss");
+                        view! {
+                            <button type="button" class="composer-plan-dismiss" data-testid="composer-plan-dismiss"
+                                title=tip.clone() aria-label=tip
+                                on:click=move |ev| {
+                                    ev.stop_propagation();
+                                    dismissed.set(Some(plan_key.get_untracked()));
+                                    open.set(false);
+                                }>{compose_icon("close")}</button>
+                        }
+                    })}
+                </div>
+                {move || open.get().then(|| {
+                    let rows = steps.get();
+                    view! {
+                        <ol class="execution-plan-list composer-plan-steps" data-testid="composer-plan-steps">
+                            {rows.into_iter().map(|(status, text)| {
+                                let key = plan_step_status_key(status);
+                                view! {
+                                    <li data-status=status>
+                                        <span class="execution-plan-mark" aria-hidden="true">{compose_icon(plan_step_icon(status))}</span>
+                                        <span class="execution-plan-text">{text}</span>
+                                        <span class="execution-plan-status">{move || t(locale.get(), key)}</span>
+                                    </li>
+                                }
+                            }).collect_view()}
+                        </ol>
+                    }
+                })}
+                <div class="composer-plan-track" role="progressbar"
+                    aria-label=move || t(locale.get(), "execution_plan.progress")
+                    aria-valuemin="0" aria-valuemax=move || total.get().to_string()
+                    aria-valuenow=move || done.get().to_string()>
+                    <span style:width=move || format!("{}%", done.get() as f64 / total.get().max(1) as f64 * 100.0)></span>
+                </div>
+            </section>
+        </Show>
+    }
+}
+
+fn render_execution_plan(
+    input: &str,
+    output: &str,
+    ok: Option<bool>,
+    duration_ms: Option<u64>,
+    id: String,
+    disclosure_state: RwSignal<HashMap<String, bool>>,
+) -> View {
+    let locale = use_locale();
+    let (steps, counts) = execution_plan_data(input, output, ok);
+    let complete = !steps.is_empty() && steps.iter().all(|(status, _)| *status == "done");
+    let automatic = !complete;
+    let toggle_id = id.clone();
+    let details_id = format!("{id}:details");
+    let details_toggle_id = store_value(details_id.clone());
+    let open = create_memo(move |_| disclosure_open(disclosure_state, &id, automatic));
+    let details_open = create_memo(move |_| disclosure_open(disclosure_state, &details_id, false));
+    let steps = store_value(steps);
+    let input = store_value(input.to_string());
+    let output = store_value(output.to_string());
+    let title_key = if ok == Some(false) {
+        "execution_plan.failed"
+    } else if complete {
+        "execution_plan.complete"
+    } else {
+        "execution_plan.title"
+    };
+    let status_key = match ok {
+        None => "execution_plan.updating",
+        Some(true) => "execution_plan.updated",
+        Some(false) => "execution_plan.failed",
+    };
+    view! {
+        <article class="execution-plan" class:failed=ok == Some(false) data-testid="execution-plan">
+            <button type="button" class="execution-plan-head" aria-expanded=move || open.get().to_string()
+                on:click=move |_| toggle_disclosure(disclosure_state, &toggle_id, automatic)>
+                <span class="execution-plan-icon" aria-hidden="true">{compose_icon(if complete { "circle-check" } else { "plan" })}</span>
+                <span class="execution-plan-title">{move || t(locale.get(), title_key)}</span>
+                {counts.map(|(done, total)| view! {
+                    <span class="execution-plan-count">{move || tf(locale.get(), "execution_plan.count", &[("done", &done.to_string()), ("total", &total.to_string())])}</span>
+                })}
+                <span class="execution-plan-chevron" class:expanded=move || open.get() aria-hidden="true">{compose_icon("chevron-right")}</span>
+            </button>
+            {move || open.get().then(|| view! {
+                <div class="execution-plan-body">
+                    {(!steps.get_value().is_empty()).then(|| {
+                        let (done, total) = counts.unwrap();
+                        view! {
+                            <div class="execution-plan-progress" role="progressbar"
+                                aria-label=move || t(locale.get(), "execution_plan.progress")
+                                aria-valuenow=done.to_string() aria-valuemin="0" aria-valuemax=total.to_string()>
+                                {steps.get_value().into_iter().map(|(status, _)| view! { <span class=status></span> }).collect_view()}
+                            </div>
+                            <ol class="execution-plan-list">
+                                {steps.get_value().into_iter().map(|(status, text)| {
+                                    let key = plan_step_status_key(status);
+                                    view! {
+                                        <li data-status=status>
+                                            <span class="execution-plan-mark" aria-hidden="true">{compose_icon(plan_step_icon(status))}</span>
+                                            <span class="execution-plan-text">{text}</span>
+                                            <span class="execution-plan-status">{move || t(locale.get(), key)}</span>
+                                        </li>
+                                    }
+                                }).collect_view()}
+                            </ol>
+                        }
+                    })}
+                    {steps.get_value().is_empty().then(|| view! {
+                        <p class="execution-plan-notice" role=if ok == Some(false) { "alert" } else { "status" }>
+                            {move || if ok == Some(false) && !output.get_value().is_empty() { output.get_value() } else { t(locale.get(), if ok == Some(true) { "execution_plan.unavailable" } else { status_key }).to_string() }}
+                        </p>
+                    })}
+                    <div class="execution-plan-details">
+                        <button type="button" class="execution-plan-details-toggle"
+                            aria-expanded=move || details_open.get().to_string()
+                            on:click=move |_| toggle_disclosure(disclosure_state, &details_toggle_id.get_value(), false)>
+                            {move || t(locale.get(), "execution_plan.details")}
+                            <span class="execution-plan-chevron" class:expanded=move || details_open.get() aria-hidden="true">{compose_icon("chevron-right")}</span>
+                        </button>
+                        {move || details_open.get().then(|| view! {
+                            <div class="execution-plan-raw">
+                                <div class="execution-plan-meta"><code>"update_plan"</code><span>{move || t(locale.get(), status_key)}</span>
+                                    {duration_ms.map(|ms| view! { <span>{if ms == 0 { "< 1 ms".to_string() } else { format_duration_ms(ms) }}</span> })}
+                                </div>
+                                {(!input.get_value().is_empty()).then(|| view! { <pre>{input.get_value()}</pre> })}
+                                {(!output.get_value().is_empty()).then(|| view! { <pre>{output.get_value()}</pre> })}
+                            </div>
+                        })}
+                    </div>
+                </div>
+            })}
+        </article>
+    }.into_view()
+}
+
+#[cfg(test)]
+mod execution_plan_tests {
+    use super::{composer_plan_dismiss_key, composer_plan_steps, execution_plan_data};
+    use crate::dto::ChatItem;
+
+    #[test]
+    fn composer_plan_uses_accepted_current_turn_and_ignores_queued_followups() {
+        let plan = |ok, output: &str| ChatItem::Tool {
+            name: "update_plan".into(),
+            ok,
+            input: String::new(),
+            output: output.into(),
+            started_at_ms: None,
+            duration_ms: None,
+        };
+        let mut items = vec![
+            ChatItem::User("Analyze".into()),
+            plan(Some(true), "[x] Inspect\n[~] Analyze"),
+            ChatItem::QueuedUser {
+                id: 1,
+                text: "Next task".into(),
+            },
+            plan(None, ""),
+            plan(Some(false), "[x] Incorrect completion"),
+        ];
+        assert_eq!(
+            composer_plan_steps(&items),
+            vec![("done", "Inspect".into()), ("running", "Analyze".into())]
+        );
+        items.push(plan(Some(true), "Steps unavailable"));
+        assert!(composer_plan_steps(&items).is_empty());
+        items.push(plan(Some(true), "[x] Finished"));
+        assert_eq!(
+            composer_plan_steps(&items),
+            vec![("done", "Finished".into())]
+        );
+        items.push(ChatItem::User("Next task".into()));
+        assert!(composer_plan_steps(&items).is_empty());
+    }
+
+    #[test]
+    fn composer_plan_dismiss_key_is_scoped_to_session_and_steps() {
+        let steps = vec![("done", "Inspect".into()), ("done", "Write".into())];
+        let key = composer_plan_dismiss_key(Some("s-a"), &steps);
+        assert_eq!(key, composer_plan_dismiss_key(Some("s-a"), &steps));
+        assert_ne!(key, composer_plan_dismiss_key(Some("s-b"), &steps));
+        assert_ne!(
+            key,
+            composer_plan_dismiss_key(Some("s-a"), &[("done", "Inspect".into())])
+        );
+    }
+
+    #[test]
+    fn result_steps_replace_preview_counts_and_keep_cancelled_separate() {
+        let (steps, counts) = execution_plan_data(
+            "0/4 steps done",
+            "Plan (4 steps):\n[x] Inspect data\n[~] Run analysis\n  keep this continuation\n[ ] Write report\n[-] Extra analysis",
+            Some(true),
+        );
+        assert_eq!(counts, Some((1, 4)));
+        assert_eq!(
+            steps[1],
+            ("running", "Run analysis\n  keep this continuation".into())
+        );
+        assert_eq!(steps[3].0, "cancelled");
+    }
+
+    #[test]
+    fn pending_and_failed_updates_never_invent_completed_work() {
+        assert_eq!(
+            execution_plan_data("0/4 steps done", "", None),
+            (vec![], Some((0, 4)))
+        );
+        for preview in ["", "4/0 steps done", "5/4 steps done", "x/4 steps done"] {
+            assert_eq!(execution_plan_data(preview, "", None), (vec![], None));
+        }
+        assert_eq!(
+            execution_plan_data("4/4 steps done", "[x] Refused step", Some(false)),
+            (vec![], None)
+        );
+        assert_eq!(
+            execution_plan_data("4/4 steps done", "4/4 steps done", Some(true)),
+            (vec![], None)
+        );
+    }
+
+    #[test]
+    fn structured_steps_preserve_nested_checklists() {
+        let output = serde_json::json!({"v": 1, "steps": [
+            {"status": "completed", "content": "Check example\n```text\n[ ] nested item\n```"},
+            {"status": "pending", "content": "Write report"}
+        ]})
+        .to_string();
+        let (steps, counts) = execution_plan_data("", &output, Some(true));
+        assert_eq!(counts, Some((1, 2)));
+        assert!(steps[0].1.contains("[ ] nested item"));
+    }
 }
 
 fn step_now_line(item: &ChatItem) -> Option<String> {
@@ -934,6 +1867,9 @@ fn step_now_line(item: &ChatItem) -> Option<String> {
             .collect()
     };
     match item {
+        // The dedicated card already explains the plan; don't repeat the raw
+        // tool name and preview in its activity-group header.
+        ChatItem::Tool { name, .. } if name == "update_plan" => None,
         ChatItem::Tool { name, input, .. } => {
             let (_, title) = tool_card_label(name, input);
             let detail = first_line(input);
@@ -988,6 +1924,10 @@ mod steps_now_line_tests {
             Some("python · from pypdf import PdfReader".into())
         );
         assert_eq!(steps_now_line(&[ChatItem::Reasoning("hmm".into())]), None);
+        assert_eq!(
+            steps_now_line(&[tool("update_plan", "0/4 steps done")]),
+            None
+        );
         assert_eq!(steps_now_line(&[]), None);
     }
 }
@@ -1160,8 +2100,10 @@ pub(crate) fn RunMonitorCard(
     /// which must never interrupt with a review modal (#897).
     #[prop(optional)]
     auto_review: bool,
+    #[prop(optional)] embedded: bool,
 ) -> impl IntoView {
     let locale = use_locale();
+    let completed_cards = use_context::<CompletedRunCards>();
     let fallback = serde_json::from_str::<RunRecord>(&tool_output).ok();
     let detail = create_rw_signal(fallback.clone());
     let lookup_id = run_id.clone();
@@ -1256,7 +2198,12 @@ pub(crate) fn RunMonitorCard(
     }
     view! {
         {move || {
-            if dismissed_runs.with(|ids| ids.contains(&run_id)) {
+            if !embedded
+                && (dismissed_runs.with(|ids| ids.contains(&run_id))
+                    || completed_cards.is_some_and(|context| {
+                        context.owners.with(|owners| owners.contains_key(&run_id))
+                    }))
+            {
                 return view! {}.into_view();
             }
             let run = selected_run.get();
@@ -1393,7 +2340,7 @@ pub(crate) fn RunMonitorCard(
                                     >{compose_icon("folder")}</button>
                                 }
                             }))}
-                        {dismissible.then(|| {
+                        {(dismissible && !embedded).then(|| {
                             let tip = t(locale.get(), "runs.dismiss");
                             let dismiss_id = run.id.clone();
                             view! {
@@ -1461,7 +2408,7 @@ pub(crate) fn render_item(
     ui_index: usize,
     item: &ChatItem,
     timestamp: Option<i64>,
-    artifacts: &[Artifact],
+    artifacts: Memo<Vec<Artifact>>,
     on_artifact: Callback<usize>,
     on_file: Callback<ModalArtifact>,
     runs: RwSignal<Vec<RunSummary>>,
@@ -1488,7 +2435,7 @@ pub(crate) fn render_item(
     plan_mode_active: Signal<bool>,
     plan_compat: Signal<bool>,
     on_plan_decision: Callback<PlanDecision>,
-    on_question_answer: Callback<(usize, Option<String>, String)>,
+    on_question_answer: Callback<(usize, Option<String>, String, bool)>,
     on_review_jump: Callback<usize>,
     dismissed_runs: RwSignal<HashSet<String>>,
     on_branch_merge: Callback<(String, String)>,
@@ -1508,19 +2455,28 @@ pub(crate) fn render_item(
                 on_branch=Callback::new(on_branch)
                 on_file=on_file
             />
-        }.into_view(),
+        }
+        .into_view(),
         ChatItem::QueuedUser { .. } => view! {}.into_view(),
+        item if item.is_context_tombstone() => render_context_tombstone(item, locale),
         ChatItem::Assistant { text, .. } if text.trim().is_empty() => view! {}.into_view(),
         ChatItem::Assistant { text, .. } if text.starts_with("Error: ") => {
-            let msg = text.strip_prefix("Error: ").unwrap_or(text.as_str()).to_string();
+            let msg = text
+                .strip_prefix("Error: ")
+                .unwrap_or(text.as_str())
+                .to_string();
             let copy = msg.clone();
             let hint_src = msg.clone();
+            let can_resume = can_modify && !msg.starts_with(crate::dto::ACP_TURN_ERROR_PREFIX);
             view! {
                 <div class="finding err">
                     <div class="finding-head">
+                        <div class="finding-summary">
                         <span class="finding-tag">{move || format!("● {}", t(locale.get(), "chat.error"))}</span>
                         <span class="finding-title">{msg}</span>
-                        {can_modify.then(|| view! {
+                        </div>
+                        <div class="finding-actions">
+                        {can_resume.then(|| view! {
                             <button type="button" class="tool-btn"
                                 disabled=move || busy.get()
                                 on:click=move |_| on_resume.call(ui_index)>
@@ -1532,6 +2488,7 @@ pub(crate) fn render_item(
                             on:click=move |_| copy_text(copy.clone())>
                             {move || t(locale.get(), "msg.copy")}
                         </button>
+                        </div>
                     </div>
                     {move || i18n::api_error_hint(locale.get(), &hint_src).map(|hint| view! {
                         <div class="finding-body">{hint}</div>
@@ -1540,15 +2497,7 @@ pub(crate) fn render_item(
             }.into_view()
         }
         ChatItem::Assistant { text, .. } if compact_assistant => {
-            let project_root = use_context::<ReadSignal<Option<ProjectInfo>>>()
-                .and_then(|project| project.get().map(|project| project.root));
-            let html = enrich_md_html(
-                md_to_html(text),
-                &[],
-                &[],
-                locale.get(),
-                project_root.as_deref(),
-            );
+            let html = enrich_app_markdown(md_to_html(text), &[], &[], locale.get());
             view! {
                 <div class="assistant-wrap">
                     <div class="body md compact-markdown"
@@ -1558,15 +2507,20 @@ pub(crate) fn render_item(
                         }
                     ></div>
                 </div>
-            }.into_view()
+            }
+            .into_view()
         }
-        ChatItem::Assistant { text, model, resources } => view! {
+        ChatItem::Assistant {
+            text,
+            model,
+            resources,
+        } => view! {
             <AssistantMessage
                 text=text.clone()
                 model=model.clone()
                 timestamp=timestamp
                 resources=resources.clone()
-                artifacts=artifacts.to_vec()
+                artifacts=artifacts
                 source_item=ui_index
                 on_artifact=on_artifact
                 on_file=on_file
@@ -1586,8 +2540,11 @@ pub(crate) fn render_item(
                 explore_turn_index=explore_turn_index
                 on_explore=on_explore
             />
-        }.into_view(),
-        ChatItem::BranchMerge { text, branch_title, .. } => {
+        }
+        .into_view(),
+        ChatItem::BranchMerge {
+            text, branch_title, ..
+        } => {
             let open_text = text.clone();
             let title = if branch_title.trim().is_empty() {
                 t(locale.get(), "branch.merged_result")
@@ -1606,9 +2563,54 @@ pub(crate) fn render_item(
                 </button>
             }.into_view()
         }
+        // Legacy persisted context rows are intentionally inert. Current MCP
+        // App context is rendered as a removable composer attachment instead
+        // of being embedded in the conversation transcript.
+        ChatItem::AppContextNotice(_) => view! {}.into_view(),
+        ChatItem::System(text) => {
+            let body = text.clone();
+            view! {
+                <details class="context-system-row" data-testid="context-system-row">
+                    <summary>{move || t(locale.get(), "chat.context_system")}</summary>
+                    <pre class="context-system-body">{body}</pre>
+                </details>
+            }
+            .into_view()
+        }
+        ChatItem::Checkpoint(text) => {
+            let html = md_to_html(text);
+            view! {
+                <div class="context-checkpoint-row" data-testid="context-checkpoint-row">
+                    <div class="context-checkpoint-label">{move || t(locale.get(), "chat.compaction_checkpoint")}</div>
+                    <div class="body md" inner_html=html></div>
+                </div>
+            }
+            .into_view()
+        }
         ChatItem::Tool { name, .. } if name == "attempt_completion" => view! {}.into_view(),
+        ChatItem::Tool {
+            name,
+            input,
+            output,
+            ok,
+            duration_ms,
+            ..
+        } if name == "update_plan" => render_execution_plan(
+            input,
+            output,
+            *ok,
+            *duration_ms,
+            format!("{session_id}:execution-plan:{ui_index}"),
+            disclosure_state,
+        ),
         ChatItem::FileChanged(_) => view! {}.into_view(),
-        ChatItem::Tool { name, ok, input, output, .. } if is_run_monitor_tool(name) => view! {
+        ChatItem::Tool {
+            name,
+            ok,
+            input,
+            output,
+            ..
+        } if is_run_monitor_tool(name) => view! {
             <RunMonitorCard
                 run_id=input.trim().to_string()
                 runs=runs
@@ -1618,22 +2620,37 @@ pub(crate) fn render_item(
                 dismissed_runs=dismissed_runs
                 auto_review=true
             />
-        }.into_view(),
-        ChatItem::Tool { name, ok, input, output, .. } if is_image_generation_tool(name) => view! {
+        }
+        .into_view(),
+        ChatItem::Tool {
+            name,
+            ok,
+            input,
+            output,
+            ..
+        } if is_image_generation_tool(name) => view! {
             <ImageGenerationCard
                 path=input.trim().to_string()
                 ok=*ok
                 output=output.clone()
                 on_file=on_file
             />
-        }.into_view(),
-        ChatItem::Tool { name, ok, input, output, .. } if is_video_generation_tool(name) => view! {
+        }
+        .into_view(),
+        ChatItem::Tool {
+            name,
+            ok,
+            input,
+            output,
+            ..
+        } if is_video_generation_tool(name) => view! {
             <VideoGenerationCard
                 path=input.trim().to_string()
                 ok=*ok
                 output=output.clone()
             />
-        }.into_view(),
+        }
+        .into_view(),
         ChatItem::Reasoning(s) => {
             // The chat row is fingerprint-keyed, so every streaming delta
             // rebuilds it and a plain `<details>` would snap shut mid-stream.
@@ -1650,90 +2667,51 @@ pub(crate) fn render_item(
                     }>{move || t(locale.get(), "chat.thinking")}</summary>
                     <div class="body">{s.clone()}</div>
                 </details>
-            }.into_view()
+            }
+            .into_view()
         }
-        ChatItem::Tool { name, ok, input, output, .. } => view! {
-            <ToolBlock name=name.clone() ok=*ok input=input.clone() output=output.clone() />
-        }.into_view(),
-        ChatItem::Usage {
+        ChatItem::Tool {
+            name,
+            ok,
             input,
             output,
-            reasoning,
-            cached,
             ..
-        } => {
-            let (input, output, reasoning, cached) = (*input, *output, *reasoning, *cached);
-            view! {
-                <div class="usage-line" title=move || t(locale.get(), "msg.usage_title")>
-                    {move || {
-                        let loc = locale.get();
-                        let mut s = tf(loc, "msg.usage", &[
-                            ("in", &fmt_tokens(input)),
-                            ("out", &fmt_tokens(output)),
-                        ]);
-                        if cached > 0 {
-                            s.push_str(&tf(loc, "msg.usage.cached", &[("c", &fmt_tokens(cached))]));
-                        }
-                        if reasoning > 0 {
-                            s.push_str(&tf(loc, "msg.usage.reasoning", &[("r", &fmt_tokens(reasoning))]));
-                        }
-                        s
-                    }}
-                </div>
-            }.into_view()
+        } => view! {
+            <ToolBlock name=name.clone() ok=*ok input=input.clone() output=output.clone() />
         }
-        ChatItem::Compaction {
-            before,
-            after,
-            strategy,
-        } => {
-            if strategy == "auto_continue" {
-                let count = before.to_string();
-                let limit = after.to_string();
-                view! {
-                    <div class="context-compaction-flag auto" data-testid="auto-continue-flag">
-                        {compose_icon("sync")}
-                        <span>{move || tf(
-                            locale.get(),
-                            "chat.auto_continued",
-                            &[("count", count.as_str()), ("limit", limit.as_str())],
-                        )}</span>
-                    </div>
-                }.into_view()
-            } else {
-                let automatic = strategy == "auto";
-                let counts = format!(
-                    "{} → {}",
-                    fmt_tokens(*before as u64),
-                    fmt_tokens(*after as u64)
-                );
-                view! {
-                    <div class="context-compaction-flag" class:auto=automatic data-testid="context-compaction-flag">
-                        {compose_icon("doc")}
-                        <span>{move || t(
-                            locale.get(),
-                            if automatic {
-                                "chat.context_auto_compacted"
-                            } else {
-                                "chat.context_compacted"
-                            },
-                        )}</span>
-                        <span class="context-compaction-count">{counts}</span>
-                    </div>
-                }.into_view()
-            }
+        .into_view(),
+        ChatItem::Usage { .. } | ChatItem::Compaction { .. } => {
+            render_process_metadata(item, locale)
         }
-        ChatItem::AcpTool { title, status, content, locations, .. } => view! {
+        ChatItem::AcpTool {
+            title,
+            status,
+            content,
+            locations,
+            ..
+        } => view! {
             <article class="tool-card" data-testid="acp-tool" data-status=status.clone()>
                 <header><strong>{title.clone()}</strong><span>{status.clone()}</span></header>
                 {(!content.is_empty()).then(|| view! { <pre>{content.clone()}</pre> })}
                 {(!locations.is_empty()).then(|| view! { <pre>{locations.clone()}</pre> })}
             </article>
-        }.into_view(),
-        ChatItem::ApprovalPending { tool, preview, message } => view! {
-            <ApprovalCard tool=tool.clone() preview=preview.clone() message=message.clone() session_id=session_id.clone() on_decide=on_approval />
-        }.into_view(),
-        ChatItem::AcpPermission { request_id, tool, options } => {
+        }
+        .into_view(),
+        ChatItem::ApprovalPending {
+            tool,
+            preview,
+            message,
+        } => view! {
+            <ApprovalCard tool=tool.clone() preview=preview.clone() message=message.clone()
+                session_id=session_id.clone() on_decide=on_approval
+                on_artifact=on_artifact.clone() on_file=on_file.clone() />
+        }
+        .into_view(),
+        ChatItem::AcpPermission {
+            request_id,
+            tool,
+            options,
+        } => {
             let request_id = request_id.clone();
             view! {
                 <article class="approval-card" data-testid="acp-permission-card">
@@ -1766,9 +2744,7 @@ pub(crate) fn render_item(
                 ReviewTransitionPhase::Correcting => {
                     ("↩", "review.transition_to_agent", "correcting")
                 }
-                ReviewTransitionPhase::Passed => {
-                    ("✓", "review.transition_passed", "passed")
-                }
+                ReviewTransitionPhase::Passed => ("✓", "review.transition_passed", "passed"),
             };
             let model = model.clone();
             view! {
@@ -1814,11 +2790,22 @@ pub(crate) fn render_item(
                                 PlanStatus::Pending => ("pending", "", "plan.status.pending"),
                             };
                             let high = entry.priority == PlanPriority::High;
+                            let html = enrich_app_markdown(
+                                md_to_html(&entry.content),
+                                &[],
+                                &[],
+                                locale.get(),
+                            );
+                            let entry_artifact = on_artifact.clone();
+                            let entry_file = on_file.clone();
                             view! {
                                 <li data-status=status>
                                     <span class="plan-entry-mark" role="img"
                                         aria-label=move || t(locale.get(), label)>{mark}</span>
-                                    <span class="plan-entry-text">{entry.content}</span>
+                                    <div class="plan-entry-text md" inner_html=html
+                                        on:click=move |ev: web_sys::MouseEvent| {
+                                            handle_md_click(&ev, &[], &[], &entry_artifact, &entry_file)
+                                        }></div>
                                     {high.then(|| view! {
                                         <span class="plan-entry-priority" role="img"
                                             aria-label=move || t(locale.get(), "plan.priority_high")>"!"</span>
@@ -1860,20 +2847,36 @@ pub(crate) fn render_item(
             };
             let request_id_keydown = request_id.clone();
             let request_id_click = request_id.clone();
+            let question_html =
+                enrich_app_markdown(md_to_html(&question.question), &[], &[], locale.get());
             view! {
                 <section class="plan-question-card" data-testid="question-card" data-state=data_state>
                     <div class="plan-question-head">
                         <span class="plan-question-icon">{compose_icon("chat")}</span>
                         <strong>{move || t(locale.get(), "plan.question.title")}</strong>
                     </div>
-                    <p class="plan-question-text">{question.question.clone()}</p>
+                    <div class="plan-question-text md"
+                        inner_html=question_html
+                        on:click=move |ev: web_sys::MouseEvent| {
+                            handle_md_click(&ev, &[], &[], &on_artifact, &on_file)
+                        }
+                    ></div>
                     {(pending && !options.is_empty()).then(|| view! {
                         <div class="plan-question-options">{options.into_iter().map(|option| {
                             let request_id = request_id.clone();
-                            let answer = option.label.clone();
+                            let answer = if request_id.is_some() || option.description.trim().is_empty() {
+                                option.label.clone()
+                            } else {
+                                format!(
+                                    "{}\n\n{}{}",
+                                    option.label,
+                                    t(locale.get(), "plan.question.description_prefix"),
+                                    option.description
+                                )
+                            };
                             view! {
                                 <button type="button"
-                                    on:click=move |_| on_question_answer.call((ui_index, request_id.clone(), answer.clone()))>
+                                    on:click=move |_| on_question_answer.call((ui_index, request_id.clone(), answer.clone(), true))>
                                     <strong>{option.label}</strong>
                                     {(!option.description.is_empty()).then(|| view! { <span>{option.description}</span> })}
                                 </button>
@@ -1888,11 +2891,11 @@ pub(crate) fn render_item(
                                 on:keydown=move |event: web_sys::KeyboardEvent| {
                                     if event.key() == "Enter" && !event.shift_key() {
                                         event.prevent_default();
-                                        on_question_answer.call((ui_index, request_id_keydown.clone(), freeform.get()));
+                                        on_question_answer.call((ui_index, request_id_keydown.clone(), freeform.get(), false));
                                     }
                                 } />
                             <button type="button" class="primary" disabled=move || freeform.get().trim().is_empty()
-                                on:click=move |_| on_question_answer.call((ui_index, request_id_click.clone(), freeform.get()))>
+                                on:click=move |_| on_question_answer.call((ui_index, request_id_click.clone(), freeform.get(), false))>
                                 {move || t(locale.get(), "plan.question.send")}
                             </button>
                         </div>

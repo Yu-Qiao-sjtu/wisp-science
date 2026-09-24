@@ -11,7 +11,7 @@ importScripts(
   "scan_page.js",
   "downloads.js",
   "capture.js",
-  "chatgpt_adapter.js"
+  "chat_adapter.js"
 );
 
 var cfg = readBridgeConfig();
@@ -281,22 +281,30 @@ async function runCommand(tabId, command) {
         return { paused: paused };
       }
       return { paused: paused };
+    case "runtime":
+      if (command.method === "reload") {
+        // Return the acknowledgement first; reloading the service worker
+        // immediately would tear down the socket before Wisp receives it.
+        setTimeout(function () { chrome.runtime.reload(); }, 250);
+        return { reloading: true };
+      }
+      throw new Error("Unknown runtime method: " + command.method);
     default:
       throw new Error("Unknown browser command: " + command.cmd);
   }
 }
 
-async function runChatgpt(tabId, method, payload) {
+async function runChatSite(tabId, method, payload) {
   await chrome.scripting.executeScript({
     target: { tabId: tabId },
     world: "MAIN",
-    files: ["chatgpt_adapter.js"]
+    files: ["chat_adapter.js"]
   });
   var injected = await chrome.scripting.executeScript({
     target: { tabId: tabId },
     world: "MAIN",
     func: function (which, prompt) {
-      var api = chatgptDomFns();
+      var api = chatSiteDomFns();
       if (which === "fill") return api.fill(prompt);
       if (which === "send") return api.send();
       if (which === "read") return api.read();
@@ -343,8 +351,8 @@ async function handleRequest(request) {
     }
 
     var result;
-    if (typeof command === "object" && command && command.cmd === "chatgpt") {
-      result = await runChatgpt(request.tabId, command.method || "ready", command);
+    if (typeof command === "object" && command && (command.cmd === "chat" || command.cmd === "chatgpt")) {
+      result = await runChatSite(request.tabId, command.method || "ready", command);
     } else if (typeof command === "string") {
       result = await executeJavaScript(request.tabId, command);
     } else {
@@ -460,4 +468,3 @@ chrome.runtime.onMessage.addListener(function (message, _sender, reply) {
 });
 
 connect();
-

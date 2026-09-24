@@ -8,6 +8,7 @@ const officeFixtures = {
   pptxBase64: readFileSync(resolve(__dirname, "../fixtures/office-preview.pptx")).toString("base64"),
 };
 const motifAppHtmlPath = process.env.WISP_MOTIF_APP_HTML;
+const snapGeneFixturePath = process.env.WISP_SNAPGENE_FIXTURE;
 
 function providerSelect(page: Page) {
   return page.getByTestId("settings-provider");
@@ -25,6 +26,18 @@ async function expectInsideViewport(locator: Locator, width: number, height: num
   expect(box!.y).toBeGreaterThanOrEqual(0);
   expect(box!.x + box!.width).toBeLessThanOrEqual(width);
   expect(box!.y + box!.height).toBeLessThanOrEqual(height);
+}
+
+async function waitForTranscriptFonts(page: Page) {
+  // font-display: swap can change wrapping after the transcript is visible.
+  // Let font layout and scroll anchoring settle before recording a pixel
+  // bookmark; a later, correctly compensated scrollTop is a different value.
+  await page.evaluate(async () => {
+    await document.fonts.ready;
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+    );
+  });
 }
 
 async function openModelsSettings(page: Page) {
@@ -115,7 +128,7 @@ async function pinNonMacPlatform(page: Page) {
   await page.addInitScript(() => {
     Object.defineProperty(navigator, "userAgent", {
       configurable: true,
-      value: "wisp-science/Tauri",
+      value: "wisp-depmap/Tauri",
     });
     Object.defineProperty(navigator, "platform", {
       configurable: true,
@@ -128,31 +141,59 @@ async function selectAssistantReplyText(
   page: Page,
   eventType: "mouseup" | "contextmenu" = "mouseup",
 ) {
-  return page.evaluate((type) => {
-    const body = document.querySelector(".msg.assistant .body");
-    if (!body) return "";
-    const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
-    let node: Text | null = null;
-    while (walker.nextNode()) {
-      const candidate = walker.currentNode as Text;
-      if (candidate.data.trim().length > 20) {
-        node = candidate;
-        break;
+  // STEPSDEMO publishes follow-up suggestions after the assistant text. Wait
+  // for that final async insert so its auto-scroll cannot dismiss a selection
+  // surface between this helper returning and the caller clicking an action.
+  await expect(page.getByText("Follow-up questions", { exact: true })).toBeVisible();
+  let selected = "";
+  const surface = page.locator(eventType === "mouseup" ? ".selection-popup" : ".ctx-menu");
+  await expect.poll(async () => {
+    selected = await page.evaluate((type) => {
+      const body = document.querySelector(".msg.assistant .body");
+      if (!body) return "";
+      const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+      let node: Text | null = null;
+      while (walker.nextNode()) {
+        const candidate = walker.currentNode as Text;
+        if (candidate.data.trim().length > 20) {
+          node = candidate;
+          break;
+        }
       }
-    }
-    if (!node) return "";
-    const range = document.createRange();
-    range.selectNodeContents(node);
-    const selection = window.getSelection()!;
-    selection.removeAllRanges();
-    selection.addRange(range);
-    body.dispatchEvent(new MouseEvent(type, {
-      bubbles: true,
-      cancelable: true,
-      button: type === "contextmenu" ? 2 : 0,
-    }));
-    return node.data.trim();
-  }, eventType);
+      if (!node) return "";
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      const selection = window.getSelection()!;
+      selection.removeAllRanges();
+      selection.addRange(range);
+      const rect = range.getBoundingClientRect();
+      const target = document.querySelector(".chat") ?? body;
+      target.dispatchEvent(new MouseEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        button: type === "contextmenu" ? 2 : 0,
+        clientX: rect.left + rect.width / 2,
+        clientY: rect.top + Math.min(rect.height / 2, 12),
+      }));
+      return node.data.trim();
+    }, eventType);
+    return surface.isVisible();
+  }).toBe(true);
+  return selected;
+}
+
+async function selectAssistantReplyTextAndClick(
+  page: Page,
+  actionName: string,
+  eventType: "mouseup" | "contextmenu" = "mouseup",
+) {
+  let selected = "";
+  await expect(async () => {
+    selected = await selectAssistantReplyText(page, eventType);
+    const surface = page.locator(eventType === "mouseup" ? ".selection-popup" : ".ctx-menu");
+    await surface.getByRole("button", { name: actionName }).click({ timeout: 2_000 });
+  }).toPass({ timeout: 15_000 });
+  return selected;
 }
 
 function newSessionButton(page: Page) {
@@ -206,6 +247,12 @@ async function lastInvokeArgs(page: Page, cmd: string) {
     const calls = ((window as any).__skillInvokeLog ?? []).filter((c: any) => c.cmd === name);
     return plain(calls.at(-1)?.args ?? null);
   }, cmd);
+}
+
+async function invokeCount(page: Page, cmd: string) {
+  return page.evaluate((name) =>
+    ((window as any).__skillInvokeLog ?? []).filter((call: any) => call.cmd === name).length,
+  cmd);
 }
 
 // How many run-list refreshes the UI has performed. The app polls `list_runs`
@@ -357,8 +404,8 @@ test("send streams a mocked assistant reply", async ({ page, context }) => {
   await enterApp(page);
   await composer(page).fill("hello there");
   await page.getByRole("button", { name: "Send" }).click();
-  // Deltas "Hello " + "from mock wisp-science." accumulate into one assistant bubble.
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible({ timeout: 10_000 });
+  // Deltas "Hello " + "from mock wisp-depmap." accumulate into one assistant bubble.
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible({ timeout: 10_000 });
   const followUps = page.getByTestId("follow-up-questions");
   await expect(followUps.getByRole("button")).toHaveCount(4);
   await followUps.getByRole("button", { name: "Expand the search for underrepresented species" }).click();
@@ -377,7 +424,7 @@ test("sending a follow-up hides suggestions before the User event arrives", asyn
   await enterApp(page);
   await composer(page).fill("hello there");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible({ timeout: 10_000 });
   const followUps = page.getByTestId("follow-up-questions");
   await expect(followUps.getByRole("button")).toHaveCount(4);
 
@@ -394,7 +441,7 @@ test("completed turns propose editable memory and require confirmation", async (
   await enterApp(page);
   await composer(page).fill("summarize this project convention");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible();
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible();
   await page.getByRole("button", { name: "Toggle panel" }).click();
   await expect(page.locator(".rightpane")).toBeVisible();
 
@@ -414,7 +461,7 @@ test("completed turns propose editable memory and require confirmation", async (
   await page.keyboard.press("Escape");
   await expect(modal).toHaveCount(0);
   await expect(page.locator(".rightpane")).toBeVisible();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible();
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible();
 
   await page.locator(".msg.assistant").getByRole("button", { name: "Memory" }).click();
   await page.getByTestId("turn-memory-content").fill("Always prefer reproducible local workflows.");
@@ -490,7 +537,7 @@ test("manual review blocks sending and shows a playful progress animation", asyn
   await enterApp(page);
   await composer(page).fill("review this answer");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible();
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible();
 
   await page.locator(".msg.assistant").getByRole("button", { name: "Review" }).click();
   await expect(page.getByRole("button", { name: "Send" })).toBeDisabled();
@@ -507,7 +554,7 @@ test("undo returns the latest prompt and keeps unsupported Word files", async ({
   await enterApp(page);
   await composer(page).fill("revise my notes");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible({ timeout: 10_000 });
 
   const undo = page.locator(".msg.assistant").getByRole("button", { name: "Undo" });
   await expect(undo).toHaveCount(1);
@@ -531,7 +578,7 @@ test("undo returns the latest prompt and keeps unsupported Word files", async ({
   });
   await expect(modal).toHaveCount(0);
   await expect(page.locator(".msg.user", { hasText: "revise my notes" })).toHaveCount(0);
-  await expect(page.getByText("Hello from mock wisp-science.")).toHaveCount(0);
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toHaveCount(0);
   await expect(composer(page)).toHaveValue("revise my notes");
 });
 
@@ -666,7 +713,7 @@ test("sidebar Feedback opens a blank conversation and waits for the user's first
     buffer: Buffer.from("a,b\n1,2"),
   });
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible();
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible();
   await page.getByRole("button", { name: "Toggle panel" }).click();
   const tile = page.locator('.rp-tile[data-artifact-name="counts.csv"]');
   await tile.click({ button: "right" });
@@ -723,9 +770,9 @@ test("Memory settings show the active project name", async ({ page }) => {
   await openSettingsSection(page, "Memory");
   const project = page.getByTestId("memory-project");
   await expect(page.getByTestId("memory-project-select")).toHaveAttribute("data-project-id", "default");
-  await expect(page.getByTestId("memory-project-select")).toContainText("wisp-science");
+  await expect(page.getByTestId("memory-project-select")).toContainText("wisp-depmap");
   await expect(project).toContainText("(1)");
-  await expect(page.locator(".conn-group-label", { hasText: "Project memory" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Project memory", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Clear all" })).toHaveClass("memory-clear-btn");
   await expect(page.locator(".memory-toggle-label")).toHaveText("Memory");
   await expect(
@@ -882,7 +929,7 @@ test("background Agent completion appears in its owning conversation", async ({ 
   await enterApp(page);
   await composer(page).fill("start background analysis");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible({ timeout: 10_000 });
   const sent = await lastInvokeArgs(page, "send_message");
   await page.evaluate((frameId) => {
     (window as any).__tauriEmit("agent", {
@@ -909,7 +956,7 @@ test("switching HTTP models confirms cache invalidation", async ({ page }) => {
   await enterApp(page);
   await composer(page).fill("bind this conversation model");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible();
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible();
 
   await page.locator(".model-picker-btn").click();
   const opusOption = page.getByRole("button", { name: /opus-4\.8/ });
@@ -933,6 +980,35 @@ test("switching HTTP models confirms cache invalidation", async ({ page }) => {
   await expect(page.locator(".model-picker-label")).toHaveText("opus-4.8");
 });
 
+test("model switch confirm consumes Escape before the right pane", async ({ page }) => {
+  await enterApp(page);
+  await composer(page).fill("bind this conversation model");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible();
+  await page.getByRole("button", { name: "Toggle panel" }).click();
+  await expect(page.locator(".rightpane")).toBeVisible();
+
+  await page.locator(".model-picker-btn").click();
+  const opusOption = page.getByRole("button", { name: /opus-4\.8/ });
+  await expect(opusOption).toBeVisible();
+  await opusOption.evaluate((element: HTMLElement) => element.click());
+  const modal = page.getByTestId("model-switch-confirm");
+  await expect(modal).toBeVisible();
+
+  // Root-owned confirm participates in the window Escape stack without focus:
+  // one press cancels only the switch, leaving the right pane open and the
+  // session model untouched.
+  await page.keyboard.press("Escape");
+  await expect(modal).toHaveCount(0);
+  await expect(page.locator(".rightpane")).toBeVisible();
+  await expect.poll(() => lastInvokeArgs(page, "set_active_model")).toBeNull();
+  await expect(page.locator(".model-picker-label")).toHaveText("deepseek-v4-pro");
+
+  // The next press reaches the parent layer.
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".rightpane")).toBeHidden();
+});
+
 test("switching to a text-only model confirms historical images will be ignored", async ({ page }) => {
   await enterApp(page, "/?mockTextOnlyModel=1");
 
@@ -947,7 +1023,7 @@ test("switching to a text-only model confirms historical images will be ignored"
     buffer: Buffer.from([137, 80, 78, 71]),
   });
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible();
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible();
 
   await page.locator(".model-picker-btn").click();
   await page.getByRole("button", { name: /deepseek-v4-pro/ }).click();
@@ -966,7 +1042,7 @@ test("model switch warning can be permanently dismissed", async ({ page }) => {
   await enterApp(page);
   await composer(page).fill("bind this conversation model");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible();
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible();
 
   await page.locator(".model-picker-btn").click();
   await page.getByRole("button", { name: /opus-4\.8/ }).click();
@@ -1192,11 +1268,38 @@ test("ACP Agent settings create, test, and authenticate an installed agent", asy
   await expect.poll(() => lastInvokeArgs(page, "authenticate_acp_agent")).toMatchObject({ methodId: "browser" });
 });
 
+test("ACP terminal authentication opens the advertised login command in the terminal dock", async ({ page }) => {
+  await enterApp(page, "/?mockAcpTerminalAuth=1");
+  await globalSettingsButton(page).click();
+  await page.getByRole("button", { name: "Models", exact: true }).click();
+  await page.getByTestId("open-acp-agents-from-settings").click();
+  await page.getByTestId("add-acp-agent-settings").click();
+  const settings = page.getByTestId("acp-agents-settings");
+  await settings.getByTestId("acp-agent-label").fill("Claude ACP");
+  await settings.getByTestId("acp-agent-command").fill("npx");
+  await settings.getByTestId("acp-agent-args").fill("-y\n@agentclientprotocol/claude-agent-acp");
+  await settings.getByTestId("save-acp-agent").click();
+
+  const row = page.getByTestId("acp-agent-row").filter({ hasText: "Claude ACP" });
+  await row.getByTestId("test-acp-agent").click();
+  await expect(row.getByTestId("acp-agent-info")).toContainText("Claude Agent 0.69.0 · ACP v1");
+  await row.getByRole("button", { name: "Claude Subscription" }).click();
+
+  await expect.poll(() => lastInvokeArgs(page, "authenticate_acp_agent")).toMatchObject({
+    methodId: "claude-ai-login",
+  });
+  await expect(page.locator(".settings-page")).toHaveCount(0);
+  const terminalDock = page.getByTestId("terminal-dock");
+  await expect(terminalDock).toBeVisible();
+  await expect(terminalDock.getByRole("tab", { name: "Claude ACP — Claude Subscription" })).toBeVisible();
+  await expect(page.getByText("Authentication terminal opened. Complete sign-in there, then retry the ACP session.")).toBeVisible();
+});
+
 test("selecting an ACP Agent from a populated HTTP session starts a fresh session", async ({ page }) => {
   await enterApp(page);
   await composer(page).fill("existing HTTP turn");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible();
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible();
   const firstSend = await lastInvokeArgs(page, "send_message");
   await composer(page).fill("preserved draft");
 
@@ -1218,6 +1321,59 @@ test("selecting an ACP Agent from a populated HTTP session starts a fresh sessio
   });
   const secondSend = await lastInvokeArgs(page, "send_message");
   expect(secondSend.sessionId).not.toBe(firstSend.sessionId);
+});
+
+for (const [locale, detail] of [
+  ["en", "Agent process exited during startup"],
+  ["en", "api: 401 unauthorized"],
+  ["zh", "api: 403 forbidden"],
+  ["zh", "This ACP Agent cannot resume or load the saved session."],
+  ["en", "api: 400 context window exceeded"],
+]) {
+  test(`ACP failure explains HTTP fallback and billing (${locale}, ${detail}) (#1118)`, async ({ page }) => {
+    await page.goto(`/?mockLocale=${locale}`);
+    await page.locator(".proj-card-main").first().click();
+    await page.locator(".model-picker-btn").click();
+    await page.getByRole("button", { name: /Test ACP Agent/ }).click();
+    await composer(page).fill(`ACPFAIL ${detail}`);
+    await composer(page).press("Enter");
+
+    const error = page.locator(".finding.err");
+    await expect(error).toContainText(detail);
+    await expect(error.locator(".finding-body")).toContainText(
+      locale === "zh" ? "未回退（fallback）到 HTTP 模型" : "did not fall back to an HTTP model",
+    );
+    await expect(error.locator(".finding-body")).toContainText(
+      locale === "zh" ? "可能产生额外费用" : "may incur separate charges",
+    );
+    await expect(error.getByRole("button", { name: locale === "zh" ? "继续执行" : "Resume", exact: true })).toHaveCount(0);
+    await expect(page.getByTestId("context-recovery-modal")).toHaveCount(0);
+    await expect(page.locator(".model-picker-label")).toHaveText("Test ACP Agent");
+    expect(await invokeCount(page, "send_message")).toBe(1);
+
+    await composer(page).fill("retry with the same ACP Agent");
+    await composer(page).press("Enter");
+    await expect(page.getByText("Hello from ACP.")).toBeVisible();
+    expect(await lastInvokeArgs(page, "send_message")).toMatchObject({ acpAgentId: "acp-test" });
+    expect(await invokeCount(page, "send_message")).toBe(2);
+    expect(await invokeCount(page, "set_active_model")).toBe(0);
+  });
+}
+
+test("restored ACP model options are usable before sending a message (#1112)", async ({ page }) => {
+  await openMockPlanSession(page, "acp");
+  await expect(page.locator(".model-picker-btn")).toContainText("Test ACP Agent");
+  await page.locator(".model-picker-btn").click();
+  const config = page.getByTestId("acp-session-config");
+  await expect(config.getByLabel("Model", { exact: true })).toHaveValue("smart");
+  await config.getByLabel("Model", { exact: true }).selectOption("fast");
+  await expect.poll(() => lastInvokeArgs(page, "set_acp_session_config")).toMatchObject({ frameId: "s1", configId: "model", value: { value: "fast" } });
+  await page.keyboard.press("Escape");
+  await newSessionButton(page).click();
+  await page.locator('[data-session-id="s1"]').click();
+  await expect(page.locator(".model-picker-btn")).toContainText("Test ACP Agent");
+  await page.locator(".model-picker-btn").click();
+  await expect(config.getByLabel("Model", { exact: true })).toHaveValue("fast");
 });
 
 test("ACP turn maps config, overlapping tools, plan, usage, and exact permission response", async ({ page }) => {
@@ -1420,7 +1576,48 @@ test("built-in propose_plan renders a plan card with a working action bar", asyn
   await expect(page.locator(".copy-toast")).toContainText("Plan approved; execution is starting");
 });
 
-test("built-in ask_user renders a question card whose option click sends the answer", async ({ page }) => {
+test("plan entries render full Markdown without breaking status layout", async ({ page }) => {
+  await openMockPlanSession(page, "native");
+  await emitTauriEvent(page, "agent", {
+    kind: "ToolCall", frame_id: "s1", name: "propose_plan", preview: "1 steps",
+  });
+  await emitTauriEvent(page, "agent", {
+    kind: "ToolResult", frame_id: "s1", name: "propose_plan", ok: true,
+    content: JSON.stringify({
+      v: 1, source: "native",
+      entries: [{
+        status: "pending", priority: "high",
+        content: [
+          "## **实现** `Fast`",
+          "",
+          "> 保留 [Issue #1025](https://github.com/xuzhougeng/wisp-science/issues/1025)",
+          "",
+          "- Chat Completions",
+          "  - `service_tier=priority`",
+          "",
+          "```json",
+          "{\\\"service_tier\\\":\\\"priority\\\"}",
+          "```",
+          "",
+          "| 模式 | 值 |",
+          "| --- | --- |",
+          "| Fast | priority |",
+        ].join("\n"),
+      }],
+    }),
+  });
+  const entry = page.getByTestId("plan-card").last().locator(".plan-entry-text");
+  await expect(entry.locator("h2 strong")).toHaveText("实现");
+  await expect(entry.locator("code").first()).toHaveText("Fast");
+  await expect(entry.locator("blockquote")).toBeVisible();
+  await expect(entry.locator("ul li")).toHaveCount(2);
+  await expect(entry.locator("pre")).toBeVisible();
+  await expect(entry.locator("table")).toBeVisible();
+  await expect(entry).not.toContainText("**实现**");
+  await expect(page.getByTestId("plan-card").last().getByRole("img", { name: "High priority" })).toBeVisible();
+});
+
+test("built-in ask_user option click fills an editable answer draft", async ({ page }) => {
   await openMockPlanSession(page, "native");
 
   // The built-in question tool streams through the ordinary tool events; its
@@ -1452,14 +1649,56 @@ test("built-in ask_user renders a question card whose option click sends the ans
   // wry's window.prompt is a no-op, so the freeform answer must be in-app.
   await expect(card.locator(".plan-question-freeform input")).toBeVisible();
 
+  const sendCount = await invokeCount(page, "send_message");
   await card.getByRole("button", { name: "STAR" }).click();
+  await expect.poll(() => invokeCount(page, "send_message")).toBe(sendCount);
+  await expect(composer(page)).toHaveValue("STAR\n\nDescription: splice-aware, needs more RAM");
+  await expect(card).toHaveAttribute("data-state", "pending");
+
+  await card.getByRole("button", { name: "HISAT2" }).click();
+  await expect(composer(page)).toHaveValue("HISAT2\n\nDescription: lighter");
+  await card.getByRole("button", { name: "STAR" }).click();
+  await expect(composer(page)).toHaveValue("STAR\n\nDescription: splice-aware, needs more RAM");
+  await expect.poll(() => invokeCount(page, "send_message")).toBe(sendCount);
+  await composer(page).fill("STAR\n\nDescription: splice-aware, needs more RAM\n\n第 4 步先跳过");
+  await page.getByRole("button", { name: "Send" }).click();
   // ?mock=1 send_message does not update the thread, so assert at the invoke layer.
   await expect.poll(() => lastInvokeArgs(page, "send_message")).toMatchObject({
-    sessionId: "s1", message: "STAR",
+    sessionId: "s1", message: "STAR\n\nDescription: splice-aware, needs more RAM\n\n第 4 步先跳过",
   });
   await expect(card).toHaveAttribute("data-state", "answered");
   await expect(card).toContainText("Answer sent to the agent");
   await expect(card.locator(".plan-question-options")).toHaveCount(0);
+});
+
+test("ask_user question body renders markdown instead of source markers", async ({ page }) => {
+  await openMockPlanSession(page, "native");
+  await emitTauriEvent(page, "agent", { kind: "ToolCall", frame_id: "s1", name: "ask_user", preview: "Confirm?" });
+  await emitTauriEvent(page, "agent", {
+    kind: "ToolResult", frame_id: "s1", name: "ask_user", ok: true,
+    content: JSON.stringify({
+      v: 1, source: "native",
+      question: [
+        "请先定怎么测。**已核实** Local Published: `release-abc`.",
+        "",
+        "- 纳入：`code/organized.R`",
+        "- 排除：`code-example.r`",
+        "",
+        "详见 [PR #17](https://github.com/jarxunlai/ScientificFigureLibrary-community-archives/pull/17)。",
+      ].join("\n"),
+      options: [{ label: "先修 render.R", description: "给 organized.R 加上 `--input-dir`" }],
+      allow_freeform: true,
+      note: "Question submitted; end your turn.",
+    }),
+  });
+
+  const body = page.getByTestId("question-card").locator(".plan-question-text");
+  await expect(body.locator("strong")).toHaveText("已核实");
+  await expect(body.locator("code").first()).toHaveText("release-abc");
+  await expect(body.locator("ul li")).toHaveCount(2);
+  await expect(body.locator("a[href*='pull/17']")).toBeVisible();
+  await expect(body).not.toContainText("**已核实**");
+  await expect(page.getByTestId("question-card")).not.toContainText("end your turn");
 });
 
 test("ACP ask_user card resolves through respond_ask_user and settles", async ({ page }) => {
@@ -1719,6 +1958,59 @@ test("post-start API errors keep the user bubble when an Error event lands first
   await expect(page.getByRole("button", { name: /Resume|继续执行/ })).toBeVisible();
 });
 
+for (const locale of ["zh", "en"]) {
+  test(`long API errors wrap without squeezing the badge or actions (${locale})`, async ({ page }) => {
+    await page.goto(`/?mockLocale=${locale}`);
+    await page.locator(".proj-card-main").first().click();
+    await composer(page).fill("show a network error");
+    await composer(page).press("Enter");
+    await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible();
+    const send = await lastInvokeArgs(page, "send_message");
+    const message = "http: error decoding response body: request or response body error: error reading a body from connection: peer closed connection without sending TLS close_notify: "
+      + "https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof-" + "connection".repeat(30);
+    await emitTauriEvent(page, "agent", { kind: "Error", frame_id: send.sessionId, message });
+    const card = page.locator(".finding.err");
+    await expect(card.locator(".finding-title")).toHaveText(message);
+    await expect(card.getByRole("button", { name: locale === "zh" ? "继续执行" : "Resume", exact: true })).toBeVisible();
+    await expect(card.getByRole("button", { name: locale === "zh" ? "复制" : "Copy", exact: true })).toBeVisible();
+    for (const width of [1440, 820, 360]) {
+      await page.setViewportSize({ width: Math.max(width, 820), height: 1200 });
+      // Also constrain the card itself: narrow panes need the same wrapping
+      // behavior even when the desktop window remains wide.
+      await card.evaluate((el, width) => { el.style.maxWidth = width === 360 ? "360px" : ""; }, width);
+      await card.scrollIntoViewIfNeeded();
+      const layout = await card.evaluate(el => {
+        const bounds = el.getBoundingClientRect();
+        const controls = Array.from(el.querySelectorAll(".finding-tag, button"));
+        const buttonCenters = Array.from(el.querySelectorAll("button"), button => {
+          const rect = button.getBoundingClientRect();
+          return rect.top + rect.height / 2;
+        });
+        return {
+          overflow: el.scrollWidth > el.clientWidth,
+          controls: controls.map(control => {
+            const rect = control.getBoundingClientRect();
+            const range = document.createRange();
+            range.selectNodeContents(control);
+            return {
+              lines: range.getClientRects().length,
+              inside: rect.left >= bounds.left && rect.right <= bounds.right,
+            };
+          }),
+          buttonsOnSameRow: Math.max(...buttonCenters) - Math.min(...buttonCenters) < 1,
+          actionsBelowSummary: el.querySelector(".finding-actions")!.getBoundingClientRect().top
+            >= el.querySelector(".finding-summary")!.getBoundingClientRect().bottom,
+        };
+      });
+      expect(layout.overflow).toBe(false);
+      expect(layout.controls).toEqual(Array(3).fill({ lines: 1, inside: true }));
+      expect(layout.buttonsOnSameRow).toBe(true);
+      if (width === 360) expect(layout.actionsBelowSummary).toBe(true);
+      await card.screenshot({ path: test.info().outputPath(`error-card-${locale}-${width}.png`) });
+    }
+  });
+}
+
 test("truncated output auto-continue is shown as progress", async ({ page }) => {
   await enterApp(page);
   await composer(page).fill("AUTOCONTINUE long task");
@@ -1744,9 +2036,9 @@ test("automatic reviewer resolves its finding and jumps past UI-only rows (#550)
 
   const handoffs = page.locator(".review-transition");
   await expect(handoffs).toHaveCount(2);
-  await expect(handoffs.nth(0)).toContainText("wisp-science nudged Reviewer");
+  await expect(handoffs.nth(0)).toContainText("wisp-depmap nudged Reviewer");
   await expect(handoffs.nth(0)).toHaveAttribute("data-phase", "reviewing");
-  await expect(handoffs.nth(1)).toContainText("Reviewer nudged wisp-science");
+  await expect(handoffs.nth(1)).toContainText("Reviewer nudged wisp-depmap");
   await expect(handoffs.nth(1)).toContainText("deepseek-v4-pro");
   await expect(handoffs.nth(1)).toHaveAttribute("data-phase", "correcting");
 
@@ -1936,7 +2228,7 @@ test("composer @ # and / add typed context references", async ({ page }) => {
   await expect(composerInput).toBeFocused();
 
   await composerInput.pressSequentially("#project");
-  await expect(page.locator(".mention-menu")).toContainText("Search every session in wisp-science");
+  await expect(page.locator(".mention-menu")).toContainText("Search every session in wisp-depmap");
   await page.locator(".mention-menu .mention-item").first().click();
   await expect(composerInput).toHaveValue("");
   await expect(composerInput).toBeFocused();
@@ -1981,7 +2273,7 @@ test("composer @ # and / add typed context references", async ({ page }) => {
   await expect(sentContext).toHaveCount(6);
   await expect(page.locator('.msg.user [data-reference-kind="artifact"]')).toContainText("nif3.treefile");
   await expect(page.locator('.msg.user [data-reference-kind="session"]')).toContainText("Current analysis");
-  await expect(page.locator('.msg.user [data-reference-kind="project"]')).toContainText("wisp-science");
+  await expect(page.locator('.msg.user [data-reference-kind="project"]')).toContainText("wisp-depmap");
   await expect(page.locator('.msg.user [data-reference-kind="skill"]')).toContainText("literature-review");
   await expect(page.locator('.msg.user [data-reference-kind="workflow"]')).toContainText("Roundtable");
   const sentEnvironment = page.locator('.msg.user [data-reference-kind="context"]');
@@ -2077,7 +2369,7 @@ test("composer slash commands run the matching shell actions", async ({ page }) 
   // A completed turn unlocks the turn-bound commands.
   await composerInput.fill("hello there");
   await composerInput.press("Enter");
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible({ timeout: 10_000 });
 
   // Picked action commands run immediately without filling the composer.
   await composerInput.pressSequentially("/rev");
@@ -2309,6 +2601,112 @@ test("/share exports selected, keyword-redacted messages as a PNG", async ({ pag
   await page.keyboard.press("Escape");
   await expect(overlay).toHaveCount(0);
   await expect(composerInput).toBeVisible();
+});
+
+test("/share PNG keeps markdown tables and KaTeX from the live thread", async ({ page }) => {
+  await enterApp(page);
+  const composerInput = composer(page);
+  await composerInput.fill("SHARETABLEMATH export the table");
+  await composerInput.press("Enter");
+  const assistant = page.locator(".msg.assistant .body.md");
+  await expect(assistant.locator("table")).toBeVisible({ timeout: 10_000 });
+  await expect(assistant.getByRole("columnheader", { name: "项目" })).toBeVisible();
+  await expect(assistant.getByRole("cell", { name: "A", exact: true })).toBeVisible();
+  await expect(assistant.locator(".katex").first()).toBeVisible({ timeout: 10_000 });
+  await expect(assistant.locator(".katex")).toHaveCount(2);
+
+  await composerInput.fill("/share");
+  await composerInput.press("Enter");
+  const overlay = page.getByTestId("share-overlay");
+  await expect(overlay).toBeVisible();
+  await overlay.getByTestId("share-export").click();
+  await expect.poll(() => lastInvokeArgs(page, "save_share_image")).not.toBeNull();
+  const info = await page.evaluate(() => (window as any).__shareRasterInfo);
+  expect(info).toMatchObject({ usedHtml: true, fallback: false });
+  expect(info.tableCount).toBeGreaterThan(0);
+  expect(info.mathCount).toBeGreaterThan(0);
+  expect(info.katexCount).toBeGreaterThan(0);
+  const args = await lastInvokeArgs(page, "save_share_image");
+  expect(String(args.pngBase64).length).toBeGreaterThan(10000);
+  const pngHeight = await page.evaluate((raw) => {
+    const bytes = Uint8Array.from(atob(raw), (c) => c.charCodeAt(0));
+    return new DataView(bytes.buffer).getUint32(20, false);
+  }, String(args.pngBase64));
+  // Header + table + two equations is taller than a short prose-only image.
+  expect(pngHeight).toBeGreaterThan(400);
+});
+
+test("/share keeps a long picker at its scroll position and bounds exported prose", async ({ page }) => {
+  await enterApp(page);
+  const composerInput = composer(page);
+  await composerInput.fill("SHARETHINK seed a long share list");
+  await composerInput.press("Enter");
+  await expect(page.getByText("Alice confirmed the spectrum is clean.")).toBeVisible({ timeout: 10_000 });
+  const send = await lastInvokeArgs(page, "send_message");
+  const frameId = String(send.sessionId ?? send.session_id ?? "");
+  await page.evaluate((fid) => {
+    const emit = (window as any).__tauriEmit;
+    for (let index = 0; index < 12; index += 1) {
+      emit("agent", {
+        kind: "User",
+        frame_id: fid,
+        text: `follow-up ${index} ${"sample".repeat(45)}`,
+      });
+      emit("agent", {
+        kind: "Text",
+        frame_id: fid,
+        delta: `Long result ${index}: https://example.test/${"unbroken".repeat(55)}`,
+      });
+    }
+  }, frameId);
+  await expect(page.locator(".msg.user")).toHaveCount(13);
+
+  await page.getByTestId("share-topbar").click();
+  const overlay = page.getByTestId("share-overlay");
+  const list = overlay.locator(".share-list");
+  const rows = overlay.locator(".share-row");
+  await expect(rows).toHaveCount(27);
+  const before = await list.evaluate((element: HTMLElement) => {
+    element.scrollTop = element.scrollHeight;
+    return element.scrollTop;
+  });
+  expect(before).toBeGreaterThan(0);
+
+  // Updating one checkbox used to replace every row view, resetting the
+  // scroll container to zero. Keyed rows must survive consecutive updates.
+  await rows.nth(25).locator("input").click();
+  await expect.poll(() => list.evaluate((element: HTMLElement) => element.scrollTop))
+    .toBeGreaterThan(before * 0.8);
+  const afterFirst = await list.evaluate((element: HTMLElement) => element.scrollTop);
+  await rows.nth(24).locator("input").click();
+  await expect.poll(() => list.evaluate((element: HTMLElement) => element.scrollTop))
+    .toBeGreaterThan(afterFirst * 0.8);
+
+  await overlay.getByTestId("share-format-html").click();
+  await overlay.getByTestId("share-export").click();
+  await expect.poll(() => lastInvokeArgs(page, "save_share_html")).not.toBeNull();
+  const html = String((await lastInvokeArgs(page, "save_share_html")).html);
+  const layout = await page.evaluate(async (documentHtml) => {
+    const iframe = document.createElement("iframe");
+    iframe.style.cssText = "position:fixed;left:-9999px;width:420px;height:640px;border:0";
+    document.body.appendChild(iframe);
+    const loaded = new Promise((resolve) => {
+      iframe.addEventListener("load", () => resolve(undefined), { once: true });
+    });
+    iframe.srcdoc = documentHtml;
+    await loaded;
+    const doc = iframe.contentDocument!;
+    const prose = [...doc.querySelectorAll<HTMLElement>(".msg .body")];
+    const result = {
+      pageWidth: doc.documentElement.clientWidth,
+      pageScrollWidth: doc.documentElement.scrollWidth,
+      overflowingProse: prose.filter((element) => element.scrollWidth > element.clientWidth + 1).length,
+    };
+    iframe.remove();
+    return result;
+  }, html);
+  expect(layout.pageScrollWidth).toBeLessThanOrEqual(layout.pageWidth + 1);
+  expect(layout.overflowingProse).toBe(0);
 });
 
 test("/share hides the social copy flow and keeps PNG plus HTML export", async ({ page }) => {
@@ -2630,7 +3028,7 @@ test("context usage moves out of the topbar and opens a categorized detail panel
   await expect(panel.locator(".context-usage-row.expandable")).toHaveCount(6);
 
   await panel.getByText("System prompt", { exact: true }).click();
-  await expect(panel.locator(".context-usage-detail")).toContainText("You are wisp-science");
+  await expect(panel.locator(".context-usage-detail")).toContainText("You are wisp-depmap");
   await panel.getByText("Tool definitions", { exact: true }).click();
   await expect(panel.locator(".context-usage-detail")).toContainText("read");
   await expect(panel.locator(".context-usage-detail")).toContainText("Read a file from disk");
@@ -2737,10 +3135,14 @@ test("danger context usage panel offers compact and a new session (#931)", async
   await expect(nudge).toContainText("Window is almost full");
   await nudge.getByRole("button", { name: "Compact" }).click();
   await expect(panel).toHaveCount(0);
+  await expect(page.getByTestId("compact-modal")).toBeVisible();
+  await expect(page.getByTestId("compact-mode-regular")).toHaveAttribute("aria-pressed", "true");
+  await page.getByTestId("compact-start").click();
   await expect.poll(() => lastInvokeArgs(page, "send_message")).toMatchObject({
     message: "/compact",
     resume: false,
   });
+  await expect(page.getByTestId("compact-modal")).toHaveCount(0);
 
   await page.locator("#composer-input").fill("CONTEXTUSAGEDANGER");
   await page.getByRole("button", { name: "Send", exact: true }).click();
@@ -2994,7 +3396,7 @@ test("artifact type badges stay neutral instead of rainbow pills", async ({ page
     .locator("#composer-input")
     .fill("show `figures/panel_I_heatmap_4genes_median.png/.pdf`");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible({ timeout: 10_000 });
   await page.getByRole("button", { name: "Toggle panel" }).click();
 
   const badge = page.locator('.rp-tile[data-artifact-name="panel_I_heatmap_4genes_median.png"] .rp-badge');
@@ -3009,7 +3411,7 @@ test("Cmd+K opens search and the composer shows the macOS shortcut", async ({ pa
   await page.addInitScript(() => {
     Object.defineProperty(navigator, "userAgent", {
       configurable: true,
-      value: "wisp-science/Tauri",
+      value: "wisp-depmap/Tauri",
     });
     Object.defineProperty(navigator, "platform", {
       configurable: true,
@@ -3037,7 +3439,7 @@ test("Cmd+Enter sends when the modifier shortcut is selected on macOS", async ({
   await page.addInitScript(() => {
     Object.defineProperty(navigator, "userAgent", {
       configurable: true,
-      value: "wisp-science/Tauri",
+      value: "wisp-depmap/Tauri",
     });
     Object.defineProperty(navigator, "platform", {
       configurable: true,
@@ -3066,6 +3468,7 @@ test("Ctrl+P command palette runs commands and switches themes", async ({ page }
   await expect(input).toHaveAttribute("inputmode", "search");
   await expect(input).toHaveAttribute("autocomplete", "off");
   await expect(palette).toContainText("New session");
+  await expect(palette).toContainText("New Window");
   await expect(palette.locator(".action-palette-row", { hasText: "New session" })
     .locator(".action-shortcut")).toHaveText("Ctrl+N");
   await expect(palette.locator(".action-palette-row", { hasText: "Search" })
@@ -3148,7 +3551,7 @@ test("Ctrl+P command palette runs commands and switches themes", async ({ page }
 test("privacy mode hides selected projects and recent sessions, then restores them", async ({ page }) => {
   await pinNonMacPlatform(page);
   await page.goto("/");
-  const privateProject = page.locator(".proj-card", { hasText: "wisp-science" });
+  const privateProject = page.locator(".proj-card", { hasText: "wisp-depmap" });
   const otherProject = page.locator(".proj-card", { hasText: "Other project" });
   await expect(privateProject).toBeVisible();
   await expect(page.getByTestId("recent-session-card")).toHaveCount(2);
@@ -3168,7 +3571,7 @@ test("privacy mode hides selected projects and recent sessions, then restores th
 
   await page.keyboard.press("Control+Shift+h");
   await expect(modal).toBeVisible();
-  const projectRow = modal.locator(".privacy-project-row", { hasText: "wisp-science" });
+  const projectRow = modal.locator(".privacy-project-row", { hasText: "wisp-depmap" });
   await expect(projectRow).toHaveCSS("flex-direction", "row");
   await projectRow.locator('input[type="checkbox"]').check();
   await modal.getByRole("button", { name: "Hide selected" }).click();
@@ -3187,12 +3590,12 @@ test("privacy mode hides selected projects and recent sessions, then restores th
   await expect(page.getByTestId("recent-session-card")).toHaveCount(0);
   await page.keyboard.press("Control+k");
   const search = page.getByRole("dialog", { name: "Search" });
-  await expect(search).not.toContainText("wisp-science");
+  await expect(search).not.toContainText("wisp-depmap");
   await expect(search).not.toContainText("Enumerate MCP bio-tools databases");
   await page.keyboard.press("Escape");
 
   await page.keyboard.press("Control+Shift+h");
-  await expect(modal.locator(".privacy-project-row", { hasText: "wisp-science" })
+  await expect(modal.locator(".privacy-project-row", { hasText: "wisp-depmap" })
     .locator('input[type="checkbox"]')).toBeChecked();
   await modal.getByRole("button", { name: "Restore all" }).click();
   await expect(privateProject).toBeVisible();
@@ -3202,7 +3605,7 @@ test("privacy mode hides selected projects and recent sessions, then restores th
 
 test("privacy mode select all toggles every project at once", async ({ page }) => {
   await page.goto("/");
-  const privateProject = page.locator(".proj-card", { hasText: "wisp-science" });
+  const privateProject = page.locator(".proj-card", { hasText: "wisp-depmap" });
   const otherProject = page.locator(".proj-card", { hasText: "Other project" });
   await expect(privateProject).toBeVisible();
   await expect(otherProject).toBeVisible();
@@ -3315,6 +3718,31 @@ test("rename session modal autofocuses so Ctrl+A selects the title", async ({ pa
   await expect.poll(async () => input.evaluate((el: HTMLInputElement) =>
     el.selectionStart === 0 && el.selectionEnd === el.value.length
   )).toBe(true);
+});
+
+test("double-clicking the conversation tab renames the session", async ({ page }) => {
+  await page.addInitScript(parallelMock);
+  await page.goto("/");
+  await page.locator(".proj-card-main").first().click();
+  await expect(newSessionButton(page)).toBeVisible();
+
+  await composer(page).fill("tab-rename-me");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(assistantReplyQuoting(page, "tab-rename-me")).toBeVisible({ timeout: 10_000 });
+
+  const tab = page.locator(".center-tab").first();
+  await tab.dblclick();
+  const input = page.locator("#rename-session-input");
+  await expect(input).toBeVisible();
+  await expect(input).toHaveValue("tab-rename-me");
+  await page.keyboard.press("Escape");
+  await expect(input).toHaveCount(0);
+
+  await tab.dblclick();
+  await input.fill("Renamed from tab");
+  await input.press("Enter");
+  await expect(tab).toContainText("Renamed from tab");
+  await expect(page.locator(".side-item.ses", { hasText: "Renamed from tab" })).toBeVisible();
 });
 
 test("renaming a fresh session takes effect before its first message (#888)", async ({ page }) => {
@@ -3716,6 +4144,44 @@ test("side chat answers in a temporary side panel and can switch model", async (
   });
 });
 
+test("side chat composer matches the main input and keeps long drafts contained", async ({ page }, testInfo) => {
+  await enterApp(page);
+  await composer(page).fill("Check analysis progress");
+  await page.getByRole("button", { name: "Message options" }).click();
+  await page.getByRole("button", { name: "Side chat" }).click();
+  const panel = page.locator(".rightpane");
+  const input = panel.getByPlaceholder("Follow up…");
+  const frame = panel.locator(".sidechat-composer-inner");
+  await expect(frame).toBeVisible();
+  await expect(input).toHaveCSS("resize", "none");
+  await expect(input).toHaveCSS("border-top-width", "0px");
+  await expect(input).toHaveCSS("font-family", await composer(page).evaluate(el => getComputedStyle(el).fontFamily));
+  await expect(frame).toHaveCSS("border-radius", await page.locator(".composer-inner").evaluate(el => getComputedStyle(el).borderRadius));
+  await expect(frame.getByRole("button", { name: "Send", exact: true })).toBeDisabled();
+
+  // Escape must dismiss the menu immediately, while keeping the side panel open.
+  await panel.locator(".sidechat-model-btn").click();
+  await expect(panel.locator(".sidechat-model-menu")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(panel.locator(".sidechat-model-menu")).toHaveCount(0);
+  await expect(frame).toBeVisible();
+
+  await input.fill(Array.from({ length: 30 }, (_, i) => `Analysis step ${i}`).join("\n"));
+  await expect.poll(() => input.evaluate(el => el.scrollHeight > el.clientHeight)).toBe(true);
+  expect((await input.boundingBox())!.height).toBeLessThanOrEqual(180);
+  await expect(frame.getByRole("button", { name: "Send", exact: true })).toBeVisible();
+  await input.fill("Follow-up draft");
+  await expect.poll(async () => (await input.boundingBox())!.height).toBeLessThan(80);
+  await input.press("Shift+Enter");
+  await expect(input).toHaveValue("Follow-up draft\n");
+  await page.setViewportSize({ width: 960, height: 720 });
+  expect(await frame.evaluate(el => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1);
+  await page.screenshot({ path: testInfo.outputPath("side-chat-composer.png") });
+  await input.press("Enter");
+  await expect(panel.getByText("Side answer: Follow-up draft")).toBeVisible();
+  await expect(input).toHaveValue("");
+});
+
 test("side chat reports when the frozen conversation has no evidence", async ({ page }) => {
   await enterApp(page);
   await composer(page).fill("NO_EVIDENCE_TEST");
@@ -3760,6 +4226,39 @@ test("side chat stays at the latest message after sending and switching tabs", a
   await expect.poll(bottomGap).toBeLessThan(8);
 });
 
+test("clicking a PNG path opens the image preview without the selection popup", async ({ page }) => {
+  await enterApp(page);
+  await composer(page).fill("CLIPBOARDIMAGE");
+  await page.getByRole("button", { name: "Send" }).click();
+
+  const reply = page.locator(".msg.assistant", { hasText: "Saved the screenshots as local files" });
+  await expect(reply).toBeVisible({ timeout: 10_000 });
+  const pathLink = reply.locator("a", { hasText: "clipboard-preview.png" }).first();
+  await expect(pathLink).toBeVisible();
+
+  // Clicking a long Windows path often selects the link label. mouseup used to
+  // treat that leftover selection as a quote and stack the popup on the preview.
+  await pathLink.evaluate((el) => {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const selection = window.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, button: 0 }));
+  });
+  await expect(page.locator(".selection-popup")).toHaveCount(0);
+
+  await pathLink.click();
+  const modal = page.locator(".artifact-modal");
+  await expect(modal).toBeVisible();
+  await expect(modal.locator(".am-name")).toHaveText("clipboard-preview.png");
+  await expect(page.locator(".selection-popup")).toHaveCount(0);
+
+  await page.keyboard.press("Escape");
+  await expect(modal).toHaveCount(0);
+  await expect(reply).toBeVisible();
+});
+
 test("transcript selections add to the main composer without closing the right pane", async ({ page }) => {
   await enterApp(page);
   await composer(page).fill("STEPSDEMO");
@@ -3775,7 +4274,7 @@ test("transcript selections add to the main composer without closing the right p
   await expect(popup.getByRole("button", { name: "Add to chat" })).toBeVisible();
   await expect(popup.getByRole("button", { name: "Ask AI in the conversation" })).toHaveCount(0);
   await expect(popup.getByRole("button", { name: "Quote in side chat" })).toBeVisible();
-  await popup.getByRole("button", { name: "Add to chat" }).click();
+  await selectAssistantReplyTextAndClick(page, "Add to chat");
   await expect(page.locator(".composer-reference-chips .quote").last())
     .toContainText(selected.slice(0, 30));
   await expect(panel).toBeVisible();
@@ -3787,7 +4286,7 @@ test("transcript selections add to the main composer without closing the right p
   await expect(menu.getByRole("button", { name: "Add to chat" })).toBeVisible();
   await expect(menu.getByRole("button", { name: "Ask AI in the conversation" })).toHaveCount(0);
   await expect(menu.getByRole("button", { name: "Quote in side chat" })).toBeVisible();
-  await menu.getByRole("button", { name: "Add to chat" }).click();
+  await selectAssistantReplyTextAndClick(page, "Add to chat", "contextmenu");
   await expect(page.locator(".composer-reference-chips .quote")).toHaveCount(2);
   await expect(panel).toBeVisible();
 });
@@ -3798,11 +4297,7 @@ test("literature research prepares a skill-backed turn in the current conversati
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByText(/60,675 genes/)).toBeVisible({ timeout: 10_000 });
 
-  const selected = await selectAssistantReplyText(page);
-  const popup = page.locator(".selection-popup");
-  const action = popup.getByRole("button", { name: "Research literature" });
-  await expect(action).toBeVisible();
-  await action.click();
+  const selected = await selectAssistantReplyTextAndClick(page, "Research literature");
 
   await expect.poll(() => lastInvokeArgs(page, "run_quick_action")).toBeNull();
   await expect(page.locator(".selection-popup")).toHaveCount(0);
@@ -3829,9 +4324,11 @@ test("literature research from the right-click menu also stays in the composer",
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByText(/60,675 genes/)).toBeVisible({ timeout: 10_000 });
 
-  const selected = await selectAssistantReplyText(page, "contextmenu");
-  const menu = page.locator(".ctx-menu");
-  await menu.getByRole("button", { name: "Research literature" }).click();
+  const selected = await selectAssistantReplyTextAndClick(
+    page,
+    "Research literature",
+    "contextmenu",
+  );
 
   await expect.poll(() => lastInvokeArgs(page, "run_quick_action")).toBeNull();
   await expect(page.locator(".ctx-menu")).toHaveCount(0);
@@ -3863,14 +4360,17 @@ test("Quick Actions opens its bound graph in the standalone Workflow Studio", as
     return {
       inside: buttons.every((button) => button.left >= bounds.left
         && button.right <= bounds.right),
-      stacked: buttons.length === 2 && buttons[1].top > buttons[0].bottom,
+      singleEntry: buttons.length === 1,
     };
   });
-  expect(libraryLayout).toEqual({ inside: true, stacked: true });
+  expect(libraryLayout).toEqual({ inside: true, singleEntry: true });
   const studioBox = await studio.boundingBox();
   const viewport = page.viewportSize()!;
   expect(studioBox?.width ?? 0).toBeGreaterThan(viewport.width * 0.95);
   expect(studioBox?.height ?? 0).toBeGreaterThan(viewport.height * 0.85);
+  // The name is edited in the header, without opening Workflow configuration.
+  await expect(studio.getByTestId("workflow-name")).toBeVisible();
+  await expect(studio.getByTestId("workflow-name")).toHaveAttribute("maxlength", "100");
   await expect(studio.getByTestId("workflow-name"))
     .toHaveValue("Literature evidence review");
   const nodes = studio.getByTestId("workflow-graph-node");
@@ -3892,57 +4392,25 @@ test("Quick Actions opens its bound graph in the standalone Workflow Studio", as
 
   await nodes.filter({ hasText: "synthesize" })
     .getByTestId("workflow-graph-node-select")
-    .click();
+    .dblclick();
   const inspector = studio.getByTestId("workflow-graph-inspector");
   await expect(inspector.getByTestId("dynamic-task-id")).toHaveValue("synthesize");
+  await inspector.locator("details.dynamic-agent-advanced > summary").click();
+  const timeout = inspector.getByTestId("dynamic-task-timeout-secs");
+  await expect(timeout).toHaveAttribute("placeholder", "Empty = policy default; 0 = unlimited");
+  await timeout.fill("0");
+  await expect(timeout).toHaveValue("0");
   await expect(inspector.getByTestId("workflow-graph-remove-edge")).toHaveCount(2);
-  const skillPicker = inspector.getByTestId("dynamic-task-skills");
-  await expect(skillPicker.getByTestId("dynamic-task-skill-option")).toHaveCount(0);
-  await skillPicker.getByTestId("dynamic-task-skill-search").fill("literature");
-  await expect(skillPicker.getByTestId("dynamic-task-skill-option")).toHaveCount(1);
-  await expect(skillPicker.getByTestId("dynamic-task-skill-option"))
-    .toContainText("literature-review");
+  await expect(inspector.getByTestId("dynamic-task-skills")).toHaveCount(0);
 
-  const resizer = studio.getByTestId("workflow-graph-resizer");
-  await expect(resizer).toHaveAttribute("role", "separator");
-  const inspectorBeforeResize = await inspector.boundingBox();
-  await resizer.evaluate((handle) => {
-    const rect = handle.getBoundingClientRect();
-    const startX = rect.left + rect.width / 2;
-    const startY = rect.top + 60;
-    handle.dispatchEvent(new PointerEvent("pointerdown", {
-      bubbles: true,
-      button: 0,
-      pointerId: 17,
-      clientX: startX,
-      clientY: startY,
-    }));
-    handle.dispatchEvent(new PointerEvent("pointermove", {
-      bubbles: true,
-      buttons: 1,
-      pointerId: 17,
-      clientX: startX - 80,
-      clientY: startY,
-    }));
-    handle.dispatchEvent(new PointerEvent("pointerup", {
-      bubbles: true,
-      button: 0,
-      pointerId: 17,
-      clientX: startX - 80,
-      clientY: startY,
-    }));
-  });
-  await expect.poll(async () => {
-    const resized = await inspector.boundingBox();
-    return inspectorBeforeResize && resized
-      ? Math.round(resized.width - inspectorBeforeResize.width)
-      : 0;
-  }).toBeGreaterThan(60);
-  await expect(studio.getByTestId("workflow-graph-minimap")).toBeVisible();
+
+  await expect(inspector).toHaveAttribute("role", "dialog");
+  await page.keyboard.press("Escape");
+  const fitZoom = Number((await studio.getByTestId("workflow-graph-fit").innerText()).replace("%", ""));
   await studio.getByTestId("workflow-graph-zoom-in").click();
-  await expect(studio.getByTestId("workflow-graph-fit")).toHaveText("110%");
+  await expect(studio.getByTestId("workflow-graph-fit")).toHaveText(`${Math.min(fitZoom + 10, 140)}%`);
   await studio.getByTestId("workflow-graph-fit").click();
-  await expect(studio.getByTestId("workflow-graph-fit")).toHaveText("100%");
+  await expect(studio.getByTestId("workflow-graph-fit")).toHaveText(`${fitZoom}%`);
   await expect(studio.getByTestId("workflow-save")).toHaveText("Save as copy");
   const typography = await studio.evaluate((root) => {
     const save = root.querySelector('[data-testid="workflow-save"]')!;
@@ -4009,7 +4477,7 @@ test("Workflow library includes the Wisp-native seven-node method-search DAG", a
     '[data-testid="workflow-graph-node"][data-node-id="method_search"]',
   );
   await expect(activityNode).toHaveClass(/run-activity/);
-  await activityNode.getByTestId("workflow-graph-node-select").click();
+  await activityNode.getByTestId("workflow-graph-node-select").dblclick();
   const inspector = studio.getByTestId("workflow-graph-inspector");
   await expect(inspector.getByTestId("dynamic-task-type"))
     .toHaveValue("run_activity");
@@ -4018,24 +4486,26 @@ test("Workflow library includes the Wisp-native seven-node method-search DAG", a
     .toHaveValue("prepare_contract");
   await expect(inspector.getByTestId("run-activity-max-candidates")).toHaveValue("20");
   await expect(inspector.getByTestId("dynamic-task-capabilities")).toBeHidden();
-  await expect(inspector.getByTestId("dynamic-task-skills")).toBeHidden();
+  await expect(inspector.getByTestId("dynamic-task-skills")).toHaveCount(0);
   await expect(inspector.getByTestId("dynamic-task-specialist")).toBeHidden();
   await expect(studio.getByTestId("workflow-save")).toHaveText("Save as copy");
 });
 
-test("Skill Portfolio Planner uses the selected model and opens an unbudgeted editable DAG", async ({ page }) => {
+test("Workflow conversion uses the selected model and opens an unbudgeted editable DAG", async ({ page }) => {
   await enterApp(page);
   await openSettingsSection(page, "Workflows");
   const studio = page.getByTestId("workflow-studio");
 
-  await studio.getByTestId("portfolio-planner-open").click();
+  await page.getByTestId("workflow-new").click();
+  await page.getByTestId("portfolio-planner-open").click();
   await expect(page.getByTestId("portfolio-planner-overlay")).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(page.getByTestId("portfolio-planner-overlay")).toBeHidden();
 
-  await studio.getByTestId("portfolio-planner-open").click();
+  await page.getByTestId("workflow-new").click();
+  await page.getByTestId("portfolio-planner-open").click();
   await expect(page.getByTestId("portfolio-planner-overlay")).toContainText(
-    "Ask a selected model to build an explainable workflow",
+    "Turn method documents into a reusable workflow",
   );
   await expect(page.getByTestId("portfolio-tier")).toHaveCount(0);
   await expect(page.getByTestId("portfolio-total")).toHaveCount(0);
@@ -4043,42 +4513,35 @@ test("Skill Portfolio Planner uses the selected model and opens an unbudgeted ed
   await page.getByTestId("portfolio-model").selectOption("opus");
   await page.getByTestId("portfolio-request").fill("Design an oncology omics study");
   await page.getByTestId("portfolio-generate").click();
-  await expect.poll(() => lastInvokeArgs(page, "plan_skill_portfolio")).toEqual({
+  await expect.poll(() => lastInvokeArgs(page, "plan_skill_portfolio")).toMatchObject({
     request: {
       request: "Design an oncology omics study",
       model_id: "opus",
     },
   });
   const card = page.getByTestId("portfolio-plan-card");
-  await expect(card).toContainText("3 tasks · 2 Skills · planned by opus-4.8");
-  await expect(card).toContainText("Task budgets are unset");
-  await card.getByTestId("portfolio-edit-studio").click();
+  await expect(card).toContainText("3 nodes · 2 source methods · opus-4.8");
+  await expect(card).toContainText("Review instructions, requested permissions and output contracts");
+  await page.getByTestId("portfolio-edit-studio").click();
   await expect(studio.getByTestId("workflow-graph-node")).toHaveCount(3);
   await expect(studio.getByTestId("workflow-graph-edge")).toHaveCount(2);
 });
 
-test("Workflow Studio reuses the roundtable generator and saves a Quick Action binding", async ({ page }) => {
+test("Workflow Studio copies the roundtable template and saves a Quick Action binding", async ({ page }) => {
   await enterApp(page);
   await openSettingsSection(page, "Workflows");
   const studio = page.getByTestId("workflow-studio");
   await expect(studio).toBeVisible();
 
   await studio.getByTestId("workflow-new").click();
-  await studio.getByTestId("workflow-studio-config").locator(":scope > summary").click();
+  await page.getByTestId("workflow-new-use-template").click();
+  await page.getByTestId("workflow-new-template").filter({ hasText: "Roundtable" }).click();
   await studio.getByTestId("workflow-name").fill("Architecture roundtable");
   await studio.getByTestId("workflow-goal").fill("Choose a website architecture");
-  await studio.getByTestId("roundtable-template").locator("summary").click();
-  await studio.getByTestId("roundtable-apply").click();
+  await expect(studio.getByTestId("roundtable-template")).toHaveCount(0);
   await expect(studio.getByTestId("workflow-graph-node")).toHaveCount(5);
   await expect(studio.getByTestId("workflow-graph-edge")).toHaveCount(6);
-  const skillPicker = studio.getByTestId("workflow-graph-inspector")
-    .getByTestId("dynamic-task-skills");
-  await skillPicker.getByTestId("dynamic-task-skill-search").fill("analysis");
-  await skillPicker.getByTestId("dynamic-task-skill-option")
-    .filter({ hasText: "analysis-workflow" })
-    .click();
-  await expect(skillPicker.getByTestId("dynamic-task-selected-skills"))
-    .toContainText("analysis-workflow · bundled");
+  await expect(studio.getByTestId("dynamic-task-skills")).toHaveCount(0);
   await studio.getByTestId("workflow-save").click();
 
   await expect.poll(() => lastInvokeArgs(page, "save_workflow_template")).toMatchObject({
@@ -4088,7 +4551,7 @@ test("Workflow Studio reuses the roundtable generator and saves a Quick Action b
       proposal: {
         goal: "Choose a website architecture",
         tasks: [
-          { id: "seat_1_opening", depends_on: [], skill_ids: ["analysis-workflow"] },
+          { id: "seat_1_opening", depends_on: [], skill_ids: [] },
           { id: "seat_2_opening", depends_on: [] },
           {
             id: "seat_1_review",
@@ -4131,19 +4594,25 @@ test("Workflow graph edits nodes and dependencies directly on the canvas", async
   await openSettingsSection(page, "Workflows");
   const studio = page.getByTestId("workflow-studio");
   await studio.getByTestId("workflow-new").click();
-  await studio.getByTestId("workflow-studio-config").locator(":scope > summary").click();
+  await page.getByTestId("workflow-new-scratch").click();
   await studio.getByTestId("workflow-name").fill("Graph pipeline");
   await studio.getByTestId("workflow-goal").fill("Compare two branches");
+  await studio.getByTestId("workflow-graph-node-select").first().dblclick();
 
   const inspector = studio.getByTestId("workflow-graph-inspector");
   await inspector.getByTestId("dynamic-task-id").fill("fetch_a");
   await inspector.getByTestId("dynamic-task-instruction").fill("Fetch branch A");
+  await page.keyboard.press("Escape");
+  await studio.getByTestId("workflow-graph-add-menu-toggle").click();
   await studio.getByTestId("workflow-graph-add-node").click();
   await inspector.getByTestId("dynamic-task-id").fill("fetch_b");
   await inspector.getByTestId("dynamic-task-instruction").fill("Fetch branch B");
+  await page.keyboard.press("Escape");
+  await studio.getByTestId("workflow-graph-add-menu-toggle").click();
   await studio.getByTestId("workflow-graph-add-after").click();
   await inspector.getByTestId("dynamic-task-id").fill("merge");
   await inspector.getByTestId("dynamic-task-instruction").fill("Merge both branches");
+  await page.keyboard.press("Escape");
 
   const byId = (id: string) =>
     studio.locator(`[data-testid="workflow-graph-node"][data-node-id="${id}"]`);
@@ -4174,10 +4643,12 @@ test("Workflow graph edits nodes and dependencies directly on the canvas", async
   ).getByTestId("workflow-graph-edge-delete").click({ force: true });
   await expect(studio.getByTestId("workflow-graph-edge")).toHaveCount(1);
 
+  await byId("merge").getByTestId("workflow-graph-node-select").dblclick();
   await inspector.getByTestId("workflow-graph-remove-edge")
     .filter({ hasText: "fetch_b" })
     .click();
   await expect(studio.getByTestId("workflow-graph-edge")).toHaveCount(0);
+  await page.keyboard.press("Escape");
 
   await byId("fetch_b").getByTestId("workflow-graph-connect").click();
   await byId("merge").getByTestId("workflow-graph-node-select").click();
@@ -4199,6 +4670,7 @@ test("Workflow graph edits nodes and dependencies directly on the canvas", async
   await expect(studio.getByTestId("workflow-graph-node")).toHaveCount(nodeCountBeforeDblclick + 1);
   await inspector.getByTestId("dynamic-task-id").fill("fetch_c");
   await inspector.getByTestId("dynamic-task-instruction").fill("Fetch branch C");
+  await page.keyboard.press("Escape");
 
   await byId("fetch_a").getByTestId("workflow-graph-delete-node").click();
   await expect(studio.getByTestId("workflow-graph-node")).toHaveCount(3);
@@ -4220,14 +4692,22 @@ test("Workflow graph edits nodes and dependencies directly on the canvas", async
 
 test("selected text can be staged as a removable side-chat quote", async ({ page }) => {
   await enterApp(page);
+  await expect(page.getByTestId("session-runtime-strip")).toBeVisible();
   await composer(page).fill("STEPSDEMO");
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByText(/60,675 genes/)).toBeVisible({ timeout: 10_000 });
 
+  await expect(page.getByRole("button", { name: "Hide follow-up questions" })).toBeVisible();
   const selected = await selectAssistantReplyText(page);
-  await page.locator(".selection-popup")
-    .getByRole("button", { name: "Quote in side chat" })
-    .click();
+  const popup = page.locator(".selection-popup");
+  await expect(popup.getByRole("button", { name: "Quote in side chat" })).toBeVisible();
+  // Follow-scroll / composer resize must not steal the popup while the
+  // selection is still live — that is what failed ui-e2e on #1027.
+  await page.locator(".chat").evaluate((el) => {
+    el.scrollTop = Math.max(0, el.scrollTop - 8);
+  });
+  await expect(popup.getByRole("button", { name: "Quote in side chat" })).toBeVisible();
+  await popup.getByRole("button", { name: "Quote in side chat" }).click();
 
   const panel = page.locator(".rightpane");
   await expect(panel.locator(".sidechat-in-pane")).toBeVisible();
@@ -4241,9 +4721,8 @@ test("selected text can be staged as a removable side-chat quote", async ({ page
   await expect(panel.getByTestId("sidechat-quote")).toHaveCount(0);
 
   await selectAssistantReplyText(page);
-  await page.locator(".selection-popup")
-    .getByRole("button", { name: "Quote in side chat" })
-    .click();
+  await expect(popup.getByRole("button", { name: "Quote in side chat" })).toBeVisible();
+  await popup.getByRole("button", { name: "Quote in side chat" }).click();
   await input.fill("Why is this important?");
   await panel.getByRole("button", { name: "Send" }).click();
 
@@ -4261,7 +4740,7 @@ test("branch in new session starts a new frame from the current session", async 
   await enterApp(page);
   await composer(page).fill("seed context");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible({ timeout: 10_000 });
 
   await composer(page).fill("try another route");
   await page.getByRole("button", { name: "Message options" }).click();
@@ -4280,7 +4759,7 @@ test("branch on an earlier user message opens a new session from that point", as
   await enterApp(page);
   await composer(page).fill("first idea");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible({ timeout: 10_000 });
 
   await composer(page).fill("second idea");
   await page.getByRole("button", { name: "Send" }).click();
@@ -4309,12 +4788,12 @@ test("assistant actions are icon-only and can branch from the preceding user tur
   await enterApp(page);
   await composer(page).fill("branch from this answer");
   await page.getByRole("button", { name: "Send" }).click();
-  const assistant = page.locator(".msg.assistant").filter({ hasText: "Hello from mock wisp-science." }).first();
+  const assistant = page.locator(".msg.assistant").filter({ hasText: "Hello from mock wisp-depmap." }).first();
   await expect(assistant).toBeVisible({ timeout: 10_000 });
 
   await composer(page).fill("a later turn");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.locator(".msg.assistant").filter({ hasText: "Hello from mock wisp-science." })).toHaveCount(2);
+  await expect(page.locator(".msg.assistant").filter({ hasText: "Hello from mock wisp-depmap." })).toHaveCount(2);
 
   for (const name of ["Memory", "Review", "Branch"]) {
     const action = assistant.getByRole("button", { name, exact: true });
@@ -4334,7 +4813,7 @@ test("rewinding a middle message asks for confirmation", async ({ page }) => {
   await enterApp(page);
   await composer(page).fill("first idea");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible({ timeout: 10_000 });
 
   await composer(page).fill("second idea");
   await page.getByRole("button", { name: "Send" }).click();
@@ -4367,7 +4846,7 @@ test("rewind confirmation can branch instead", async ({ page }) => {
   await enterApp(page);
   await composer(page).fill("first idea");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible({ timeout: 10_000 });
 
   await composer(page).fill("second idea");
   await page.getByRole("button", { name: "Send" }).click();
@@ -4396,7 +4875,7 @@ test("Escape closes only the rewind confirmation modal and keeps the transcript"
   await enterApp(page);
   await composer(page).fill("first idea");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible({ timeout: 10_000 });
 
   await composer(page).fill("second idea");
   await page.getByRole("button", { name: "Send" }).click();
@@ -4421,9 +4900,9 @@ test("generic content menus do not expose session export", async ({ page }) => {
   await enterApp(page);
   await composer(page).fill("hello there");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible({ timeout: 10_000 });
 
-  await page.getByText("Hello from mock wisp-science.").click({ button: "right" });
+  await page.getByText("Hello from mock wisp-depmap.").click({ button: "right" });
   await expect(page.getByRole("button", { name: "Export session" })).toHaveCount(0);
   await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "Toggle panel" }).click();
@@ -4440,7 +4919,7 @@ test("uploaded file shows up in the artifacts panel after send", async ({ page }
   });
   await expect(page.locator(".composer-attachment.ready")).toHaveText("counts.csv");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible({ timeout: 10_000 });
   await expect.poll(async () => page.evaluate(() => {
     const calls = ((window as any).__skillInvokeLog ?? []).filter((c: any) => c.cmd === "send_message");
     const args = calls.at(-1)?.args;
@@ -4475,16 +4954,75 @@ test("Generated artifacts survive follow-up tool commentary and ignore mentioned
   await page.getByRole("button", { name: "Send" }).click();
 
   const reply = page.locator(".msg.assistant", {
-    hasText: "I inspected old.csv and created the requested output.",
+    hasText: "I inspected old.csv and created the requested output",
   });
   await expect(reply).toBeVisible({ timeout: 10_000 });
   await expect(reply.locator(".message-artifacts-label")).toHaveText("Generated · 1");
+  await reply.locator(".message-artifacts-label").click();
+  await reply.locator(".generated-directory > summary").filter({ hasText: "results" }).click();
   await expect(reply.locator('.message-artifact-card[data-artifact-name="new.png"]')).toBeVisible();
   await expect(reply.locator('.message-artifact-card[data-artifact-name="old.csv"]')).toHaveCount(0);
   await expect(reply.locator('.message-artifact-card[data-artifact-name="old.png"]')).toHaveCount(0);
   await expect(reply.locator('.message-artifact-card[data-artifact-name="old-report.md"]')).toHaveCount(0);
+  // Suggested/mentioned filenames are not workspace files unless they exist.
+  // Deleted temp paths stay as code even when they look like project files.
+  await expect(reply.locator('a.workspace-path-link[href="old.csv"]')).toHaveCount(0);
+  await expect(reply.locator("code").filter({ hasText: "old.csv" })).toHaveText("old.csv");
+  await expect(reply.locator('a.workspace-path-link[href=".cache/Figure-style-rbq.png"]')).toHaveCount(0);
+  await expect(reply.locator("code").filter({ hasText: ".cache/Figure-style-rbq.png" })).toHaveText(
+    ".cache/Figure-style-rbq.png",
+  );
   const pathLink = reply.locator('a.workspace-path-link[href="notes/FIGURE_LEGEND.md"]');
   await expect(pathLink).toHaveText("notes/FIGURE_LEGEND.md");
+  await expect.poll(async () => pathLink.evaluate((el) => {
+    const style = getComputedStyle(el);
+    return {
+      decoration: style.textDecorationLine,
+      shadow: style.boxShadow,
+      display: style.display,
+    };
+  })).toEqual({
+    decoration: "none",
+    shadow: "none",
+    display: "inline",
+  });
+
+  // Project paths in assistant replies own a file-focused context menu rather
+  // than falling through to the generic whole-message menu.
+  await pathLink.click({ button: "right" });
+  const pathMenu = page.locator(".ctx-menu");
+  await expect(pathMenu.getByRole("button", { name: "Open in center" })).toBeVisible();
+  await expect(pathMenu.getByRole("button", { name: "Copy absolute path" })).toBeVisible();
+  await expect(pathMenu.getByRole("button", { name: "Copy relative path" })).toBeVisible();
+  await expect(pathMenu.getByRole("button", { name: "Copy message" })).toHaveCount(0);
+  await pathMenu.getByRole("button", { name: "Show in file manager" }).click();
+  await expect.poll(() => lastInvokeArgs(page, "reveal_in_file_manager")).toMatchObject({
+    path: "notes/FIGURE_LEGEND.md",
+  });
+  await expect(page.locator(".artifact-modal")).toHaveCount(0);
+
+  // A generated file mentioned in the answer is rendered as an artifact chip,
+  // not a workspace-path anchor. It must own the same file menu and must not
+  // fall through to "Copy message" (the real-world #1048 regression).
+  const artifactPath = reply.locator('.art-ref[data-workspace-path="/mock/root/results/new.png"]');
+  await expect(artifactPath).toHaveText("new.png");
+  await artifactPath.click({ button: "right" });
+  await expect(pathMenu.getByRole("button", { name: "Open with default app" })).toBeVisible();
+  await expect(pathMenu.getByRole("button", { name: "Copy message" })).toHaveCount(0);
+  await pathMenu.getByRole("button", { name: "Open with default app" }).click();
+  await expect.poll(() => lastInvokeArgs(page, "open_workspace_path")).toMatchObject({
+    path: "results/new.png",
+  });
+
+  // Ordinary project-directory Markdown links share the same route.
+  const directoryPath = reply.locator('a[href="results/"]');
+  await directoryPath.click({ button: "right" });
+  await expect(pathMenu.getByRole("button", { name: "Open with default app" })).toBeVisible();
+  await pathMenu.getByRole("button", { name: "Show in file manager" }).click();
+  await expect.poll(() => lastInvokeArgs(page, "reveal_in_file_manager")).toMatchObject({
+    path: "results/",
+  });
+
   await pathLink.click();
   const linkedModal = page.locator('.artifact-modal:has(.am-figure[data-file-path="notes/FIGURE_LEGEND.md"])');
   await expect(linkedModal).toBeVisible();
@@ -4511,7 +5049,7 @@ test("links inside the artifact modal preview never navigate the app", async ({ 
   await page.getByRole("button", { name: "Send" }).click();
 
   const reply = page.locator(".msg.assistant", {
-    hasText: "I inspected old.csv and created the requested output.",
+    hasText: "I inspected old.csv and created the requested output",
   });
   await reply.locator('a.workspace-path-link[href="notes/FIGURE_LEGEND.md"]').click();
   const modal = page.locator('.artifact-modal:has(.am-figure[data-file-path="notes/FIGURE_LEGEND.md"])');
@@ -4545,7 +5083,7 @@ test("artifact category headers collapse and expand their tiles", async ({ page 
   await enterApp(page);
   await composer(page).fill("make a volcano plot volcano.png");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible({ timeout: 10_000 });
   await page.getByRole("button", { name: "Toggle panel" }).click();
 
   const tile = page.locator('.rp-tile[data-artifact-name="volcano.png"]');
@@ -4574,6 +5112,81 @@ test("dropped local file uploads and attaches to the composer", async ({ page })
     el.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: data }));
   });
   await expect(page.locator(".composer-attachment.ready")).toHaveText("dropped.csv");
+});
+
+for (const mode of ["list", "grid", "search"]) {
+  test(`workspace file drag attaches path context without upload (${mode})`, async ({ page }) => {
+    await enterApp(page);
+    await page.getByRole("button", { name: "Files", exact: true }).click();
+    if (mode === "grid") await page.getByRole("button", { name: "Grid view" }).click();
+    if (mode === "search") await page.locator(".fb-search").fill("counts");
+    const path = mode === "search" ? "counts.csv" : "report.csv";
+    const file = page.locator(`.fb-row[data-workspace-path="${path}"]`);
+    await expect(file).toHaveAttribute("draggable", "true");
+    await composer(page).fill("Inspect this file");
+    await file.dragTo(composer(page));
+    const cards = page.locator('[data-reference-kind="file-path"]');
+    await expect(cards).toHaveCount(1);
+    await expect(cards).toHaveAttribute("title", path);
+    await expect(composer(page)).toHaveValue("Inspect this file");
+    await expect(composer(page)).toBeFocused();
+    await expect(page.locator(".composer-inner")).not.toHaveClass(/composer-dragover/);
+    await page.screenshot({ path: test.info().outputPath(`workspace-drag-${mode}.png`) });
+    await file.dragTo(composer(page));
+    await expect(cards).toHaveCount(1);
+    await cards.getByRole("button").click();
+    await expect(cards).toHaveCount(0);
+    await file.dragTo(composer(page));
+    await page.getByRole("button", { name: "Send", exact: true }).click();
+    await expect.poll(() => lastInvokeArgs(page, "send_message")).toMatchObject({
+      message: `Inspect this file\n\nReferenced local file paths (not imported): ${JSON.stringify(path)}`,
+      attachments: [], references: [],
+    });
+    expect(await lastInvokeArgs(page, "upload_file")).toBeNull();
+    await expect(cards).toHaveCount(0);
+  });
+}
+
+test("workspace path drops preserve native paths and never upload accompanying bytes", async ({ page }) => {
+  await enterApp(page);
+  const paths = [String.raw`C:\研究 数据\photo.png`, "/Users/alice/研究 数据/photo.png"];
+  for (const path of paths) {
+    await composer(page).evaluate((el, path) => {
+      const data = new DataTransfer();
+      data.setData("application/x-wisp-workspace-path", path);
+      data.items.add(new File(["image bytes"], "photo.png", { type: "image/png" }));
+      el.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: data }));
+      el.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: data }));
+    }, path);
+  }
+  const cards = page.locator('[data-reference-kind="file-path"]');
+  await expect(cards).toHaveCount(2);
+  await expect(cards.first()).toHaveAttribute("title", paths[0]);
+  await expect(cards.last()).toHaveAttribute("title", paths[1]);
+  await expect(cards.locator("img")).toHaveCount(0);
+  expect(await lastInvokeArgs(page, "upload_file")).toBeNull();
+});
+
+test("workspace drag hover clears on cancellation and ignores text drags", async ({ page }) => {
+  await enterApp(page);
+  await page.getByRole("button", { name: "Files", exact: true }).click();
+  const file = page.locator('.fb-row[data-workspace-path="report.csv"]');
+  const data = await page.evaluateHandle(() => new DataTransfer());
+  await file.dispatchEvent("dragstart", { dataTransfer: data });
+  await composer(page).dispatchEvent("dragover", { dataTransfer: data });
+  await expect(page.locator(".composer-inner")).toHaveClass(/composer-dragover/);
+  await file.dispatchEvent("dragend", { dataTransfer: data });
+  await expect(page.locator(".composer-inner")).not.toHaveClass(/composer-dragover/);
+  await composer(page).evaluate(el => {
+    const data = new DataTransfer();
+    data.setData("text/plain", "session-id");
+    el.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: data }));
+    el.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: data }));
+  });
+  await expect(page.locator(".composer-inner")).not.toHaveClass(/composer-dragover/);
+  await expect(page.locator('[data-reference-kind="file-path"]')).toHaveCount(0);
+  expect(await lastInvokeArgs(page, "upload_file")).toBeNull();
+  await data.dispose();
 });
 
 test("workspace file context menu attaches its path to the composer", async ({ page }) => {
@@ -4627,7 +5240,7 @@ test("artifact tile attaches to the chat from its context and more menus", async
   await enterApp(page);
   await composer(page).fill("make a volcano plot volcano.png");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible({ timeout: 10_000 });
   await page.getByRole("button", { name: "Toggle panel" }).click();
 
   const tile = page.locator('.rp-tile[data-artifact-name="volcano.png"]');
@@ -4891,11 +5504,31 @@ test("saving a changed agent context asks for confirmation", async ({ page }) =>
   await settings.getByRole("button", { name: "Save", exact: true }).click();
   await confirm.getByRole("button", { name: "Save agent context", exact: true }).click();
   await expect.poll(() => lastInvokeArgs(page, "update_project")).toMatchObject({
-    name: "wisp-science",
+    name: "wisp-depmap",
     agentContext: "Prefer the project UI setting.",
   });
   await expect(settings).toHaveCount(0);
   await expect(page.locator(".copy-toast")).toHaveCount(0);
+});
+
+test("a project default Specialist is inherited by every new conversation", async ({ page }) => {
+  await enterApp(page);
+  await page.locator(".proj-switch").click();
+  await page.getByRole("button", { name: "Project settings" }).click();
+
+  const settings = page.locator(".proj-settings-modal");
+  const defaultAgent = settings.getByTestId("project-default-specialist");
+  await expect(defaultAgent).toBeVisible();
+  await defaultAgent.selectOption("depmap_r_agent");
+  await settings.getByRole("button", { name: "Save", exact: true }).click();
+  await expect.poll(() => lastInvokeArgs(page, "update_project")).toMatchObject({
+    defaultSpecialistId: "depmap_r_agent",
+  });
+
+  await newSessionButton(page).click();
+  await expect(page.locator(".session-specialist")).toHaveText("DepMap Agent");
+  await newSessionButton(page).click();
+  await expect(page.locator(".session-specialist")).toHaveText("DepMap Agent");
 });
 
 test("center structure and FASTA previews fill the available height", async ({ page }) => {
@@ -4944,7 +5577,9 @@ test("script previews show source while unknown file types are explicitly unsupp
 
   // An extension no mime claims (#307: pixi.toml) is still text — preview it.
   await openInCenter("pixi.toml");
-  await expect(page.locator(".center-file-preview .rp-code-body code")).toHaveClass(/language-ini/);
+  const tomlCode = page.locator(".center-file-preview .rp-code-body code");
+  await expect(tomlCode).toHaveClass(/language-ini/);
+  await expect(tomlCode.locator(".hljs-string")).toHaveText('"x"');
   await expect(page.locator(".center-file-preview")).toContainText("[project]");
 
   await openInCenter("protocol.rtf");
@@ -5017,6 +5652,33 @@ test("selected workspace code tells the agent to edit its source and refreshes a
   await expect(preview.locator(".rp-code-body code")).toContainText("plot(df$x, df$y)");
 });
 
+test("same-value writes never remount the right pane or center preview", async ({ page }) => {
+  await enterApp(page);
+  const filesButton = page.locator(".side-btn", { hasText: "Files" });
+  await filesButton.click();
+  await page.locator('[data-workspace-path="analysis.R"]').click({ button: "right" });
+  await page.locator(".ctx-menu").getByRole("button", { name: "Open in center" }).click();
+  const preview = page.locator('.center-file-preview[data-file-path="analysis.R"]');
+  await expect(preview.locator(".rp-code-body code")).toContainText("plot(1:3)");
+  await expect(page.locator(".rightpane")).toBeVisible();
+  await page.evaluate(() => {
+    (document.querySelector(".rightpane") as any).__mounted = true;
+    (document.querySelector(".center-file-preview") as any).__mounted = true;
+  });
+
+  // Both surfaces animate in from opacity 0; rebuilding them for an unchanged
+  // value is the visible flash. Re-opening the already-open Files tab and a
+  // FileChanged for some other path are both same-value writes for them.
+  await filesButton.click();
+  await emitTauriEvent(page, "agent", { kind: "FileChanged", frame_id: "t1", path: "/mock/root/other.txt" });
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(resolve)));
+  expect(await page.evaluate(() => [
+    Boolean((document.querySelector(".rightpane") as any)?.__mounted),
+    Boolean((document.querySelector(".center-file-preview") as any)?.__mounted),
+  ])).toEqual([true, true]);
+  await expect(preview).toHaveAttribute("data-file-revision", "0");
+});
+
 test("notebook preview renders saved rich outputs without active content", async ({ page }) => {
   await enterApp(page);
   await page.getByRole("button", { name: "Files" }).click();
@@ -5055,7 +5717,7 @@ test("notebook preview renders saved rich outputs without active content", async
   await expect.poll(() => page.evaluate(() => Boolean((window as any).__notebookPwned))).toBe(false);
 });
 
-test("R scripts expose variables and console while only selected code can run", async ({ page }) => {
+test("R scripts expose variables and console and run selected code", async ({ page }) => {
   await enterApp(page);
   await page.getByRole("button", { name: "Files" }).click();
   await page.locator('[data-workspace-path="analysis.R"]').click({ button: "right" });
@@ -5069,20 +5731,21 @@ test("R scripts expose variables and console while only selected code can run", 
   await expect(binding.locator("option")).toHaveText(["R · gpu-server"]);
   await expect(binding).toHaveValue("ssh:gpu-server");
 
-  // The AI-first source preview has no whole-file run or direct-edit action.
   const filePreview = page.locator(".center-file-preview");
-  await expect(filePreview.getByRole("button", { name: "Run this script in its runtime" })).toHaveCount(0);
+  await expect(filePreview.getByRole("button", { name: "Run script" })).toBeVisible();
   await expect(filePreview.getByRole("button", { name: "Rewind" })).toHaveCount(0);
 
-  // The replacement control opens the bound runtime's variable rail and an
-  // initially empty console without executing the file.
+  // The replacement control opens the RStudio-style workbench: variable rail,
+  // an initially empty console, and an empty plots pane — without executing
+  // the file.
   await expect(page.locator(".center-file-console")).toHaveCount(0);
   await page.getByRole("button", { name: "Show runtime variables and console" }).click();
   await expect(page.locator(".center-runtime-environment")).toBeVisible();
-  await expect(page.locator(".center-file-console")).toContainText("Selected-code output will appear here.");
+  await expect(page.locator(".center-file-console")).toContainText("Run selected code or type in the prompt below");
+  await expect(page.locator(".center-runtime-plots")).toContainText("Plots from executed code appear here.");
 
-  // Selecting code offers the only execution path from the source preview.
-  // highlight.js splits the source into spans, so select one it produces.
+  // Selecting code still offers the floating execution path from the source
+  // preview. highlight.js splits the source into spans, so select one it produces.
   await page.locator(".center-file-preview .rp-code-body .hljs-string").evaluate((el) => {
     const range = document.createRange();
     range.selectNodeContents(el);
@@ -5091,7 +5754,18 @@ test("R scripts expose variables and console while only selected code can run", 
     selection.addRange(range);
     window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
   });
-  await page.locator(".selection-popup").getByRole("button", { name: "Run in runtime" }).click();
+  const popup = page.locator(".selection-popup");
+  await expect(popup).toHaveClass(/selection-popup-code/);
+  await expect(popup).toHaveCSS("flex-direction", "column");
+  await expect(popup.getByRole("button")).toHaveText([
+    "Run in runtime",
+    "Ask AI in the conversation",
+    "Quote in side chat",
+    "Explain in side chat",
+  ]);
+  await expect(popup.getByRole("button", { name: "Research literature" })).toHaveCount(0);
+  await expect(popup.getByRole("button", { name: "Add to review" })).toHaveCount(0);
+  await popup.getByRole("button", { name: "Run in runtime" }).click();
   await expect.poll(() => lastInvokeArgs(page, "execute_runtime")).toMatchObject({
     contextId: "ssh:gpu-server",
     language: "r",
@@ -5109,34 +5783,287 @@ test("R scripts expose variables and console while only selected code can run", 
   await expect(page.locator(".center-file-preview")).toHaveCSS("overflow", "hidden");
   await expect(page.locator(".center-file-console")).not.toHaveCSS("position", "sticky");
 
-  // Variables stay to the right of the source and span the bounded console.
+  // RStudio quadrants: source top-left, console below it, variables top-right,
+  // plots below the variables.
   const dockLayout = await page.locator(".center-file-preview").evaluate((preview) => {
     const source = preview.querySelector(".rp-code")!.getBoundingClientRect();
     const console_ = preview.querySelector(".center-file-console")!.getBoundingClientRect();
     const environment = preview.querySelector(".center-runtime-environment")!.getBoundingClientRect();
+    const plots = preview.querySelector(".center-runtime-plots")!.getBoundingClientRect();
     return {
+      sourceTop: Math.round(source.top),
       sourceBottom: Math.round(source.bottom),
       sourceRight: Math.round(source.right),
       consoleTop: Math.round(console_.top),
-      consoleHeight: Math.round(console_.height),
-      consoleBottom: Math.round(console_.bottom),
+      consoleRight: Math.round(console_.right),
       environmentLeft: Math.round(environment.left),
       environmentTop: Math.round(environment.top),
       environmentBottom: Math.round(environment.bottom),
-      sourceTop: Math.round(source.top),
-      viewportHeight: window.innerHeight,
+      plotsLeft: Math.round(plots.left),
+      plotsTop: Math.round(plots.top),
     };
   });
   expect(dockLayout.consoleTop).toBeGreaterThanOrEqual(dockLayout.sourceBottom);
-  expect(dockLayout.consoleHeight).toBeLessThanOrEqual(Math.round(dockLayout.viewportHeight * 0.28) + 1);
   expect(dockLayout.environmentLeft).toBeGreaterThanOrEqual(dockLayout.sourceRight);
   expect(dockLayout.environmentTop).toBeLessThanOrEqual(dockLayout.sourceTop);
-  expect(dockLayout.environmentBottom).toBeGreaterThanOrEqual(dockLayout.consoleBottom);
+  expect(dockLayout.plotsLeft).toBeGreaterThanOrEqual(dockLayout.consoleRight - 1);
+  expect(dockLayout.plotsTop).toBeGreaterThanOrEqual(dockLayout.environmentBottom);
 
   // Clearing empties the log without closing the inspector or runtime.
   await page.getByRole("button", { name: "Clear console" }).click();
-  await expect(page.locator(".center-file-console")).toContainText("Selected-code output will appear here.");
+  await expect(page.locator(".center-file-console")).toContainText("Run selected code or type in the prompt below");
   await expect(page.locator(".center-runtime-environment")).toBeVisible();
+});
+
+test("the runtime console prompt executes typed code and captures plots", async ({ page }) => {
+  await enterApp(page);
+  await page.getByRole("button", { name: "Files" }).click();
+  await page.locator('[data-workspace-path="analysis.R"]').click({ button: "right" });
+  await page.locator(".ctx-menu").getByRole("button", { name: "Open in center" }).click();
+  await page.getByRole("button", { name: "Show runtime variables and console" }).click();
+
+  // Typing at the prompt runs against the bound runtime, echoes the input,
+  // and appends the result — the RStudio console loop.
+  const prompt = page.getByRole("textbox", { name: "Console input" });
+  await expect(page.getByRole("button", { name: "Run console input (Enter)" })).toBeVisible();
+  await prompt.fill("summary(x)");
+  await prompt.press("Enter");
+  await expect.poll(() => lastInvokeArgs(page, "execute_runtime")).toMatchObject({
+    contextId: "ssh:gpu-server",
+    language: "r",
+    code: "summary(x)",
+  });
+  const console_ = page.locator(".center-file-console pre");
+  await expect(console_).toContainText("> summary(x)");
+  await expect(console_).toContainText("[r @ ssh:gpu-server] summary(x)");
+  await expect(prompt).toHaveValue("");
+
+  // A plotting command fills the bottom-right plots pane with the snapshot
+  // the runtime captured; non-plotting commands leave it untouched.
+  await expect(page.locator(".center-runtime-plots img")).toHaveCount(0);
+  await prompt.fill("plot(1:3)");
+  await prompt.press("Enter");
+  await expect(page.locator(".center-runtime-plots img")).toHaveCount(1);
+  await expect(page.locator(".center-runtime-plots-counter")).toHaveCount(0);
+
+  // A second plot arrives selected; paging moves through the history.
+  await prompt.fill("plot(4:6)");
+  await prompt.press("Enter");
+  await expect(page.locator(".center-runtime-plots-counter")).toHaveText("2 / 2");
+  await page.getByRole("button", { name: "Previous plot" }).click();
+  await expect(page.locator(".center-runtime-plots-counter")).toHaveText("1 / 2");
+  await page.getByRole("button", { name: "Next plot" }).click();
+  await expect(page.locator(".center-runtime-plots-counter")).toHaveText("2 / 2");
+
+  // ArrowUp recalls submitted history for editing.
+  await prompt.press("ArrowUp");
+  await expect(prompt).toHaveValue("plot(4:6)");
+  await prompt.press("ArrowUp");
+  await expect(prompt).toHaveValue("plot(1:3)");
+  await prompt.press("ArrowDown");
+  await expect(prompt).toHaveValue("plot(4:6)");
+
+  // The prompt is a real multi-line editor: Shift+Enter adds a line, while
+  // the visible Run action submits the complete cell.
+  await prompt.fill("x <- 1");
+  await prompt.press("Shift+Enter");
+  await prompt.type("x + 1");
+  await expect(prompt).toHaveValue("x <- 1\nx + 1");
+  await page.getByRole("button", { name: "Run console input (Enter)" }).click();
+  await expect.poll(() => lastInvokeArgs(page, "execute_runtime")).toMatchObject({
+    contextId: "ssh:gpu-server",
+    language: "r",
+    code: "x <- 1\nx + 1",
+  });
+  await expect(prompt).toHaveValue("");
+  await prompt.press("ArrowUp");
+  await expect(prompt).toHaveValue("plot(4:6)");
+  await prompt.fill("");
+
+  // Clearing the pane empties the history without touching the console.
+  await page.getByRole("button", { name: "Clear plots" }).click();
+  await expect(page.locator(".center-runtime-plots")).toContainText("Plots from executed code appear here.");
+  await expect(console_).toContainText("[r @ ssh:gpu-server] plot(4:6)");
+});
+
+test("R sources are editable, save back to the workspace, and run selections", async ({ page }) => {
+  await enterApp(page);
+  await page.getByRole("button", { name: "Files" }).click();
+  await page.locator('[data-workspace-path="analysis.R"]').click({ button: "right" });
+  await page.locator(".ctx-menu").getByRole("button", { name: "Open in center" }).click();
+
+  const editor = page.getByRole("textbox", { name: "Source editor" });
+  await expect(editor).toHaveValue('library(Seurat)\nin_dir <- "data"\nplot(1:3)\n');
+  // No save affordance until the source changes.
+  await expect(page.locator("[data-editor-save]")).toHaveCount(0);
+
+  await editor.fill("library(Seurat)\nplot(4:6)\n");
+  // The highlighted mirror and the gutter follow the draft.
+  await expect(page.locator(".center-file-preview .rp-code-body")).toContainText("plot(4:6)");
+  await expect(page.locator(".center-file-preview .rp-code-gutter")).toHaveText("1\n2\n3");
+
+  // Ctrl+S persists through the workspace-scoped save command.
+  await editor.press("Control+s");
+  await expect.poll(() => lastInvokeArgs(page, "save_file")).toMatchObject({
+    path: "analysis.R",
+    content: "library(Seurat)\nplot(4:6)\n",
+  });
+  await expect(page.locator("[data-editor-save]")).toHaveCount(0);
+
+  // Selecting inside the editor still raises the quote popup with Run.
+  await editor.evaluate((element) => {
+    const textarea = element as HTMLTextAreaElement;
+    textarea.focus();
+    const start = textarea.value.indexOf("plot(4:6)");
+    textarea.setSelectionRange(start, start + "plot(4:6)".length);
+    window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+  });
+  const selectedMark = page.locator(".rp-code-selection-layer mark");
+  await expect(selectedMark).toHaveText("plot(4:6)");
+  await expect(page.locator(".rp-code-selection-status")).toHaveText("Selected line 2");
+  // Focused: native ::selection is the live paint so dragging is not delayed.
+  const nativeSelection = await editor.evaluate((element) =>
+    getComputedStyle(element, "::selection").backgroundColor);
+  expect(nativeSelection).not.toBe("rgba(0, 0, 0, 0)");
+  await page.locator(".selection-popup").getByRole("button", { name: "Run in runtime" }).click();
+  await expect.poll(() => lastInvokeArgs(page, "execute_runtime")).toMatchObject({
+    contextId: "ssh:gpu-server",
+    language: "r",
+    code: "plot(4:6)",
+  });
+
+  // Ctrl/⌘+Enter is the fast path. With a collapsed caret it runs the current
+  // statement and advances to the next one; a persistent Run button exposes
+  // the same behavior to users who have not learned the shortcut yet.
+  await expect(page.locator("[data-editor-run]")).toBeVisible();
+  await editor.evaluate((element) => {
+    const textarea = element as HTMLTextAreaElement;
+    textarea.focus();
+    textarea.setSelectionRange(0, 0);
+  });
+  await editor.press("Control+Enter");
+  await expect.poll(() => lastInvokeArgs(page, "execute_runtime")).toMatchObject({
+    contextId: "ssh:gpu-server",
+    language: "r",
+    code: "library(Seurat)",
+  });
+  await expect.poll(() => editor.evaluate((element) =>
+    (element as HTMLTextAreaElement).selectionStart)).toBe("library(Seurat)\n".length);
+
+  await editor.evaluate((element) => {
+    const textarea = element as HTMLTextAreaElement;
+    const start = textarea.value.indexOf("plot(4:6)");
+    textarea.focus();
+    textarea.setSelectionRange(start, start + "plot(4:6)".length);
+  });
+  await editor.press("Control+Enter");
+  await expect.poll(() => lastInvokeArgs(page, "execute_runtime")).toMatchObject({
+    contextId: "ssh:gpu-server",
+    language: "r",
+    code: "plot(4:6)",
+  });
+
+  // A parenthesized call is one statement: caret on the first line sends both,
+  // then advances past the whole call. Dragging across those lines updates the
+  // toolbar before mouseup — the previous overlay only painted on select.
+  await editor.fill("sce <- FindVariableFeatures(sce,\n  verbose = FALSE)\nplot(1)\n");
+  await editor.evaluate((element) => {
+    const textarea = element as HTMLTextAreaElement;
+    textarea.focus();
+    textarea.setSelectionRange(0, 0);
+  });
+  await editor.press("Control+Enter");
+  await expect.poll(() => lastInvokeArgs(page, "execute_runtime")).toMatchObject({
+    contextId: "ssh:gpu-server",
+    language: "r",
+    code: "sce <- FindVariableFeatures(sce,\n  verbose = FALSE)",
+  });
+  await expect.poll(() => editor.evaluate((element) =>
+    (element as HTMLTextAreaElement).selectionStart)).toBe(
+      "sce <- FindVariableFeatures(sce,\n  verbose = FALSE)\n".length,
+    );
+
+  const box = (await editor.boundingBox())!;
+  await page.mouse.move(box.x + 24, box.y + 20);
+  await page.mouse.down();
+  await page.mouse.move(box.x + 80, box.y + 42, { steps: 6 });
+  await expect.poll(() => editor.evaluate((element) => {
+    const textarea = element as HTMLTextAreaElement;
+    return textarea.selectionEnd - textarea.selectionStart;
+  })).toBeGreaterThan(0);
+  await expect(page.locator(".rp-code-selection-status")).toHaveText(/Selected lines 1–2/);
+  await page.mouse.up();
+
+  // The save button path: edit again and click Save.
+  await editor.fill("plot(7:9)\n");
+  await page.locator("[data-editor-save]").click();
+  await expect.poll(() => lastInvokeArgs(page, "save_file")).toMatchObject({
+    path: "analysis.R",
+    content: "plot(7:9)\n",
+  });
+
+  // Whole-script run reads the saved file in the bound runtime. A dirty draft
+  // is persisted first so the reported hash matches the buffer the user sees.
+  await page.getByRole("button", { name: "Run script" }).click();
+  await expect.poll(() => lastInvokeArgs(page, "execute_runtime_script")).toMatchObject({
+    contextId: "ssh:gpu-server",
+    language: "r",
+    scriptPath: "analysis.R",
+  });
+  await expect(page.locator(".center-file-console")).toContainText("path=analysis.R");
+
+  await editor.fill("plot(10:12)\n");
+  await editor.press("Control+Shift+Enter");
+  await expect.poll(() => lastInvokeArgs(page, "save_file")).toMatchObject({
+    path: "analysis.R",
+    content: "plot(10:12)\n",
+  });
+  await expect.poll(() => lastInvokeArgs(page, "execute_runtime_script")).toMatchObject({
+    contextId: "ssh:gpu-server",
+    language: "r",
+    scriptPath: "analysis.R",
+  });
+});
+
+test("runtime workbench dividers resize the quadrants by dragging", async ({ page }) => {
+  await enterApp(page);
+  await page.getByRole("button", { name: "Files" }).click();
+  await page.locator('[data-workspace-path="analysis.R"]').click({ button: "right" });
+  await page.locator(".ctx-menu").getByRole("button", { name: "Open in center" }).click();
+  await page.getByRole("button", { name: "Show runtime variables and console" }).click();
+  await expect(page.locator(".center-runtime-environment")).toBeVisible();
+
+  // Dragging the vertical divider left widens the environment/plots column.
+  const environment = page.locator(".center-runtime-environment");
+  const environmentBefore = (await environment.boundingBox())!;
+  const colDivider = (await page.locator(".center-runtime-col-resizer").boundingBox())!;
+  await page.mouse.move(colDivider.x + 2, colDivider.y + colDivider.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(colDivider.x - 120, colDivider.y + colDivider.height / 2);
+  await page.mouse.up();
+  const environmentAfter = (await environment.boundingBox())!;
+  expect(environmentAfter.width).toBeGreaterThan(environmentBefore.width + 80);
+
+  // Dragging the horizontal divider up makes the console/plots row taller.
+  const console_ = page.locator(".center-file-console");
+  const consoleBefore = (await console_.boundingBox())!;
+  const rowDivider = (await page.locator(".center-runtime-row-resizer").boundingBox())!;
+  await page.mouse.move(rowDivider.x + rowDivider.width / 2, rowDivider.y + 2);
+  await page.mouse.down();
+  await page.mouse.move(rowDivider.x + rowDivider.width / 2, rowDivider.y - 100);
+  await page.mouse.up();
+  const consoleAfter = (await console_.boundingBox())!;
+  expect(consoleAfter.height).toBeGreaterThan(consoleBefore.height + 60);
+
+  // Escape cancels an in-progress divider drag (topmost layer only).
+  const divider = (await page.locator(".center-runtime-col-resizer").boundingBox())!;
+  await page.mouse.move(divider.x + 2, divider.y + divider.height / 2);
+  await page.mouse.down();
+  await expect(page.locator(".drag-overlay")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".drag-overlay")).toHaveCount(0);
+  await expect(page.locator(".center-runtime-environment")).toBeVisible();
+  await page.mouse.up();
 });
 
 test("a Python script rebinds to another execution context", async ({ page }) => {
@@ -5189,7 +6116,8 @@ test("files with no persistent runtime have no run control", async ({ page }) =>
 
   // .toml highlights as code but has no runtime to bind to.
   await expect(page.getByRole("combobox", { name: "Runtime this script runs in" })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Run this script in its runtime" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Run script" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Run", exact: true })).toHaveCount(0);
 });
 
 test("Files browses registered SSH contexts without a real remote host", async ({ page }) => {
@@ -5249,6 +6177,65 @@ test("Files uploads local paths to the selected SSH folder", async ({ page }) =>
   await expect(page.locator("#copy-toast")).toContainText("Uploading 1 item");
 });
 
+for (const shortcut of ["Control+v", "Meta+v"]) {
+  test(`copied system files paste as removable path context without upload (${shortcut})`, async ({ page }) => {
+    await enterApp(page);
+    const paths = [String.raw`C:\研究 数据\mcp.html`, String.raw`C:\研究 数据\photo.png`];
+    await page.evaluate(paths => { (window as any).__clipboardFilePaths = paths; }, paths);
+    // Windows can deliver only keydown when CF_HDROP is on the clipboard.
+    // Dispatch the shortcut without pasting the test machine's real clipboard:
+    // parallel clipboard tests may have written unrelated text there.
+    await composer(page).evaluate((el, shortcut) => {
+      el.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "v", code: "KeyV", bubbles: true, cancelable: true,
+        ctrlKey: shortcut === "Control+v", metaKey: shortcut === "Meta+v",
+      }));
+    }, shortcut);
+    const cards = page.locator('[data-reference-kind="file-path"]');
+    await expect(cards).toHaveCount(2);
+    await expect(cards.first()).toHaveAttribute("title", paths[0]);
+    await expect(cards.first()).toContainText("mcp.html");
+    await expect(cards.locator("img")).toHaveCount(0);
+    // Some WebViews also expose an image paste event for a copied image file.
+    await composer(page).evaluate(el => {
+      const data = new DataTransfer();
+      data.items.add(new File(["image"], "photo.png", { type: "image/png" }));
+      el.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: data }));
+    });
+    await expect(cards).toHaveCount(2);
+    await cards.first().getByRole("button").click();
+    await expect(cards).toHaveCount(1);
+    await page.getByRole("button", { name: "Send", exact: true }).click();
+    await expect.poll(() => lastInvokeArgs(page, "send_message")).toMatchObject({
+      message: `Referenced local file paths (not imported): ${JSON.stringify(paths[1])}`,
+      attachments: [], references: [],
+    });
+    await expect.poll(() => page.evaluate(() =>
+      ((window as any).__skillInvokeLog ?? []).filter((c: any) => c.cmd === "upload_file").length
+    )).toBe(0);
+    await expect(cards).toHaveCount(0);
+  });
+
+}
+
+test("file URI paste decodes paths while ordinary text paste stays native", async ({ page }) => {
+  await enterApp(page);
+  await composer(page).evaluate(el => {
+    const data = new DataTransfer();
+    data.setData("text/uri-list", "# file reference\r\nfile:///home/alice/my%20data.csv\r\nhttps://example.com");
+    el.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: data }));
+  });
+  await expect(page.locator('[data-reference-kind="file-path"]')).toHaveAttribute("title", "/home/alice/my data.csv");
+  expect(await composer(page).evaluate(el => {
+    const data = new DataTransfer();
+    data.setData("text/plain", "plain text");
+    data.setData("text/uri-list", "https://example.com");
+    const event = new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: data });
+    el.dispatchEvent(event);
+    return event.defaultPrevented;
+  })).toBe(false);
+});
+
 test("pasted image attaches to the composer", async ({ page }) => {
   await enterApp(page);
   await composer(page).evaluate((el) => {
@@ -5262,7 +6249,7 @@ test("pasted image attaches to the composer", async ({ page }) => {
   await expect(page.locator(".composer-attachment.ready")).toHaveText(/pasted_image_\d+_1\.png/);
   await expect(page.locator(".composer-attachment-row.image img")).toBeVisible();
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible({ timeout: 10_000 });
   await expect.poll(async () => page.evaluate(() => {
     const calls = ((window as any).__skillInvokeLog ?? []).filter((c: any) => c.cmd === "send_message");
     const args = calls.at(-1)?.args;
@@ -5280,7 +6267,12 @@ test("compute menu selects remote resources per session", async ({ page }) => {
 
   const menu = await openComputeMenu(page);
   await expect(menu).toBeVisible();
+  await expect(menu.getByText("Click a server to attach it to this chat.")).toBeVisible();
   await expect(menu.getByRole("button", { name: "Local", exact: true })).toHaveCount(0);
+  await expect(menu.getByRole("button", { name: "Add SSH host…" })).toBeVisible();
+  const defaultSelect = menu.getByTestId("compute-default-analysis");
+  await expect(defaultSelect).toHaveValue("");
+  await expect(defaultSelect).toContainText("Local by default");
   const search = menu.getByRole("searchbox", { name: "Search servers" });
   await search.fill("missing");
   await expect(menu.locator('[data-context-id="ssh:gpu-server"]')).toHaveCount(0);
@@ -5290,6 +6282,7 @@ test("compute menu selects remote resources per session", async ({ page }) => {
   await expect(server).toHaveCSS("display", "grid");
   await expect(menu.getByRole("button", { name: "Manage environments in Settings" })).toBeVisible();
   await expect(server).not.toHaveClass(/enabled/);
+  await expect(server).toContainText("Not in this chat");
   await server.click();
   await expect.poll(() => lastInvokeArgs(page, "set_session_execution_context_enabled")).toMatchObject({
     sessionId: expect.any(String),
@@ -5297,6 +6290,7 @@ test("compute menu selects remote resources per session", async ({ page }) => {
     enabled: true,
   });
   const firstSession = (await lastInvokeArgs(page, "set_session_execution_context_enabled")).sessionId;
+  await expect(server).toContainText("In this chat");
   await expect(page.locator(".composer-compute")).toHaveClass(/has-resource/);
 
   await page.keyboard.press("Escape");
@@ -5311,27 +6305,74 @@ test("compute menu selects remote resources per session", async ({ page }) => {
 test("compute menu sets and clears a default analysis environment", async ({ page }) => {
   await enterApp(page);
 
-  const menu = await openComputeMenu(page);
+  const agentMenu = await openAgentMenu(page);
+  await expect(agentMenu.getByRole("button", { name: /^Compute/ })).toContainText("Local by default");
+  await agentMenu.getByRole("button", { name: /^Compute/ }).click();
+  const menu = page.getByRole("menu", { name: "Compute" });
   const server = menu.locator('[data-context-id="ssh:gpu-server"]');
   await expect(server.locator(".compute-resource-default")).toHaveCount(0);
-  await server.getByRole("button", { name: "Set as default analysis environment" }).click();
+  await server.getByRole("button", { name: "Set as this chat's default" }).click();
+  await expect.poll(() => lastInvokeArgs(page, "set_session_default_execution_context")).toMatchObject({
+    contextId: "ssh:gpu-server",
+  });
+  expect(await lastInvokeArgs(page, "set_default_execution_context")).toBeNull();
+  await expect(server).toHaveClass(/enabled/);
+  await expect(server.locator(".compute-resource-default")).toHaveText("Default");
+  await expect(server).toContainText("In this chat");
+  await expect(agentMenu.getByRole("button", { name: /^Compute/ })).toContainText("Default gpu-server");
+
+  await server.getByRole("button", { name: "Use local in this chat" }).click();
+  await expect.poll(async () =>
+    (await lastInvokeArgs(page, "set_session_default_execution_context"))?.contextId ?? null
+  ).toBeNull();
+  await expect(server.locator(".compute-resource-default")).toHaveCount(0);
+  await expect(agentMenu.getByRole("button", { name: /^Compute/ })).toContainText("1 remote");
+});
+
+test("new chats snapshot the global default without rewriting older chats", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Environments");
+  await page.getByTestId("default-analysis-environment").selectOption("ssh:gpu-server");
   await expect.poll(() => lastInvokeArgs(page, "set_default_execution_context")).toMatchObject({
     contextId: "ssh:gpu-server",
   });
-  // Setting the default also selects it for the current session.
-  await expect.poll(() => lastInvokeArgs(page, "set_session_execution_context_enabled")).toMatchObject({
-    sessionId: expect.any(String),
-    contextId: "ssh:gpu-server",
-    enabled: true,
-  });
+  await page.getByRole("button", { name: "Back to app" }).click();
+  await newSessionButton(page).click();
+
+  const agentMenu = await openAgentMenu(page);
+  await expect(agentMenu.getByRole("button", { name: /^Compute/ })).toContainText("Default gpu-server");
+  await expect(page.locator(".composer-compute")).toHaveClass(/has-resource/);
+  await agentMenu.getByRole("button", { name: /^Compute/ }).click();
+  const server = page.getByRole("menu", { name: "Compute" })
+    .locator('[data-context-id="ssh:gpu-server"]');
   await expect(server).toHaveClass(/enabled/);
   await expect(server.locator(".compute-resource-default")).toHaveText("Default");
+  await expect(server).toContainText("In this chat");
+  await expect(page.getByTestId("session-runtime-strip")
+    .locator('[data-testid="session-runtime-group"][data-runtime-context="ssh:gpu-server"]'))
+    .toBeVisible();
+});
 
-  await server.getByRole("button", { name: "Remove default" }).click();
-  await expect.poll(async () =>
-    (await lastInvokeArgs(page, "set_default_execution_context"))?.contextId ?? null
-  ).toBeNull();
-  await expect(server.locator(".compute-resource-default")).toHaveCount(0);
+test("compute menu default is isolated per conversation", async ({ page }) => {
+  await enterApp(page);
+
+  const firstMenu = await openComputeMenu(page);
+  await firstMenu.locator('[data-context-id="ssh:gpu-server"]')
+    .getByRole("button", { name: "Set as this chat's default" })
+    .click();
+  await expect.poll(() => lastInvokeArgs(page, "set_session_default_execution_context")).toMatchObject({
+    contextId: "ssh:gpu-server",
+  });
+  expect(await lastInvokeArgs(page, "set_default_execution_context")).toBeNull();
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("Escape");
+
+  await newSessionButton(page).click();
+  const secondMenu = await openComputeMenu(page);
+  await expect(secondMenu.getByTestId("compute-default-analysis")).toHaveValue("");
+  await expect(secondMenu.locator('[data-context-id="ssh:gpu-server"]'))
+    .not.toHaveClass(/enabled/);
+  await expect(page.getByRole("button", { name: /^Compute/ })).toContainText("Local by default");
 });
 
 test("environment panel attaches and detaches remote servers", async ({ page }) => {
@@ -5415,6 +6456,27 @@ test("first server enable asks for storage locations and the rail can edit them"
   await attach.locator('.context-attach-row[data-context-id="ssh:gpu-server"]').click();
   await expect(page.locator(".context-card", { hasText: "ssh:gpu-server" })).toBeVisible();
   await expect(dialog).toHaveCount(0);
+});
+
+test("settings sets the default analysis environment", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Environments");
+
+  const select = page.getByTestId("default-analysis-environment");
+  await expect(select).toBeVisible();
+  await expect(select).toHaveValue("");
+  await expect(select).toContainText("Local by default");
+  await expect(select).toContainText("gpu-server");
+  await select.selectOption("ssh:gpu-server");
+  await expect.poll(() => lastInvokeArgs(page, "set_default_execution_context")).toMatchObject({
+    contextId: "ssh:gpu-server",
+  });
+
+  await page.getByRole("button", { name: "Back to app" }).click();
+  const agentMenu = await openAgentMenu(page);
+  await expect(agentMenu.getByRole("button", { name: /^Compute/ })).toContainText("Default gpu-server");
+  await agentMenu.getByRole("button", { name: /^Compute/ }).click();
+  await expect(page.getByTestId("compute-default-analysis")).toHaveValue("ssh:gpu-server");
 });
 
 test("settings manages servers and probes them with the default environment skill", async ({ page }) => {
@@ -5510,6 +6572,28 @@ test("environment probe shows progress and classifies password authentication fa
   await expect(modal).toContainText("SSH password authentication failed");
   await expect(modal).toContainText("saved password may be wrong or outdated");
   await expect(server.getByRole("status")).toHaveCount(0);
+});
+
+test("environment probe classifies an old local OpenSSH client", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Environments");
+  await page.evaluate(() => {
+    const context = (window as any).__mockExecutionContexts.find(
+      (item: any) => item.id === "ssh:gpu-server",
+    );
+    context.last_probe_status = "error";
+    context.last_probe_error =
+      "Local OpenSSH is too old for Wisp (found OpenSSH 8.1, need 8.4 or later). Password authentication uses SSH_ASKPASS_REQUIRE, which OpenSSH added in 8.4. (while using `ssh:gpu-server`)";
+  });
+
+  const server = page.locator('.environment-settings-row[data-context-id="ssh:gpu-server"]');
+  await server.getByRole("button", { name: "Probe context" }).click();
+
+  const modal = page.getByTestId("ssh-connectivity-modal");
+  await expect(modal).toBeVisible();
+  await expect(modal).toContainText("Local OpenSSH is too old");
+  await expect(modal).toContainText("Run `ssh -V` in a terminal");
+  await expect(modal).toContainText("Windows inbox OpenSSH 8.1");
 });
 
 test("missing optional uname output does not fail an otherwise usable SSH probe", async ({ page }) => {
@@ -5640,8 +6724,11 @@ test("agent menu updates review, reviewer model, and memory preferences", async 
     .toMatchObject({ policy: "inline", autoResume: false });
   await expect(autoResume).toHaveCount(0);
 
-  await menu.locator("label.agent-menu-row", { hasText: "Auto-review" }).click();
-  await expect.poll(() => lastInvokeArgs(page, "set_auto_review_enabled")).toMatchObject({ enabled: true });
+  const autoReview = menu.locator("label.agent-menu-row", { hasText: "Auto-review" });
+  await autoReview.click();
+  await expect.poll(() => lastInvokeArgs(page, "set_auto_review_enabled"))
+    .toMatchObject({ sessionId: expect.stringMatching(/^s-/), enabled: true });
+  await expect(autoReview.locator('input[type="checkbox"]')).toBeChecked();
 
   await menu.getByRole("button", { name: /^Reviewer model/ }).click();
   await page.getByRole("menu", { name: "Reviewer model" })
@@ -5692,60 +6779,43 @@ test("agent menu updates review, reviewer model, and memory preferences", async 
   await expect(page.getByRole("menu", { name: "Reviewer model" })).toBeVisible();
 });
 
-test("project research graph opens from the sidebar in list and graph views", async ({ page }) => {
+test("auto-review stays with the session that enabled it", async ({ page }) => {
   await enterApp(page);
-
-  const sidebar = page.locator(".sidebar");
-  const navLabels = await sidebar.locator(".nav > .side-btn").allTextContents();
-  expect(navLabels.indexOf("Research graph")).toBe(navLabels.indexOf("Publication") - 1);
-  expect(navLabels.indexOf("Publication")).toBe(navLabels.indexOf("Library") - 1);
-
-  await sidebar.getByRole("button", { name: "Research graph", exact: true }).click();
-  const modal = page.getByTestId("research-graph-modal");
-  await expect(modal).toBeVisible();
+  await enableDelegation(page);
+  let menu = await openAgentMenu(page);
+  await menu.locator("label.agent-menu-row", { hasText: "Auto-review" }).click();
+  await expect.poll(() => lastInvokeArgs(page, "set_auto_review_enabled")).toMatchObject({ enabled: true });
   await page.keyboard.press("Escape");
-  await expect(modal).toHaveCount(0);
 
-  await sidebar.getByRole("button", { name: "Research graph", exact: true }).click();
-  await expect(modal).toBeVisible();
-  await expect(modal.locator(".research-graph-heading h2")).toHaveCSS("font-family", /Source Serif/);
-  await expect(modal).toContainText("5 nodes · 3 relationships");
-  await expect(modal.getByTestId("research-graph-list")).toBeVisible();
-  await expect(modal.getByText("Use DESeq2 over edgeR")).toBeVisible();
-  await expect(modal).toContainText("applies to");
-  await expect(modal).toContainText("confidence: high");
-  await modal.getByRole("button", { name: "cites: Love et al. 2014" }).click();
-  const edgeDetail = modal.getByTestId("research-edge-detail");
-  await expect(edgeDetail).toContainText("Use DESeq2 over edgeR → Love et al. 2014");
-  await expect(edgeDetail).toContainText("confidence");
-  await expect(edgeDetail).toContainText("high");
+  await newSessionButton(page).click();
+  menu = await openAgentMenu(page);
+  await expect(menu.locator("label.agent-menu-row", { hasText: "Auto-review" })
+    .locator('input[type="checkbox"]')).not.toBeChecked();
+});
+
+test("research relationships remain available inside the daily journey", async ({ page }) => {
+  await enterApp(page);
+  await page.locator(".sidebar").getByRole("button", { name: "Research journey", exact: true }).click();
+  const journey = page.getByTestId("research-journey");
+  await expect(journey).toBeVisible();
   await page.keyboard.press("Escape");
-  await expect(edgeDetail).toHaveCount(0);
-  await expect(modal).toBeVisible();
-  await expect.poll(async () => (await invokeArgsList(page, "get_research_graph")).length).toBe(2);
-
-  await modal.getByRole("tab", { name: "Graph", exact: true }).click();
-  const canvas = modal.getByTestId("research-graph-canvas");
-  await expect(canvas).toBeVisible();
-  await expect(canvas.locator(".research-graph-node")).toHaveCount(5);
-  await expect(canvas.locator(".research-graph-edge")).toHaveCount(3);
-  const metadataEdge = canvas.getByRole("button", { name: /cites.*confidence: high/ });
-  await expect(metadataEdge.locator("title")).toContainText("evidence: Methods section");
-  await metadataEdge.click();
-  await expect(modal.getByTestId("research-edge-detail")).toContainText("Methods section");
-
+  await expect(journey).toHaveCount(0);
+  await page.locator(".sidebar").getByRole("button", { name: "Research journey", exact: true }).click();
+  await journey.getByRole("tab", { name: "Relationships", exact: true }).click();
+  await expect(journey).toContainText("5 nodes · 3 relationships");
+  await journey.getByRole("button", { name: "cites: Love et al. 2014" }).click();
+  await expect(journey.getByTestId("research-edge-detail")).toContainText("Methods section");
   await page.keyboard.press("Escape");
-  await expect(modal.getByTestId("research-edge-detail")).toHaveCount(0);
-  await expect(modal).toBeVisible();
-
+  await expect(journey.getByTestId("research-edge-detail")).toHaveCount(0);
+  await expect(journey).toBeVisible();
+  await journey.getByRole("button", { name: "Graph", exact: true }).click();
+  await expect(journey.locator(".research-graph-node")).toHaveCount(5);
+  await journey.getByTestId("research-graph-canvas").getByRole("button", { name: /cites.*confidence: high/ }).click();
   await page.keyboard.press("Escape");
-  await expect(modal).toHaveCount(0);
-
-  await page.getByRole("button", { name: "Toggle panel" }).click();
-  const rightPanel = page.locator(".rightpane");
-  await rightPanel.getByRole("button", { name: "Add panel" }).click();
-  await expect(rightPanel.locator(".rp-tab-add-menu")
-    .getByRole("button", { name: /Research graph/ })).toHaveCount(0);
+  await expect(journey.getByTestId("research-edge-detail")).toHaveCount(0);
+  await expect(journey).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(journey).toHaveCount(0);
 });
 
 test("registered Artifact opens publication binding and Escape keeps Workspace open", async ({ page }) => {
@@ -5778,7 +6848,8 @@ test("Run surface binds an exact publication evidence source", async ({ page }) 
   await expect(run.locator(".run-use-publication")).toBeVisible();
   await run.getByRole("button", { name: "Use in publication" }).click();
   const dialog = page.getByTestId("publication-binding-dialog");
-  await expect(dialog).toContainText("run-kinase-001");
+  await expect(dialog).toContainText("Kinase screen QC");
+  await expect(runsModal).toHaveCount(0);
   await dialog.locator("textarea").fill("Methods parameters and QC evidence");
   await dialog.getByRole("button", { name: "Bind exact evidence" }).click();
 
@@ -5788,7 +6859,7 @@ test("Run surface binds an exact publication evidence source", async ({ page }) 
       sourceId: "run-kinase-001",
       purpose: "Methods parameters and QC evidence",
       selectionState: "selected",
-      visibility: "public",
+      visibility: "private",
     },
   });
   await expect(dialog).toHaveCount(0);
@@ -5977,11 +7048,97 @@ test("method-search Run reviews the frozen contract before start and exposes con
   await expect(details).toContainText("Cancelled");
 });
 
+test("publication is an independent project page and source selection binds an exact version", async ({ page }) => {
+  await enterApp(page, "/?mockPublication=draft");
+  await page.locator(".sidebar").getByRole("button", { name: "Publication", exact: true }).click();
+  const workspace = page.getByTestId("publication-workspace");
+  await expect(workspace).toHaveAttribute("role", "region");
+  await expect(page.locator(".sidebar")).toBeVisible();
+  await expect(page.locator(".workspace-main")).toBeHidden();
+  await page.keyboard.press("Escape");
+  await expect(workspace).toBeVisible();
+  await workspace.getByTestId("add-publication-evidence").click();
+  await page.locator(".publication-source-choice", {hasText:"figure2b.png"}).click();
+  await page.getByTestId("publication-source-continue").click();
+  const binding = page.getByTestId("publication-binding-dialog");
+  await binding.locator("textarea").fill("Use the reviewed version for Figure 2B");
+  await binding.getByRole("button", { name: "Bind exact evidence" }).click();
+  await expect.poll(() => lastInvokeArgs(page, "bind_publication_evidence")).toMatchObject({input:{sourceKind:"artifact_version",sourceId:"artifact-version-original-v3",visibility:"private"}});
+  await expect(page.getByTestId("publication-evidence-card")).toContainText("Use the reviewed version");
+  await page.locator('[data-session-id="publication-session"]').click();
+  await expect(workspace).toHaveCount(0);
+  await expect(page.locator(".workspace-main")).toBeVisible();
+});
+
+test("publication conversation picker translates selected Chinese and emoji to UTF-8 bytes", async ({ page }) => {
+  await enterApp(page, "/?mockPublication=draft");
+  await page.locator(".sidebar").getByRole("button", { name: "Publication", exact: true }).click();
+  await page.getByTestId("add-publication-evidence").click();
+  await page.getByRole("button", { name: "Research conversations", exact: true }).click();
+  await page.locator(".publication-source-choice").click();
+  const preview=page.getByRole("textbox",{name:"Persisted message text"});
+  await preview.evaluate((element: HTMLTextAreaElement) => {
+    element.focus(); element.setSelectionRange(1,5); element.dispatchEvent(new Event("select",{bubbles:true}));
+  });
+  await page.getByTestId("publication-source-continue").click();
+  const binding = page.getByTestId("publication-binding-dialog");
+  await binding.locator("textarea").fill("The original decision passage");
+  await binding.getByRole("button", { name: "Bind exact evidence" }).click();
+  await expect.poll(async () => {
+    const args=await lastInvokeArgs(page,"bind_publication_evidence");
+    return args?.input?.sourceId ? JSON.parse(args.input.sourceId) : null;
+  }).toEqual({byte_start:1,byte_end:11,frame_id:"publication-session",message_seq:7});
+});
+
+test("publication checks before locking and policy changes invalidate the check", async ({ page }) => {
+  await enterApp(page, "/?mockPublication=draft");
+  await page.locator(".sidebar").getByRole("button", { name: "Publication", exact: true }).click();
+  await page.getByRole("button", { name: "Finalization check", exact: true }).click();
+  const confirm=page.getByTestId("freeze-publication");
+  await expect(confirm).toBeDisabled();
+  await page.getByTestId("check-publication").click();
+  await expect(confirm).toBeEnabled();
+  expect(await invokeArgsList(page,"freeze_publication_revision")).toHaveLength(0);
+  await expect(page.locator(".publication-toolbar .publication-state")).toHaveText("Draft");
+  await page.locator(".publication-policy-inline select").selectOption("public");
+  await expect(confirm).toBeDisabled();
+  await page.locator(".publication-policy-inline input[type=checkbox]").nth(0).check();
+  await page.locator(".publication-policy-inline input[type=checkbox]").nth(1).check();
+  await page.getByTestId("check-publication").click();
+  await expect(confirm).toBeEnabled();
+  await confirm.click();
+  await expect.poll(() => lastInvokeArgs(page,"freeze_publication_revision")).toMatchObject({policy:{target_visibility:"public",phi_pii_reviewed:true,redistribution_reviewed:true}});
+  await expect(page.locator(".publication-toolbar .publication-state")).toHaveText("Frozen");
+  await page.getByRole("button", { name: "Version history", exact: true }).click();
+  await expect(page.locator(".publication-version-row")).toContainText("Submission");
+});
+
+test("publication page keeps its evidence and actions within the available width", async ({ page }) => {
+  await enterApp(page, "/?mockPublication=frozen");
+  await page.locator(".sidebar").getByRole("button", { name: "Publication", exact: true }).click();
+  for (const width of [1280, 900, 600]) {
+    await page.setViewportSize({width,height:900});
+    await expect(page.getByTestId("publication-workspace")).toBeVisible();
+    expect(await page.locator(".publication-page").evaluate(el => el.scrollWidth <= el.clientWidth+1)).toBe(true);
+  }
+  await page.setViewportSize({width:1280,height:900});
+  if (process.env.WISP_PUBLICATION_SHOTS) {
+    mkdirSync(process.env.WISP_PUBLICATION_SHOTS,{recursive:true});
+    await page.screenshot({path:resolve(process.env.WISP_PUBLICATION_SHOTS,"publication-evidence.png")});
+    await page.getByRole("button",{name:"Finalization check",exact:true}).click();
+    await page.screenshot({path:resolve(process.env.WISP_PUBLICATION_SHOTS,"publication-check.png")});
+    await page.getByRole("button",{name:"Version history",exact:true}).click();
+    await page.screenshot({path:resolve(process.env.WISP_PUBLICATION_SHOTS,"publication-versions.png")});
+  }
+});
+
 test("precise message evidence uses a stable locator and Escape closes only the top layer", async ({ page }) => {
   await enterApp(page, "/?mockPublication=draft");
   await page.locator(".sidebar").getByRole("button", { name: "Publication", exact: true }).click();
 
   const workspace = page.getByTestId("publication-workspace");
+  await workspace.getByTestId("add-publication-evidence").click();
+  await workspace.locator(".publication-advanced summary").click();
   await workspace.getByTestId("add-precise-publication-evidence").click();
   await expect(page.getByTestId("publication-anchor-dialog")).toBeVisible();
   await page.keyboard.press("Escape");
@@ -6020,6 +7177,7 @@ test("Frozen Publication is read-only and exposes exact source plus late-capture
 
   const workspace = page.getByTestId("publication-workspace");
   await expect(workspace).toBeVisible();
+  await workspace.locator(".publication-technical summary").click();
   await expect(workspace.getByTestId("publication-exact-source"))
     .toHaveText("artifact-version-late-v4");
   await expect(workspace).toContainText("historical_content_unverified");
@@ -6217,6 +7375,92 @@ test("active SSH transfer shows a live progress card and can be cancelled", asyn
   });
 });
 
+test("unmeasured relay shows elapsed activity and collapses without cancelling", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    const now = Math.floor(Date.now() / 1000);
+    const run = (window as any).__mockRuns.find((item: any) => item.id === "run-local-002");
+    Object.assign(run, {
+      frame_id: "s-complete", context_id: "ssh:gpu-server", title: "Relay source to destination",
+      kind: "file_transfer", status: "running", started_at: now - 65, ended_at: null,
+      progress_json: JSON.stringify({
+        phase: "uploading", direction: "relay", indeterminate: true,
+        completed_bytes: 0, total_bytes: Math.floor(2.58 * 1024 ** 3),
+        files_completed: 0, files_total: 1, current_file: "reads.fastq.gz",
+        bytes_per_second: null, eta_seconds: null, updated_at: now - 65,
+      }),
+    });
+  });
+  await page.getByTestId("recent-session-card").nth(1).click();
+  const card = page.locator('.transfer-card[data-run-id="run-local-002"]');
+  await expect(card).toContainText("2.58 GB total");
+  await expect(card).toContainText("byte progress unavailable");
+  await expect(card).not.toContainText("0%");
+  await expect(card).not.toContainText("ETA");
+  await expect(card.locator("progress")).not.toHaveAttribute("value");
+  const elapsed = await card.locator(".transfer-elapsed").innerText();
+  await expect.poll(() => card.locator(".transfer-elapsed").innerText()).not.toBe(elapsed);
+  await card.screenshot({ path: test.info().outputPath("relay-expanded.png") });
+  // A higher surface consumes Escape first; the transfer tray stays expanded.
+  await composer(page).press("@");
+  await expect(page.locator(".mention-menu")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".mention-menu")).toBeHidden();
+  await expect(card).toBeVisible();
+  const fullHeight = (await card.boundingBox())!.height;
+  await card.getByRole("button", { name: "Collapse transfers" }).click();
+  const summary = page.getByRole("button", { name: "Expand transfers" });
+  await expect(summary).toBeVisible();
+  await expect(summary).toContainText("Transfers (1)");
+  expect((await summary.boundingBox())!.height).toBeLessThan(fullHeight);
+  await expect(card).toBeHidden();
+  // Polls and the one-second clock must preserve the user's collapsed state.
+  await page.waitForTimeout(2200);
+  await expect(summary).toBeVisible();
+  await summary.click();
+  await expect(card).toBeVisible();
+  // No focus movement into the newly expanded tray before Escape.
+  await page.keyboard.press("Escape");
+  await expect(summary).toBeVisible();
+  await expect(newSessionButton(page)).toBeVisible();
+  expect(await lastInvokeArgs(page, "cancel_run")).toBeNull();
+  await summary.click();
+  await card.getByRole("button", { name: "Cancel run" }).click();
+  await expect.poll(() => lastInvokeArgs(page, "cancel_run")).toMatchObject({ runId: "run-local-002" });
+});
+
+test("unknown-size download is indeterminate and completion restores measured progress", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    const run = (window as any).__mockRuns.find((item: any) => item.id === "run-local-002");
+    Object.assign(run, {
+      frame_id: "s-complete", kind: "file_transfer", status: "running", ended_at: null,
+      progress_json: JSON.stringify({
+        phase: "downloading", direction: "download", indeterminate: true,
+        completed_bytes: 0, total_bytes: 0, files_completed: 0, files_total: 0,
+        current_file: null, bytes_per_second: null, eta_seconds: null,
+        updated_at: Math.floor(Date.now() / 1000),
+      }),
+    });
+  });
+  await page.getByTestId("recent-session-card").nth(1).click();
+  const card = page.locator('.transfer-card[data-run-id="run-local-002"]');
+  await expect(card).toContainText("Byte progress unavailable");
+  await expect(card.locator("progress")).not.toHaveAttribute("value");
+  await page.evaluate(() => {
+    const run = (window as any).__mockRuns.find((item: any) => item.id === "run-local-002");
+    run.status = "succeeded";
+    run.ended_at = Math.floor(Date.now() / 1000);
+    run.progress_json = JSON.stringify({ ...JSON.parse(run.progress_json),
+      phase: "downloaded", indeterminate: false, total_bytes: 1024, completed_bytes: 1024,
+      updated_at: run.ended_at,
+    });
+  });
+  await expect(card).toContainText("1.00 KB / 1.00 KB · 100%");
+  await expect(card.locator("progress")).toHaveAttribute("value", "100");
+  await expect(card).toBeHidden({ timeout: 5000 });
+});
+
 test("completed SSH transfer cards leave the composer tray promptly", async ({ page }) => {
   await page.goto("/");
   await page.evaluate(() => {
@@ -6267,6 +7511,10 @@ test("completed SSH transfer cards leave the composer tray promptly", async ({ p
   });
   await expect(card).toContainText("Download complete");
   await expect(card).toBeHidden({ timeout: 5_000 });
+  // Crossing another shared-clock tick must not remount an expired card after
+  // the transfer tray has dropped its clock dependency.
+  await page.waitForTimeout(1_200);
+  await expect(card).toBeHidden();
 });
 
 test("monitor_run renders a live Run card from summary polls and on-demand detail", async ({ page }) => {
@@ -6643,7 +7891,7 @@ test("image generation shows a placeholder and replaces it with the PNG", async 
   await expect(card).toHaveAttribute("data-status", "completed", { timeout: 3_000 });
   const image = card.locator("img");
   await expect(image).toBeVisible();
-  await expect(image).toHaveAttribute("src", /^data:image\/png;base64,/);
+  await expect(image).toHaveAttribute("src", /^blob:/);
   await expect(card.locator(".image-generation-spinner")).toHaveCount(0);
 });
 
@@ -6662,7 +7910,7 @@ test("video generation shows a placeholder and replaces it with the MP4", async 
   await expect(card).toHaveAttribute("data-status", "completed", { timeout: 3_000 });
   const video = card.locator("video");
   await expect(video).toBeVisible();
-  await expect(video).toHaveAttribute("src", /^data:video\/mp4;base64,/);
+  await expect(video).toHaveAttribute("src", /^blob:/);
   await expect(video).toHaveAttribute("preload", "metadata");
   await expect(card.locator(".video-generation-spinner")).toHaveCount(0);
 });
@@ -6826,6 +8074,21 @@ test("runtime panel shows lifecycle state and controls start stop restart", asyn
   });
 });
 
+test("terminated runtimes can be dismissed without restarting their interpreter", async ({ page }) => {
+  await enterApp(page);
+  await selectRemoteContext(page);
+  await page.getByRole("button", { name: "Toggle panel" }).click();
+  await page.getByRole("button", { name: "Environment", exact: true }).click();
+  await page.locator(".context-card", { hasText: "ssh:gpu-server" }).getByRole("button", { name: "View runtimes" }).click();
+  const runtime = page.locator('.runtime-card[data-runtime-id="runtime-python-ssh"]');
+  await expect(runtime.getByRole("button", { name: "Dismiss", exact: true })).toHaveCount(0);
+  await runtime.getByRole("button", { name: "Stop", exact: true }).click();
+  await runtime.getByRole("button", { name: "Dismiss", exact: true }).click();
+  await expect.poll(() => lastInvokeArgs(page, "dismiss_runtime")).toEqual({ runtimeId: "runtime-python-ssh" });
+  await expect(runtime).toHaveCount(0);
+  await expect(page.locator('.runtime-card[data-runtime-language="python"][data-runtime-context="ssh:gpu-server"]')).toContainText("Not started");
+});
+
 test("runtime inspector lists object metadata without loading object contents", async ({ page }) => {
   await enterApp(page);
   await selectRemoteContext(page);
@@ -6924,6 +8187,109 @@ test("runtime inspector lists object metadata without loading object contents", 
   await page.keyboard.press("Escape");
   await expect(rEnvironment).toHaveCount(0);
   await expect(page.locator(".rightpane")).toBeVisible();
+});
+
+test("pinned runtime environment stays on screen after the window shrinks", async ({ page }) => {
+  await page.setViewportSize({ width: 1600, height: 900 });
+  await enterApp(page);
+  await page.getByTestId("session-runtime-strip")
+    .locator('[data-runtime-language="r"][data-runtime-context="local"]')
+    .click();
+  const environment = page.getByRole("region", { name: "R Environment" });
+  await expect(environment).toBeVisible();
+  await environment.getByRole("button", { name: "Pin environment to conversation" }).click();
+  await expect(environment).toHaveClass(/is-pinned/);
+  await expectInsideViewport(environment, 1600, 900);
+
+  // Restoring a maximized window used to leave the pin at the old right-edge
+  // coordinates, so it vanished until the window was maximized again.
+  await page.setViewportSize({ width: 900, height: 640 });
+  await expect(environment).toBeVisible();
+  await expect.poll(async () => {
+    const box = await environment.boundingBox();
+    if (!box) return false;
+    return box.x >= 0
+      && box.y >= 0
+      && box.x + box.width <= 900
+      && box.y + box.height <= 640;
+  }).toBe(true);
+
+  await page.setViewportSize({ width: 1600, height: 900 });
+  await expect(environment).toBeVisible();
+  await expectInsideViewport(environment, 1600, 900);
+});
+
+test("conversation runtime strip shows bound servers and opens R/Python environments", async ({ page }) => {
+  await enterApp(page);
+  const strip = page.getByTestId("session-runtime-strip");
+  await expect(strip).toBeVisible();
+  const local = strip.locator('[data-testid="session-runtime-group"][data-runtime-context="local"]');
+  await expect(local.getByTestId("session-runtime-chip")).toHaveCount(2);
+  await expect(local.locator('[data-runtime-language="python"]')).toContainText("Ready");
+  await expect(local.locator('[data-runtime-language="r"]')).toContainText("Dead");
+  await expect(strip.locator('[data-testid="session-runtime-group"][data-runtime-context="ssh:gpu-server"]')).toHaveCount(0);
+
+  await selectRemoteContext(page);
+  const remote = strip.locator('[data-testid="session-runtime-group"][data-runtime-context="ssh:gpu-server"]');
+  await expect(remote).toBeVisible();
+  await expect(remote.locator('[data-runtime-language="python"]')).toContainText("Busy");
+
+  await local.locator('[data-runtime-language="python"]').click();
+  const dialog = page.getByRole("dialog", { name: "Runtimes" });
+  await expect(dialog).toBeVisible();
+  await expect(page.getByRole("region", { name: "Python Environment" })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await expect(strip).toBeVisible();
+
+  await local.locator('[data-runtime-language="r"]').click();
+  await expect(page.getByRole("dialog", { name: "Runtimes" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "R Environment" })).toBeVisible();
+});
+
+test("an agent r cell refreshes the open R memory environment without manual sync", async ({ page }) => {
+  await enterApp(page);
+  const strip = page.getByTestId("session-runtime-strip");
+  const rChip = strip.locator('[data-runtime-language="r"][data-runtime-context="local"]');
+  await expect(rChip).toContainText("Dead");
+  await rChip.click();
+  const environment = page.getByRole("region", { name: "R Environment" });
+  await expect(environment).toBeVisible();
+  // Dead runtime: nothing to inspect yet, so the table stays empty.
+  await expect(environment.locator(".runtime-environment-row")).toHaveCount(0);
+  const inspectsBeforeTurn = await invokeCount(page, "inspect_runtime");
+
+  // Pin the panel so it floats next to the conversation, then let the agent
+  // run an R cell that lazily restarts the runtime.
+  await environment.getByRole("button", { name: "Pin environment to conversation" }).click();
+  await composer(page).fill("RAUTOREFRESH seed the session");
+  await page.getByRole("button", { name: "Send" }).click();
+
+  // The finished tool call alone must refresh the status chip and re-inspect
+  // the open panel — no manual sync click.
+  await expect(rChip).toContainText("Ready");
+  await expect(environment.locator(".runtime-environment-row", { hasText: "counts" })).toBeVisible();
+  expect(await invokeCount(page, "inspect_runtime")).toBeGreaterThan(inspectsBeforeTurn);
+  await expect.poll(() => lastInvokeArgs(page, "inspect_runtime")).toMatchObject({
+    projectId: "default",
+    contextId: "local",
+    language: "r",
+  });
+});
+
+test("runtime environment switches language and filters objects", async ({ page }) => {
+  await enterApp(page);
+  await page.getByTestId("session-runtime-strip")
+    .locator('[data-runtime-language="python"][data-runtime-context="local"]')
+    .click();
+  const environment = page.getByRole("region", { name: "Python Environment" });
+  await expect(environment).toBeVisible();
+  await expect(environment.getByTestId("runtime-environment-lang")).toHaveCount(2);
+  await environment.getByTestId("runtime-object-filter").fill("model");
+  await expect(environment.locator(".runtime-environment-row", { hasText: "model" })).toBeVisible();
+  await expect(environment.locator(".runtime-environment-row", { hasText: "counts" })).toHaveCount(0);
+  await environment.getByRole("tab", { name: "Show R environment" }).click();
+  await expect(page.getByRole("region", { name: "R Environment" })).toBeVisible();
 });
 
 test("Windows environment settings imports installed WSL distributions", async ({ page }) => {
@@ -7717,7 +9083,7 @@ test("artifact panel normalizes png/pdf shorthand to the previewable image", asy
     .locator("#composer-input")
     .fill("show `figures/panel_I_heatmap_4genes_median.png/.pdf`");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible({ timeout: 10_000 });
   await page.getByRole("button", { name: "Toggle panel" }).click();
 
   const tile = page.locator('.rp-tile[data-artifact-name="panel_I_heatmap_4genes_median.png"]');
@@ -7736,12 +9102,68 @@ test("settings page shows the saved protocol", async ({ page }) => {
   await page.locator(".settings-footer").getByRole("button", { name: "Cancel" }).click();
 });
 
+for (const locale of ["en", "zh"]) {
+  test(`model explanations stay with their controls in ${locale}`, async ({ page }, testInfo) => {
+    await page.setViewportSize({ width: 1440, height: 1200 });
+    await page.goto(`/?mockLocale=${locale}`);
+    await page.getByRole("button", { name: locale === "zh" ? "设置" : "Settings", exact: true }).click();
+    await page.locator(".settings-nav").getByRole("button", { name: locale === "zh" ? "模型" : "Models", exact: true }).click();
+    await page.locator(".settings-list-row").first().click();
+    await providerSelect(page).selectOption("anthropic");
+    await page.getByRole("textbox", { name: locale === "zh" ? "模型 ID" : "Model ID", exact: true }).fill("glm-5.3");
+    const form = page.locator(".model-form");
+    const effort = page.getByRole("combobox", { name: locale === "zh" ? "推理强度" : "Reasoning effort", exact: true });
+    await expect(effort).toHaveAccessibleDescription(/.+/);
+    const image = page.getByTestId("use-for-image-generation");
+    const video = page.getByTestId("use-for-video-generation");
+    await expect(image).toHaveAccessibleDescription(locale === "zh" ? /自定义模型 ID/ : /Custom model IDs/);
+    await expect(video).toHaveAccessibleDescription(/grok-imagine-video/);
+    for (const width of [1440, 640]) {
+      await page.setViewportSize({ width, height: 1200 });
+      const control = (await effort.boundingBox())!;
+      const hint = (await page.locator("#model-reasoning-hint").boundingBox())!;
+      expect(Math.abs(control.x - hint.x)).toBeLessThan(2);
+      expect(hint.y - control.y - control.height).toBeGreaterThanOrEqual(0);
+      expect(hint.y - control.y - control.height).toBeLessThan(12);
+      const groups = form.locator(".model-capability");
+      await expect(groups).toHaveCount(3);
+      for (const group of await groups.all()) {
+        const explanation = group.locator(":scope > .hint");
+        const bounds = (await group.boundingBox())!;
+        const text = (await explanation.boundingBox())!;
+        expect(text.x).toBeGreaterThan(bounds.x);
+        expect(text.x + text.width).toBeLessThanOrEqual(bounds.x + bounds.width);
+        expect(text.y + text.height).toBeLessThanOrEqual(bounds.y + bounds.height);
+      }
+      const imageGroup = (await groups.nth(1).boundingBox())!;
+      const videoGroup = (await groups.nth(2).boundingBox())!;
+      if (width === 1440) {
+        expect(Math.abs(imageGroup.y - videoGroup.y)).toBeLessThan(2);
+      } else {
+        expect(videoGroup.y).toBeGreaterThanOrEqual(imageGroup.y + imageGroup.height);
+      }
+      expect(await form.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+      await form.screenshot({ animations: "disabled", path: testInfo.outputPath(`model-explanations-${locale}-${width}.png`) });
+    }
+    await video.check();
+    await image.check();
+    // Explicit image intent now switches arbitrary IDs to the image-only form.
+    await expect(image).toBeChecked();
+    await expect(video).toHaveCount(0);
+    await image.uncheck();
+    await expect(video).not.toBeChecked();
+    await video.check();
+    await expect(image).not.toBeChecked();
+    await expect(video).toBeChecked();
+  });
+}
+
 test("model settings updates activation and confirms removal", async ({ page }) => {
   await enterApp(page);
   await openSettingsSection(page, "Models");
 
   const opus = page.locator(".settings-list-row").filter({ hasText: "opus-4.8" });
-  await opus.getByRole("button", { name: "Use" }).click();
+  await opus.getByRole("button", { name: "Set as default" }).click();
   await expect.poll(() => lastInvokeArgs(page, "set_active_model")).toMatchObject({ id: "opus" });
   await expect(opus).toHaveClass(/settings-list-row-active/);
 
@@ -7893,6 +9315,7 @@ test("custom CSS hides the bold-at-start lead bar", async ({ page }) => {
   expect(await barWidth()).toBe("3px");
 
   await openSettingsSection(page, "Appearance");
+  await page.getByTestId("appearance-custom-css-summary").click();
   await page.getByTestId("appearance-custom-css")
     .fill(":root { --md-lead-bar-width: 0; --md-lead-bar-pad: 0; }");
   await page.getByRole("button", { name: "Back to app" }).click();
@@ -7903,6 +9326,7 @@ test("custom CSS hides the bold-at-start lead bar", async ({ page }) => {
 test("appearance custom CSS can be pasted, imported, and cleared", async ({ page }, testInfo) => {
   await enterApp(page);
   await openSettingsSection(page, "Appearance");
+  await page.getByTestId("appearance-custom-css-summary").click();
 
   const card = page.getByTestId("appearance-custom-css-card");
   await expect(card).toHaveClass(/appearance-config-card/);
@@ -7937,6 +9361,7 @@ test("appearance custom CSS can be pasted, imported, and cleared", async ({ page
 test("custom CSS sanitizes remote url and import", async ({ page }) => {
   await enterApp(page);
   await openSettingsSection(page, "Appearance");
+  await page.getByTestId("appearance-custom-css-summary").click();
   await page.getByTestId("appearance-custom-css").fill([
     ":root { --clay: #111111; }",
     '@import url("https://evil.example/x.css");',
@@ -7989,6 +9414,155 @@ test("UI font size setting scales Chinese chat markdown and composer", async ({ 
   await expect.poll(composerFontSize).toBe("18px");
 });
 
+
+test("OpenCode preset defaults to Go and saves only user-configured models", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Models");
+  await page.getByTestId("model-presets").getByRole("button", { name: "OpenCode", exact: true }).click();
+  await expect(page.getByTestId("provider-api-url")).toHaveValue("https://opencode.ai/zen/go/v1");
+  const rows = page.getByTestId("provider-model-row");
+  await expect(rows).toHaveCount(1);
+  await expect(rows.first().getByTestId("provider-model-id")).toHaveValue("");
+  await rows.first().getByTestId("provider-model-id").fill("custom-model");
+  await rows.first().getByTestId("provider-model-protocol").selectOption("anthropic");
+  await page.getByTestId("provider-api-key").fill("fake-go-key");
+  await page.getByTestId("save-provider").click();
+  await expect(page.getByTestId("provider-add-form")).toBeHidden();
+  const profiles = await page.evaluate(async () => {
+    const models: any[] = await (window as any).__TAURI__.core.invoke("list_models");
+    return models.filter(m => m.api_url === "https://opencode.ai/zen/go/v1")
+      .map(m => [m.model, m.provider]);
+  });
+  expect(profiles).toEqual([["custom-model", "anthropic"]]);
+});
+
+test("OpenCode Go and Zen URLs never populate models or overwrite user entries", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Models");
+  await page.getByRole("button", { name: /Add API access/i }).click();
+  for (const url of ["https://opencode.ai/zen/go/v1", "https://opencode.ai/zen/v1"]) {
+    await page.getByTestId("provider-api-url").fill(url);
+    await expect(page.getByTestId("provider-model-row")).toHaveCount(1);
+    await expect(page.getByTestId("provider-model-id")).toHaveValue("");
+  }
+  await page.getByTestId("provider-model-id").fill("custom-model");
+  await page.getByTestId("provider-model-protocol").selectOption("openai_responses");
+  await page.getByTestId("provider-api-url").fill("https://opencode.ai/zen/go/v1");
+  await expect(page.getByTestId("provider-model-id")).toHaveValue("custom-model");
+  await expect(page.getByTestId("provider-model-protocol")).toHaveValue("openai_responses");
+});
+
+test("advanced identity controls persist and validate a custom session header", async ({ page }) => {
+  await enterApp(page);
+  await openModelsSettings(page);
+  const advanced = page.getByTestId("model-advanced-options");
+  await advanced.locator("summary").click();
+  await expect(page.getByTestId("model-send-user-agent")).toBeChecked();
+  await expect(page.getByTestId("model-send-session-id")).not.toBeChecked();
+  await expect(page.getByTestId("model-session-header-name")).toBeDisabled();
+  await page.getByTestId("model-send-user-agent").uncheck();
+  await expect(page.getByTestId("model-user-agent")).toBeDisabled();
+  await page.getByTestId("model-send-session-id").check();
+  await page.getByTestId("model-session-header-name").fill("x-custom-session");
+  await page.getByRole("button", { name: "Valid", exact: true }).click();
+  await expect.poll(() => lastInvokeArgs(page, "validate_settings")).toMatchObject({ settings: {
+    send_user_agent: false, send_session_id: true, session_header_name: "x-custom-session",
+  }});
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect.poll(() => lastInvokeArgs(page, "save_model")).toMatchObject({ profile: {
+    send_user_agent: false, send_session_id: true, session_header_name: "x-custom-session",
+  }});
+  await page.locator(".settings-list-row").first().click();
+  await advanced.locator("summary").click();
+  await expect(page.getByTestId("model-send-user-agent")).not.toBeChecked();
+  await expect(page.getByTestId("model-send-session-id")).toBeChecked();
+  await expect(page.getByTestId("model-session-header-name")).toHaveValue("x-custom-session");
+  await page.getByTestId("model-send-session-id").uncheck();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect.poll(() => lastInvokeArgs(page, "save_model")).toMatchObject({ profile: {
+    send_session_id: false, session_header_name: "x-custom-session",
+  }});
+});
+
+test("OpenCode defaults to session identity but permits disabling both headers", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Models");
+  await page.getByTestId("model-presets").getByRole("button", { name: "OpenCode", exact: true }).click();
+  await page.getByTestId("model-advanced-options").locator("summary").click();
+  await expect(page.getByTestId("model-send-user-agent")).toBeChecked();
+  await expect(page.getByTestId("model-send-session-id")).toBeChecked();
+  await page.getByTestId("provider-api-url").fill("https://OPENCODE.AI:443/zen/go/v1");
+  await expect(page.getByTestId("model-send-session-id")).toBeChecked();
+  await page.getByTestId("provider-api-url").fill("https://opencode.ai.evil.test/zen/go/v1");
+  await expect(page.getByTestId("model-send-session-id")).not.toBeChecked();
+  await page.getByTestId("provider-api-url").fill("https://opencode.ai/zen/go/v1");
+  await expect(page.getByTestId("model-send-session-id")).toBeChecked();
+  await expect(page.getByTestId("model-session-header-name")).toHaveValue("");
+  await expect(page.getByTestId("model-session-header-name")).toHaveAttribute("placeholder", "x-opencode-session");
+  await page.getByTestId("model-send-session-id").uncheck();
+  await page.getByTestId("model-send-user-agent").uncheck();
+  await page.getByTestId("provider-model-id").fill("user-selected-model");
+  await page.getByTestId("provider-api-key").fill("fake-key");
+  await page.getByTestId("save-provider").click();
+  await expect.poll(() => lastInvokeArgs(page, "save_model")).toMatchObject({ profile: {
+    api_url: "https://opencode.ai/zen/go/v1", send_user_agent: false, send_session_id: false,
+  }});
+});
+
+test("model User-Agent advanced option validates, persists, and resets", async ({ page }) => {
+  await enterApp(page);
+  await openModelsSettings(page);
+  const advanced = page.getByTestId("model-advanced-options");
+  const userAgent = page.getByTestId("model-user-agent");
+  await expect(advanced).not.toHaveAttribute("open", "");
+  await expect(userAgent).toBeHidden();
+  await advanced.locator("summary").click();
+  await expect(userAgent).toHaveValue("");
+  await expect(userAgent).toHaveAttribute("placeholder", "wisp-depmap");
+  await userAgent.fill("research-client/1.0");
+  await page.getByRole("button", { name: "Valid", exact: true }).click();
+  await expect.poll(() => lastInvokeArgs(page, "validate_settings"))
+    .toMatchObject({ settings: { user_agent: "research-client/1.0" } });
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect.poll(() => lastInvokeArgs(page, "save_model"))
+    .toMatchObject({ profile: { user_agent: "research-client/1.0" } });
+  await page.locator(".settings-list-row").first().click();
+  await advanced.locator("summary").click();
+  await expect(userAgent).toHaveValue("research-client/1.0");
+  await userAgent.fill("");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect.poll(() => lastInvokeArgs(page, "save_model"))
+    .toMatchObject({ profile: { user_agent: "" } });
+  await page.locator(".settings-list-row").first().click();
+  await advanced.locator("summary").click();
+  await expect(userAgent).toHaveValue("");
+});
+
+test("new API access applies its advanced User-Agent to every added model", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Models");
+  await page.getByRole("button", { name: /Add API access/i }).click();
+  await page.getByLabel("Base URL").fill("https://research.example/v1");
+  await page.getByLabel("API key (stored in OS keyring)").fill("test-key");
+  await page.getByTestId("provider-model-row").first().getByLabel("Model ID").fill("research-one");
+  await page.getByTestId("provider-add-model").click();
+  await page.getByTestId("provider-model-row").last().getByLabel("Model ID").fill("research-two");
+  await expect(page.getByTestId("model-user-agent")).toBeHidden();
+  await page.getByTestId("model-advanced-options").locator("summary").click();
+  await page.getByTestId("model-user-agent").fill("research-client/2.0");
+  await page.getByRole("button", { name: "Valid", exact: true }).click();
+  await expect.poll(() => lastInvokeArgs(page, "validate_settings"))
+    .toMatchObject({ settings: { user_agent: "research-client/2.0" } });
+  await page.getByTestId("save-provider").click();
+  await expect(page.getByTestId("provider-add-form")).toBeHidden();
+  const models = await page.evaluate(async () => {
+    const models: any[] = await (window as any).__TAURI__.core.invoke("list_models");
+    return models.filter(m => m.api_url === "https://research.example/v1");
+  });
+  expect(models).toHaveLength(2);
+  expect(models.every((m: any) => m.user_agent === "research-client/2.0")).toBe(true);
+});
+
 test("vision assignment keeps model fields and stored key placeholder untouched", async ({ page }) => {
   await enterApp(page);
   await openModelsSettings(page);
@@ -7999,7 +9573,7 @@ test("vision assignment keeps model fields and stored key placeholder untouched"
 
   await providerSelect(page).selectOption("openai_responses");
   await page.getByLabel("Base URL").fill("https://api.openai-proxy.org/v1");
-  await page.getByLabel("Model").fill("gpt-5.6-luna");
+  await page.getByRole("textbox", { name: "Model ID", exact: true }).fill("gpt-5.6-luna");
   await effort.selectOption("medium");
   await expect(key).toHaveValue("");
   await expect(key).toHaveAttribute("placeholder", "(stored — leave blank to keep)");
@@ -8041,6 +9615,132 @@ test("vision assignment keeps model fields and stored key placeholder untouched"
   await expect(effort).toHaveValue("medium");
   await expect(page.getByLabel("Use for image analysis")).toBeChecked();
 });
+
+test("Fast profile toggle is available for both OpenAI HTTP protocols", async ({ page }) => {
+  await enterApp(page);
+  await openModelsSettings(page);
+
+  for (const provider of ["openai", "openai_responses"]) {
+    await providerSelect(page).selectOption(provider);
+    await page.getByLabel("Base URL").fill("https://api.openai.com/v1");
+    await page.getByRole("textbox", { name: "Model ID", exact: true }).fill("gpt-5.6-luna");
+    await page.getByLabel("Reasoning effort").selectOption("high");
+    const row = page.getByTestId("service-tier-toggle-row");
+    const toggle = page.getByTestId("service-tier-toggle");
+    await expect(row).toBeVisible();
+    if (await toggle.isChecked()) await row.locator(".toggle-track").click();
+    await expect(toggle).not.toBeChecked();
+    await row.locator(".toggle-track").click();
+    await expect(toggle).toBeChecked();
+    await expect(row).toHaveClass(/enabled/);
+    await expect(row).toContainText("On · priority");
+    await page.getByRole("button", { name: "Save" }).click();
+    await expect.poll(() => lastInvokeArgs(page, "save_model")).toMatchObject({
+      profile: { provider, reasoning_effort: "high", service_tier: "priority" },
+    });
+    await page.locator(".settings-list-row").first().click();
+  }
+
+  await providerSelect(page).selectOption("anthropic");
+  await expect(page.getByTestId("service-tier-toggle")).toHaveCount(0);
+});
+
+test("composer Fast lightning is a conversation override and has distinct states", async ({ page }) => {
+  await enterApp(page);
+  const fast = page.getByTestId("composer-fast-toggle");
+  await expect(fast).toBeVisible();
+  await expect(fast).toHaveAttribute("aria-pressed", "false");
+  await expect(fast).not.toHaveClass(/enabled/);
+  await fast.click();
+  await expect(fast).toHaveAttribute("aria-pressed", "true");
+  await expect(fast).toHaveClass(/enabled/);
+  await expect(fast).toHaveAttribute("title", /service_tier=priority/);
+  // No frame exists yet, so the choice is staged instead of mutating a profile.
+  await expect.poll(() => lastInvokeArgs(page, "save_model")).toBeNull();
+
+  await composer(page).fill("FAST FIRST TURN");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect.poll(async () => (await invokeArgsList(page, "set_session_service_tier")).length).toBe(1);
+  await expect.poll(() => lastInvokeArgs(page, "set_session_service_tier"))
+    .toMatchObject({ serviceTier: "priority" });
+  const order = await page.evaluate(() => ((window as any).__skillInvokeLog ?? [])
+    .map((call: any) => call.cmd)
+    .filter((cmd: string) => ["new_session", "set_session_service_tier", "send_message"].includes(cmd)));
+  expect(order.slice(-3)).toEqual(["new_session", "set_session_service_tier", "send_message"]);
+});
+
+test("composer Fast override is isolated per conversation and can return to inheritance", async ({ page }) => {
+  await enterApp(page, "/?mockSessionModels=1&mockFastDefault=1");
+  const fast = page.getByTestId("composer-fast-toggle");
+
+  await page.locator('[data-session-id="s-model-a"]').click();
+  await expect(fast).toHaveAttribute("aria-pressed", "true");
+  await expect(fast).toHaveAttribute("title", /profile default/);
+  await fast.click();
+  await expect.poll(() => lastInvokeArgs(page, "set_session_service_tier"))
+    .toMatchObject({ sessionId: "s-model-a", serviceTier: "" });
+  await expect(fast).toHaveAttribute("aria-pressed", "false");
+  await expect(fast).toHaveAttribute("title", /conversation overrides/);
+
+  await page.locator('[data-session-id="s-model-b"]').click();
+  await expect(fast).toHaveAttribute("aria-pressed", "true");
+  await expect(fast).toHaveAttribute("title", /profile default/);
+
+  await page.locator('[data-session-id="s-model-a"]').click();
+  await expect(fast).toHaveAttribute("aria-pressed", "false");
+  await fast.click();
+  await expect.poll(() => lastInvokeArgs(page, "set_session_service_tier"))
+    .toMatchObject({ sessionId: "s-model-a", serviceTier: undefined });
+  await expect(fast).toHaveAttribute("aria-pressed", "true");
+  await expect(fast).toHaveAttribute("title", /profile default/);
+});
+
+test("composer Fast lightning hides for ACP and unsupported HTTP providers", async ({ page }) => {
+  await enterApp(page);
+  await expect(page.getByTestId("composer-fast-toggle")).toBeVisible();
+  await page.locator(".model-picker-btn").click();
+  await page.getByRole("button", { name: /opus-4.8/ }).click();
+  await expect(page.getByTestId("composer-fast-toggle")).toHaveCount(0);
+
+  await page.locator(".model-picker-btn").click();
+  await page.getByRole("button", { name: /Test ACP Agent/ }).click();
+  await expect(page.getByTestId("composer-fast-toggle")).toHaveCount(0);
+});
+
+for (const [label, field, value] of [
+  ["Max output tokens", "max_tokens", "4096"],
+  ["Context window (tokens)", "context_window", "32768"],
+] as const) {
+  test(`model settings keeps ${field} focused while typing and deleting (#1243)`, async ({ page }) => {
+    await enterApp(page);
+    await openModelsSettings(page);
+    const input = page.getByLabel(label, { exact: true });
+    await input.click();
+    await page.keyboard.press("ControlOrMeta+A");
+    // Use the keyboard after one click: fill() would hide input remounts.
+    for (let i = 0; i < value.length; i++) {
+      await page.keyboard.type(value[i]);
+      await expect(input).toBeFocused();
+      await expect(input).toHaveValue(value.slice(0, i + 1));
+    }
+    for (let length = value.length - 1; length > 0; length--) {
+      await page.keyboard.press("Backspace");
+      await expect(input).toBeFocused();
+      await expect(input).toHaveValue(value.slice(0, length));
+    }
+    await page.keyboard.type(value.slice(1));
+    await expect(input).toBeFocused();
+    await expect(input).toHaveValue(value);
+    await page.getByRole("button", { name: "Save", exact: true }).click();
+    await expect.poll(() => lastInvokeArgs(page, "save_model"))
+      .toMatchObject({ profile: { [field]: Number(value) } });
+    const stored = await page.evaluate(async () => {
+      const models = await (window as any).__TAURI__.core.invoke("list_models");
+      return models.find((model: any) => model.model === "deepseek-v4-pro");
+    });
+    expect(stored).toMatchObject({ [field]: Number(value) });
+  });
+}
 
 test("model settings rejects max output tokens above the known ceiling", async ({ page }) => {
   await enterApp(page);
@@ -8139,6 +9839,8 @@ test("API access reuses a stored key for the same Base URL", async ({ page }) =>
     "placeholder",
     /api\.deepseek\.com/,
   );
+  await expect(page.getByTestId("provider-separate-key-hint"))
+    .toContainText("Paste a different key");
   await page.getByRole("button", { name: "Save" }).click();
   await expect.poll(async () => {
     const args = await lastInvokeArgs(page, "save_model");
@@ -8147,6 +9849,44 @@ test("API access reuses a stored key for the same Base URL", async ({ page }) =>
     key: null,
     profile: { model: "deepseek-v4-flash" },
   });
+});
+
+test("API access can paste a second key on the same Base URL", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Models");
+  await page.getByRole("button", { name: /Add API access/i }).click();
+
+  await expect(page.getByTestId("provider-separate-key-hint")).toBeVisible();
+  await page.getByTestId("provider-model-row").nth(0).getByLabel("Display name").fill("flash-work");
+  await page.getByTestId("provider-model-row").nth(1).getByLabel("Display name").fill("pro-work");
+  await page.getByLabel("API key (stored in OS keyring)").fill("sk-work");
+  await page.getByRole("button", { name: "Save" }).click();
+
+  await expect.poll(() => page.evaluate(() => ((window as any).__skillInvokeLog ?? [])
+    .filter((c: any) => c.cmd === "save_model")
+    .map((c: any) => {
+      const args = c.args instanceof Map ? Object.fromEntries(c.args) : c.args;
+      const profile = args.profile instanceof Map ? Object.fromEntries(args.profile) : args.profile;
+      return {
+        model: profile.model,
+        label: profile.label,
+        key: args.key ?? null,
+        apiUrl: profile.api_url,
+      };
+    }))).toEqual([
+      {
+        model: "deepseek-v4-pro",
+        label: "pro-work",
+        key: "sk-work",
+        apiUrl: "https://api.deepseek.com",
+      },
+      {
+        model: "deepseek-v4-flash",
+        label: "flash-work",
+        key: "sk-work",
+        apiUrl: "https://api.deepseek.com",
+      },
+    ]);
 });
 
 test("one DeepSeek Base URL can save Responses and Anthropic protocol models", async ({ page }) => {
@@ -8193,8 +9933,10 @@ test("one DeepSeek Base URL can save Responses and Anthropic protocol models", a
 test("onboarding key setup lands on flash after adding pro", async ({ page }) => {
   await page.goto("/?mockOnboarding=1");
   await expect(page.locator(".onboard-overlay")).toBeVisible();
+  await page.locator(".onboard-overlay").getByRole("button", { name: "Next" }).click();
+  await page.locator(".onboard-overlay").getByRole("button", { name: "Next" }).click();
   await page.getByLabel("API key (stored in OS keyring)").fill("sk-onboard");
-  await page.getByRole("button", { name: "Next" }).click();
+  await page.keyboard.press("Enter");
   // Order matters: save_model activates each new profile, so flash must land
   // last for the user to start on the cheaper default.
   await expect.poll(() => page.evaluate(() => ((window as any).__skillInvokeLog ?? [])
@@ -8225,6 +9967,41 @@ test("API access on xAI suggests grok chat and imagine image", async ({ page }) 
   await expect(page.getByTestId("provider-model-row").nth(1).getByLabel("Model ID")).toHaveValue("grok-imagine-image-2.0");
   await expect(page.getByTestId("provider-model-row").nth(1).getByTestId("provider-use-for-image")).toBeChecked();
 });
+
+for (const modelId of ["gpt-image-2.5", "gateway/custom-image-v3"]) {
+  test(`custom image model ${modelId} validates with image intent and stays out of chat`, async ({ page }) => {
+    await enterApp(page);
+    await openSettingsSection(page, "Models");
+    await page.locator(".settings-list-row", { hasText: "opus-4.8" }).click();
+    await providerSelect(page).selectOption("openai");
+    await page.getByLabel("Model").fill(modelId);
+    await page.getByTestId("use-for-image-generation").check();
+    await expect(page.getByLabel("Max output tokens")).toHaveCount(0);
+    await expect(page.getByTestId("image-size")).toBeVisible();
+    await page.getByTestId("image-size").selectOption("1536x1024");
+    await page.getByRole("button", { name: "Valid" }).click();
+    await expect.poll(() => lastInvokeArgs(page, "validate_settings")).toMatchObject({
+      useForImageGeneration: true,
+      settings: { provider: "openai", model: modelId, supports_vision: false },
+    });
+    await expect(page.locator(".settings-status")).toHaveText(`Validated openai with ${modelId}`);
+    await page.getByRole("button", { name: "Save" }).click();
+    await expect.poll(() => lastInvokeArgs(page, "save_model")).toMatchObject({
+      useForImageGeneration: true,
+      profile: { model: modelId, image_size: "1536x1024" },
+    });
+    const row = page.locator(".settings-list-row", { hasText: "opus-4.8" });
+    await expect(row.getByRole("button", { name: "Set as default" })).toHaveCount(0);
+    await row.click();
+    await page.getByTestId("use-for-image-generation").uncheck();
+    await expect(page.getByTestId("image-size")).toBeVisible();
+    await page.getByRole("button", { name: "Save" }).click();
+    await expect(row.getByRole("button", { name: "Set as default" })).toHaveCount(0);
+    await page.locator(".settings-head-close").click();
+    await page.locator(".model-picker-btn").click();
+    await expect(page.locator(".model-menu")).not.toContainText(modelId);
+  });
+}
 
 test("gpt-image-2 can be assigned for generation but not selected for chat", async ({ page }) => {
   await enterApp(page);
@@ -8262,8 +10039,8 @@ test("gpt-image-2 can be assigned for generation but not selected for chat", asy
 
   const imageModel = page.locator(".settings-list-row", { hasText: "opus-4.8" });
   await expect(imageModel).toContainText("gpt-image-2");
-  await expect(imageModel).toContainText("image gen");
-  await expect(imageModel.getByRole("button", { name: "Use" })).toHaveCount(0);
+  await expect(imageModel).toContainText("Image generation");
+  await expect(imageModel.getByRole("button", { name: "Set as default" })).toHaveCount(0);
 
   await page.locator(".settings-head-close").click();
   await page.locator(".model-picker-btn").click();
@@ -8311,8 +10088,8 @@ test("grok-imagine-image-2.0 can be assigned for generation but not selected for
 
   const imageModel = page.locator(".settings-list-row", { hasText: "opus-4.8" });
   await expect(imageModel).toContainText("grok-imagine-image-2.0");
-  await expect(imageModel).toContainText("image gen");
-  await expect(imageModel.getByRole("button", { name: "Use" })).toHaveCount(0);
+  await expect(imageModel).toContainText("Image generation");
+  await expect(imageModel.getByRole("button", { name: "Set as default" })).toHaveCount(0);
 
   await page.locator(".settings-head-close").click();
   await page.locator(".model-picker-btn").click();
@@ -8360,8 +10137,8 @@ test("grok-imagine-video can be assigned for generation but not selected for cha
 
   const videoModel = page.locator(".settings-list-row", { hasText: "opus-4.8" });
   await expect(videoModel).toContainText("grok-imagine-video");
-  await expect(videoModel).toContainText("video gen");
-  await expect(videoModel.getByRole("button", { name: "Use" })).toHaveCount(0);
+  await expect(videoModel).toContainText("Video generation");
+  await expect(videoModel.getByRole("button", { name: "Set as default" })).toHaveCount(0);
 
   await page.locator(".settings-head-close").click();
   await page.locator(".model-picker-btn").click();
@@ -8670,7 +10447,10 @@ test("credential services explain their behavior and open official setup links",
   await enterApp(page);
   await openSettingsSection(page, "Credentials");
 
-  await expect(page.locator(".cred-help-trigger")).toHaveCount(4);
+  await expect(page.locator(".cred-help-trigger")).toHaveCount(0);
+  await expect(page.locator("[data-credential-service]")).toHaveCount(5);
+  await page.locator('[data-credential-service="openalex"]').click();
+  await expect(page.locator(".cred-help-trigger")).toHaveCount(1);
   const openAlexHelp = page.getByRole("button", { name: "OpenAlex: About this credential" });
   const openAlexTooltip = page.locator("#cred-help-openalex");
   await expect(openAlexTooltip).not.toBeVisible();
@@ -8681,19 +10461,23 @@ test("credential services explain their behavior and open official setup links",
   await expect(openAlexTooltip).toContainText("When not configured");
   await expect(openAlexTooltip).toContainText("falls back to anonymous OpenAlex requests");
 
+  await page.locator(".settings-head-back").click();
+  await page.locator('[data-credential-service="ncbi"]').click();
   const ncbiHelp = page.getByRole("button", { name: "NCBI E-utilities (PubMed): About this credential" });
   await ncbiHelp.focus();
   await expect(page.locator("#cred-help-ncbi")).toBeVisible();
   await expect(page.locator("#cred-help-ncbi")).toContainText("3 requests/s limit");
 
   const links = [
-    ["Get OpenAlex API key", "https://openalex.org/settings/api"],
-    ["Open InfiniSynapse console", "https://app.infinisynapse.cn/tasks"],
-    ["Visit InfiniSynapse", "https://infinisynapse.cn"],
-    ["Get SCIMaster API key", "https://scimaster.bohrium.com/vibe-write/home"],
-    ["Open NCBI account", "https://www.ncbi.nlm.nih.gov/account/"],
+    ["openalex", "Get OpenAlex API key", "https://openalex.org/settings/api"],
+    ["infinisynapse", "Open InfiniSynapse console", "https://app.infinisynapse.cn/tasks"],
+    ["infinisynapse", "Visit InfiniSynapse", "https://infinisynapse.cn"],
+    ["scimaster", "Get SCIMaster API key", "https://scimaster.bohrium.com/vibe-write/home"],
+    ["ncbi", "Open NCBI account", "https://www.ncbi.nlm.nih.gov/account/"],
   ] as const;
-  for (const [label, url] of links) {
+  for (const [service, label, url] of links) {
+    await page.locator(".settings-head-back").click();
+    await page.locator(`[data-credential-service="${service}"]`).click();
     await page.getByRole("button", { name: label, exact: true }).click();
     await expect.poll(() => lastInvokeArgs(page, "open_external_url")).toMatchObject({ url });
   }
@@ -8707,6 +10491,7 @@ test("Chinese NCBI credential help gives the complete account navigation path", 
   await page.getByRole("button", { name: "设置", exact: true }).click();
   await page.getByRole("button", { name: "凭据", exact: true }).click();
 
+  await page.locator('[data-credential-service="ncbi"]').click();
   const help = page.getByRole("button", { name: /NCBI E-utilities.*了解该凭据/ });
   await help.focus();
   const tooltip = page.locator("#cred-help-ncbi");
@@ -8724,6 +10509,7 @@ test("Chinese NCBI credential help gives the complete account navigation path", 
 test("credentials settings include SCIMaster and save its key", async ({ page }) => {
   await enterApp(page);
   await openSettingsSection(page, "Credentials");
+  await page.locator('[data-credential-service="scimaster"]').click();
   const field = page.locator("label", { hasText: "SCIMaster API key" });
   await expect(field).toContainText("Not configured");
   await field.locator("input").fill("sk-sci-123");
@@ -8734,6 +10520,74 @@ test("credentials settings include SCIMaster and save its key", async ({ page })
   });
   await expect(page.locator(".settings-status")).toHaveText("Saved. Applies to new sessions.");
   await expect(field).toContainText("Configured");
+});
+
+test("DepMap server token is stored through the credential boundary", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Credentials");
+  await page.locator('[data-credential-service="depmap"]').click();
+  const field = page.locator("label", { hasText: "DepMap server token" });
+  await expect(field).toContainText("Not configured");
+  await field.locator("input").fill("depmap-token-123");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect.poll(() => lastInvokeArgs(page, "set_credential")).toMatchObject({
+    id: "depmap_knowledge_api_token",
+    value: "depmap-token-123",
+  });
+  await expect(field).toContainText("Configured");
+});
+
+test("credential service subpages navigate, discard drafts, and update list status", async ({ page }) => {
+  test.setTimeout(60_000);
+  await enterApp(page);
+  await openSettingsSection(page, "Credentials");
+  const list = page.getByTestId("credential-service-list");
+  await expect(list.locator("button")).toHaveCount(5);
+  await expect(list.locator("input")).toHaveCount(0);
+  await expect.poll(async () => (await list.boundingBox())?.height ?? 0).toBeGreaterThan(250);
+  await page.screenshot({ path: test.info().outputPath("credential-services.png"), animations: "disabled" });
+
+  for (const service of ["depmap", "openalex", "infinisynapse", "scimaster", "ncbi"]) {
+    await page.locator(`[data-credential-service="${service}"]`).click();
+    // Escape must work immediately, while focus is still outside the detail form.
+    await page.keyboard.press("Escape");
+    await expect(list).toBeVisible();
+    await expect(page.locator(".settings-page")).toBeVisible();
+  }
+
+  await page.locator('[data-credential-service="openalex"]').click();
+  await expect(page.locator(".settings-crumb-current")).toHaveText("OpenAlex");
+  await expect(page.getByLabel("Service name")).toHaveCount(0);
+  await page.locator('.credentials-pane input[type="password"]').fill("discard-me");
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.locator('[data-credential-service="ncbi"]').click();
+  await expect(page.locator(".credentials-pane input")).toHaveCount(2);
+  await page.screenshot({ path: test.info().outputPath("credential-ncbi.png"), animations: "disabled" });
+  const field = page.locator("label", { hasText: "NCBI API key" });
+  await field.locator("input").fill("ncbi-test-key");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect.poll(() => lastInvokeArgs(page, "set_credential")).toMatchObject({ id: "ncbi_api_key", value: "ncbi-test-key" });
+  await expect(field).toContainText("Configured");
+  await expect(field.locator("input")).toHaveValue("");
+  await page.locator(".settings-crumb-link").click();
+  await expect(page.locator('[data-credential-service="ncbi"]')).toContainText("Configured 1/2");
+  await expect(page.locator('[data-credential-service="openalex"]')).toContainText("Not configured");
+  await page.locator('[data-credential-service="openalex"]').click();
+  await expect(page.locator('.credentials-pane input[type="password"]')).toHaveValue("");
+  await page.locator(".settings-head-back").click();
+  await page.locator('[data-credential-service="ncbi"]').click();
+  await field.getByRole("button", { name: "Clear", exact: true }).click();
+  await expect(field).toContainText("Not configured");
+  await page.locator(".settings-head-back").click();
+  await expect(page.locator('[data-credential-service="ncbi"]')).toContainText("Not configured");
+
+  await page.locator('[data-credential-service="scimaster"]').click();
+  await page.locator('.credentials-pane input[type="password"]').fill("discard-on-navigation");
+  await page.locator(".settings-nav").getByRole("button", { name: "General", exact: true }).click();
+  await page.locator(".settings-nav").getByRole("button", { name: "Credentials", exact: true }).click();
+  await expect(list).toBeVisible();
+  await page.locator('[data-credential-service="scimaster"]').click();
+  await expect(page.locator('.credentials-pane input[type="password"]')).toHaveValue("");
 });
 
 test("credentials settings add, replace, clear, and remove a custom credential", async ({ page }) => {
@@ -8814,6 +10668,77 @@ test("capability counts open skills, connections, and editable project memory", 
   });
 });
 
+test("skill detail browses markdown and scripts and persists tags without leaving the file", async ({ page }, testInfo) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Skills");
+  await page.locator('.skill-tags-filter').getByRole("button", { name: "compute", exact: true }).click();
+  await page.locator('[data-skill-name="remote-compute-ssh"] .skill-row-open').click();
+  const detail = page.getByTestId("skill-detail");
+  await expect(page.locator(".settings-crumb-current")).toHaveText("remote-compute-ssh");
+  await expect(detail.getByTestId("skill-file-preview").getByRole("heading", { name: "Skill instructions" })).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath("skill-detail.png"), fullPage: true });
+  await expect.poll(() => lastInvokeArgs(page, "list_skill_files")).toEqual({ name: "remote-compute-ssh" });
+  await expect.poll(() => page.evaluate(() => (window as any).__skillPreviewUnsafe ?? false)).toBe(false);
+  await detail.getByRole("button", { name: "Source", exact: true }).click();
+  await expect(detail.getByTestId("skill-file-source")).toContainText("name: remote-compute-ssh");
+  const picker = detail.getByRole("combobox", { name: "Select skill file" });
+  await picker.selectOption("scripts/nested/analyze.py");
+  await expect(detail.getByTestId("skill-file-source")).toContainText("print('analysis ready')");
+  await detail.getByRole("textbox", { name: "Edit tags" }).fill("compute, reviewed");
+  await detail.getByRole("textbox", { name: "Edit tags" }).press("Tab");
+  await expect.poll(() => lastInvokeArgs(page, "set_skill_tags")).toEqual({ name: "remote-compute-ssh", tags: ["compute", "reviewed"] });
+  await expect(picker).toHaveValue("scripts/nested/analyze.py");
+  await detail.locator("label.toggle").click();
+  await expect.poll(() => lastInvokeArgs(page, "set_skill_enabled")).toEqual({ name: "remote-compute-ssh", enabled: false });
+  await expect(detail.getByTestId("skill-file-source")).toContainText("analysis ready");
+  await page.locator(".settings-crumb-link").click();
+  const row = page.locator('[data-skill-name="remote-compute-ssh"]');
+  await expect(row.locator('.skill-tag')).toHaveText(["compute", "reviewed"]);
+  await expect(row.getByRole("checkbox")).not.toBeChecked();
+  await expect(page.locator('[data-skill-name="literature-review"]')).toHaveCount(0);
+  await row.locator('.skill-row-open').click();
+  await page.keyboard.press("Escape");
+  await expect(detail).toBeHidden();
+  await expect(page.locator(".settings-page")).toBeVisible();
+  await page.locator('.skill-tags-filter').getByRole("button", { name: "All", exact: true }).click();
+  await page.screenshot({ path: testInfo.outputPath("skill-catalog.png"), fullPage: true });
+});
+
+test("skill detail shows file errors and ignores stale file responses", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Skills");
+  await page.locator('[data-skill-name="literature-review"] .skill-row-open').click();
+  const detail = page.getByTestId("skill-detail");
+  const picker = detail.getByRole("combobox", { name: "Select skill file" });
+  await expect(detail.getByTestId("skill-file-preview")).toBeVisible();
+  await picker.selectOption("assets/image.png");
+  await expect(detail.getByRole("alert")).toContainText("Binary files cannot be previewed");
+  await expect(detail.getByTestId("skill-file-preview")).toBeHidden();
+  await picker.selectOption("scripts/slow.py");
+  await picker.selectOption("scripts/nested/analyze.py");
+  await expect(detail.getByTestId("skill-file-source")).toContainText("analysis ready");
+  await page.waitForTimeout(500);
+  await expect(detail.getByTestId("skill-file-source")).not.toContainText("old slow response");
+  await picker.selectOption("references/guide.md");
+  await expect(detail.getByTestId("skill-file-preview")).toContainText("Reference guide");
+  await detail.getByRole("link", { name: "Paper reference" }).click();
+  await expect(page.getByTestId("external-link-confirm")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("external-link-confirm")).toBeHidden();
+  await expect(detail).toBeVisible();
+  await expect(picker).toHaveValue("references/guide.md");
+});
+
+test("skill detail reports unavailable packages and can return immediately", async ({ page }) => {
+  await enterApp(page, "/?mockSkillFilesError=1");
+  await openSettingsSection(page, "Skills");
+  await page.locator('[data-skill-name="literature-review"] .skill-row-open').click();
+  await expect(page.getByTestId("skill-detail").getByRole("alert")).toContainText("Skill package is unavailable");
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("skill-detail")).toBeHidden();
+  await expect(page.locator(".settings-page")).toBeVisible();
+});
+
 test("skill manager filters by tag and batch disables visible skills", async ({ page }) => {
   await enterApp(page);
   await page.getByRole("button", { name: "Add to message" }).click();
@@ -8823,7 +10748,7 @@ test("skill manager filters by tag and batch disables visible skills", async ({ 
   await expect(page.locator(".settings-search")).toHaveAttribute("inputmode", "search");
   await expect(page.locator(".settings-search")).toHaveAttribute("autocomplete", "off");
   await expect(page.locator(".settings-filter")).toContainText(/visible.*enabled/);
-  await expect(page.locator(".skill-tags-editor").first()).not.toHaveAttribute("open", "");
+  await expect(page.locator(".skill-tags-input")).toHaveCount(0);
 
   await page.getByRole("button", { name: "Disabled", exact: true }).click();
   await expect(page.getByText("No skills match the current filters.")).toBeVisible();
@@ -8856,7 +10781,7 @@ test("skill manager reloads manually copied skills and shows their scope", async
 
   const fresh = page.locator('[data-skill-name="fresh-project-skill"]');
   await expect.poll(() => lastInvokeArgs(page, "reload_skills")).toEqual({});
-  await expect(fresh).toContainText("Newly copied project skill");
+  await expect(fresh).toContainText("fresh-project-skill");
   await expect(fresh).toContainText("Project");
   await expect(fresh.locator('input[type="checkbox"]')).toBeChecked();
   await expect(fresh.getByRole("button", { name: "Delete skill" })).toHaveCount(0);
@@ -8881,9 +10806,14 @@ test("skill manager updates and deletes user-added skills", async ({ page }) => 
   await expect(page.getByText("Skill added or updated.")).toBeVisible();
 
   const skill = page.locator('[data-skill-name="paper-narrative"]');
-  await expect(skill.getByRole("button", { name: "Delete skill" })).toBeVisible();
-  await skill.getByRole("button", { name: "Delete skill" }).click();
+  await skill.locator(".skill-row-open").click();
+  const detail = page.getByTestId("skill-detail");
+  await detail.getByRole("button", { name: "Delete skill" }).click();
   const confirm = page.getByTestId("skill-remove-confirm");
+  await page.keyboard.press("Escape");
+  await expect(confirm).toBeHidden();
+  await expect(detail).toBeVisible();
+  await detail.getByRole("button", { name: "Delete skill" }).click();
   await expect(confirm).toContainText(
     "Delete paper-narrative? Its installed files will be removed. This cannot be undone.",
   );
@@ -9007,7 +10937,7 @@ test("custom MCP row opens tools while edit uses a dedicated button", async ({ p
 
   const row = page.locator(".settings-list-row", { hasText: "wolai_cmp" });
   await row.click();
-  await expect(page.getByText("wolai_search")).toBeVisible();
+  await page.getByRole("button", { name: "wolai_search", exact: true }).click();
   await expect(page.getByText("Search Wolai pages")).toBeVisible();
 
   await page.locator(".settings-head-back").click();
@@ -9070,9 +11000,118 @@ test("Notion uses the generic Remote URL OAuth connection flow", async ({ page }
   await expect(page.getByText("Service", { exact: true })).toBeVisible();
   await expect(page.getByText("https://mcp.notion.com/mcp", { exact: true })).toBeVisible();
   await expect(page.getByText("Status", { exact: true })).toBeVisible();
-  await expect(page.getByText("Enabled", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("connector-detail").getByText("Ready", { exact: true })).toBeVisible();
   await expect(page.getByText("Authentication", { exact: true })).toBeVisible();
   await expect(page.getByText("OAuth", { exact: true })).toBeVisible();
+});
+
+test("custom MCP detail reports managed disconnect and reconnect state", async ({ page }) => {
+  await page.goto("/?mockMcpStatus=disconnected&mockMcpLastError=502%20Bad%20Gateway");
+  await page.locator(".proj-card-main").first().click();
+  await globalSettingsButton(page).click();
+  await page.getByRole("button", { name: "Connections" }).click();
+  await page.locator(".settings-list-row-link", { hasText: "wolai_cmp" }).click();
+  const detail = page.getByTestId("connector-detail");
+  await expect(detail.getByText("Disconnected", { exact: true })).toBeVisible();
+  await expect(detail.getByText("502 Bad Gateway", { exact: true })).toBeVisible();
+
+  await page.goto("/?mockMcpStatus=reconnecting");
+  await page.locator(".proj-card-main").first().click();
+  await globalSettingsButton(page).click();
+  await page.getByRole("button", { name: "Connections" }).click();
+  await page.locator(".settings-list-row-link", { hasText: "wolai_cmp" }).click();
+  await expect(page.getByTestId("connector-detail").getByText("Reconnecting…", { exact: true })).toBeVisible();
+});
+
+test("MCP env values stay focused while typing and can be revealed", async ({ page }) => {
+  await enterApp(page);
+  await globalSettingsButton(page).click();
+  await page.getByRole("button", { name: "Connections" }).click();
+  await page.getByRole("button", { name: "Add connection" }).click();
+
+  const name = page.getByTestId("conn-secret-name").first();
+  const value = page.getByTestId("conn-secret-value").first();
+  const reveal = page.getByTestId("conn-secret-reveal").first();
+  await expect(value).toHaveAttribute("type", "password");
+  await expect(reveal).toHaveAttribute("aria-pressed", "false");
+
+  // Character-by-character: the previous list rebuilt every keystroke from
+  // conn_form, so focus dropped after the first letter and only paste worked.
+  await name.click();
+  await name.pressSequentially("API_KEY");
+  await expect(name).toHaveValue("API_KEY");
+  await expect(name).toBeFocused();
+
+  await value.click();
+  await value.pressSequentially("secret-token");
+  await expect(value).toHaveValue("secret-token");
+  await expect(value).toBeFocused();
+
+  await reveal.click();
+  await expect(value).toHaveAttribute("type", "text");
+  await expect(value).toHaveValue("secret-token");
+  await expect(reveal).toHaveAttribute("aria-pressed", "true");
+  await expect(value).toBeFocused();
+
+  await value.pressSequentially("-more");
+  await expect(value).toHaveValue("secret-token-more");
+  await expect(value).toBeFocused();
+
+  await reveal.click();
+  await expect(value).toHaveAttribute("type", "password");
+  await expect(value).toHaveValue("secret-token-more");
+
+  await page.getByRole("button", { name: "Add variable" }).click();
+  await expect(page.getByTestId("conn-secret-row")).toHaveCount(2);
+  const secondName = page.getByTestId("conn-secret-name").nth(1);
+  const secondValue = page.getByTestId("conn-secret-value").nth(1);
+  await secondName.fill("OTHER");
+  await secondValue.fill("second-value");
+  await expect(value).toHaveValue("secret-token-more");
+
+  await page.getByLabel("Name").fill("local-mcp");
+  await page.getByRole("textbox", { name: "Command" }).fill("npx");
+  await page.getByRole("button", { name: "Save" }).click();
+  await expect.poll(() => lastInvokeArgs(page, "add_mcp_connection")).toMatchObject({
+    conn: {
+      name: "local-mcp",
+      transport: {
+        kind: "stdio",
+        command: "npx",
+        env: [
+          { name: "API_KEY", value: "secret-token-more" },
+          { name: "OTHER", value: "second-value" },
+        ],
+      },
+    },
+  });
+});
+
+test("MCP test disables the button and shows progress until it finishes", async ({ page }) => {
+  await enterApp(page);
+  await globalSettingsButton(page).click();
+  await page.getByRole("button", { name: "Connections" }).click();
+  await page.getByRole("button", { name: "Add connection" }).click();
+  await page.getByLabel("Name").fill("local-mcp");
+  await page.getByRole("textbox", { name: "Command" }).fill("npx");
+  await page.evaluate(() => (window as any).__delayNextMcpTest(1200));
+
+  const testBtn = page.getByTestId("conn-test");
+  await testBtn.click();
+  await expect(testBtn).toBeDisabled();
+  await expect(testBtn).toHaveText("Testing…");
+  await expect(testBtn).toHaveAttribute("aria-busy", "true");
+  await expect(page.getByTestId("conn-test-status")).toContainText("Testing the connection");
+  await expect(page.getByRole("button", { name: "Save" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Cancel" })).toBeEnabled();
+
+  await testBtn.click({ force: true });
+  await expect.poll(async () => (await invokeArgsList(page, "test_mcp_connection")).length).toBe(1);
+
+  await expect(page.getByTestId("conn-test-status")).toHaveText("OK — 2 tools");
+  await expect(testBtn).toBeEnabled();
+  await expect(testBtn).toHaveText("Test");
+  await expect(page.getByRole("button", { name: "Save" })).toBeEnabled();
 });
 
 test("OAuth authorization keeps Cancel available and clears form status", async ({ page }) => {
@@ -9084,10 +11123,12 @@ test("OAuth authorization keeps Cancel available and clears form status", async 
   await page.getByLabel("Type").selectOption("http");
   await page.getByPlaceholder("https://host/mcp").fill("https://example.com/mcp");
   await page.getByLabel("Authentication").selectOption("oauth");
-  await expect(page.getByPlaceholder("X-Custom-Header: value")).toBeVisible();
+  await expect(page.getByPlaceholder("X-Custom-Header")).toBeVisible();
 
   await page.getByRole("button", { name: "Test" }).click();
   await expect(page.getByText("Complete authorization in your browser…")).toBeVisible();
+  await expect(page.getByTestId("conn-test")).toBeDisabled();
+  await expect(page.getByTestId("conn-test")).toHaveAttribute("aria-busy", "true");
   const cancel = page.getByRole("button", { name: "Cancel" });
   await expect(cancel).toBeEnabled();
   await cancel.click();
@@ -9252,6 +11293,273 @@ test("large image approval warns before resizing and cannot be remembered", asyn
   });
 });
 
+test("composer plan stays visible through folded tools, live updates and session switches", async ({ page }, testInfo) => {
+  await enterApp(page, "/?mockSessionModels=1");
+  await page.locator('[data-session-id="s-model-a"]').click();
+  await composer(page).fill("PLANPROGRESS");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => typeof (window as any).__finishPlanProgress)).toBe("function");
+  const strip = page.getByTestId("composer-plan-progress");
+  const update = async (content: string, ok = true) => {
+    await emitTauriEvent(page, "agent", { kind: "ToolCall", frame_id: "s-model-a", name: "update_plan", preview: "Plan update" });
+    await emitTauriEvent(page, "agent", { kind: "ToolResult", frame_id: "s-model-a", name: "update_plan", ok, content });
+  };
+  await expect(strip).toHaveCount(0);
+  await update("[x] Inspect data\n[~] Check barcode alignment\n[ ] Verify results");
+  await expect(strip).toBeVisible();
+  await expect(strip).toContainText("1 / 3 completed");
+  await expect(strip.locator(".composer-plan-current")).toHaveText("Check barcode alignment");
+  await expect(strip).toHaveClass(/is-running/);
+  const stepsHead = page.locator(".steps-head").last();
+  if (await stepsHead.getAttribute("aria-expanded") === "true") await stepsHead.click();
+  await expect(stepsHead).toHaveAttribute("aria-expanded", "false");
+  await expect(strip).toBeVisible();
+  await expect(strip.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "1");
+  const marker = strip.locator(".composer-plan-mark");
+  await expect(marker).toHaveCSS("animation-name", "composer-plan-orbit");
+  await strip.evaluate(el => { (window as any).__planStripNode = el; });
+  await emitTauriEvent(page, "agent", { kind: "Reasoning", frame_id: "s-model-a", delta: "Inspecting more evidence" });
+  expect(await strip.evaluate(el => el === (window as any).__planStripNode)).toBe(true);
+  // Rejected revisions cannot create false completion.
+  await update("[x] Everything done", false);
+  await expect(strip).toContainText("1 / 3 completed");
+  await update("[x] Inspect data\n[x] Check barcode alignment\n[~] Verify results");
+  await expect(strip).toContainText("2 / 3 completed");
+  await expect(strip.locator(".composer-plan-current")).toHaveText("Verify results");
+  await expect(strip.locator(".composer-plan-track > span")).toHaveAttribute("style", /66\.66/);
+  await page.locator("#chat-scroller").evaluate(el => { el.scrollTop = 0; });
+  await expect(strip).toBeInViewport();
+  const stripBox = (await strip.boundingBox())!;
+  const composerBox = (await composer(page).boundingBox())!;
+  expect(stripBox.y + stripBox.height).toBeLessThanOrEqual(composerBox.y);
+  const inputBox = (await page.locator(".composer-inner").boundingBox())!;
+  expect(Math.abs(stripBox.x - inputBox.x)).toBeLessThan(1);
+  expect(Math.abs(stripBox.width - inputBox.width)).toBeLessThan(1);
+  await expect(strip.locator(".composer-plan-current")).toHaveCSS("opacity", "1");
+  await page.screenshot({ path: testInfo.outputPath("composer-plan-running.png") });
+  await page.locator(".composer").screenshot({ path: testInfo.outputPath("composer-plan-detail.png") });
+  await page.locator('[data-session-id="s-model-b"]').click();
+  await expect(strip).toHaveCount(0);
+  await page.locator('[data-session-id="s-model-a"]').click();
+  await expect(strip).toContainText("2 / 3 completed");
+  await expect(strip).toHaveClass(/is-running/);
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await expect(marker).toHaveCSS("animation-name", "none");
+  await expect(strip.locator(".composer-plan-track > span")).toHaveCSS("transition-duration", "0s");
+  await page.evaluate(() => (window as any).__finishPlanProgress());
+  await expect(strip).not.toHaveClass(/is-running/);
+  await expect(strip).toContainText("not running");
+  await update("[x] Inspect data\n[x] Check barcode alignment\n[x] Verify results");
+  await expect(strip).toContainText("Plan completed");
+  await expect(strip).toContainText("3 / 3 completed");
+  await expect(strip.locator(".composer-plan-current")).toHaveCount(0);
+  await expect(strip.getByTestId("composer-plan-dismiss")).toBeVisible();
+  await expect(strip.getByTestId("composer-plan-steps")).toHaveCount(0);
+  await emitTauriEvent(page, "agent", { kind: "User", frame_id: "s-model-a", text: "A new task" });
+  await expect(strip).toHaveCount(0);
+});
+
+test("composer plan supports Chinese, cancelled steps and narrow light/dark layouts", async ({ page }, testInfo) => {
+  await page.goto("/?mockSessionModels=1&mockLocale=zh");
+  await page.locator(".proj-card-main").first().click();
+  await page.locator('[data-session-id="s-model-a"]').click();
+  await emitTauriEvent(page, "agent", { kind: "ToolResult", frame_id: "s-model-a", name: "update_plan", ok: true,
+    content: "[x] 检查输入数据\n[~] 检查训练输出数据中 barcode 与 species 的对应关系并回溯数据拼接逻辑\n[-] 可选对照分析" });
+  const strip = page.getByTestId("composer-plan-progress");
+  await expect(strip).toContainText("1 / 3 已完成");
+  for (const theme of ["light", "dark"]) {
+    await page.evaluate(theme => document.documentElement.setAttribute("data-theme", theme), theme);
+    await strip.evaluate(el => { (el as HTMLElement).style.width = "280px"; });
+    expect(await strip.evaluate(el => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
+    await expect(strip.locator(".composer-plan-current")).toHaveAttribute("title", /barcode 与 species/);
+    await expect(strip.locator(".composer-plan-current")).toHaveCSS("opacity", "1");
+    await strip.screenshot({ path: testInfo.outputPath(`composer-plan-${theme}-narrow.png`) });
+  }
+  await emitTauriEvent(page, "agent", { kind: "ToolResult", frame_id: "s-model-a", name: "update_plan", ok: true,
+    content: "[x] 检查输入数据\n[-] 停止分析\n[-] 可选对照分析" });
+  await expect(strip).toContainText("计划已结束");
+  await expect(strip).not.toHaveClass(/is-complete/);
+  await expect(strip.getByTestId("composer-plan-dismiss")).toHaveCount(0);
+});
+
+test("composer plan expands the checklist and dismisses a completed plan", async ({ page }) => {
+  await enterApp(page, "/?mockSessionModels=1");
+  await page.locator('[data-session-id="s-model-a"]').click();
+  await composer(page).fill("PLANPROGRESS");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => typeof (window as any).__finishPlanProgress)).toBe("function");
+  const strip = page.getByTestId("composer-plan-progress");
+  const update = async (content: string) => {
+    await emitTauriEvent(page, "agent", { kind: "ToolCall", frame_id: "s-model-a", name: "update_plan", preview: "Plan update" });
+    await emitTauriEvent(page, "agent", { kind: "ToolResult", frame_id: "s-model-a", name: "update_plan", ok: true, content });
+  };
+  await update("[x] Inspect data\n[~] Check barcode alignment\n[ ] Verify results");
+  await expect(strip.getByTestId("composer-plan-dismiss")).toHaveCount(0);
+  await expect(strip.getByTestId("composer-plan-toggle")).toHaveAttribute("aria-expanded", "false");
+  await strip.getByTestId("composer-plan-toggle").click();
+  const steps = strip.getByTestId("composer-plan-steps");
+  await expect(steps).toBeVisible();
+  await expect(strip.getByTestId("composer-plan-toggle")).toHaveAttribute("aria-expanded", "true");
+  await expect(steps.locator("li")).toHaveCount(3);
+  await expect(steps.locator("li").nth(1)).toHaveAttribute("data-status", "running");
+  await expect(steps.locator("li").nth(1)).toContainText("Check barcode alignment");
+  await expect(strip.locator(".composer-plan-current")).toHaveCount(0);
+  await strip.getByTestId("composer-plan-toggle").click();
+  await expect(steps).toHaveCount(0);
+  await expect(strip).toBeVisible();
+  await expect(strip.getByTestId("composer-plan-toggle")).toHaveAttribute("aria-expanded", "false");
+  await strip.getByTestId("composer-plan-toggle").click();
+  await expect(steps.locator("li")).toHaveCount(3);
+  await update("[x] Inspect data\n[x] Check barcode alignment\n[x] Verify results");
+  await expect(strip).toContainText("Plan completed");
+  await expect(steps.locator("li")).toHaveCount(3);
+  await expect(steps.locator("li").last()).toHaveAttribute("data-status", "done");
+  const dismiss = strip.getByTestId("composer-plan-dismiss");
+  await expect(dismiss).toBeVisible();
+  await dismiss.click();
+  await expect(strip).toHaveCount(0);
+  await update("[x] Inspect data\n[x] Check barcode alignment\n[x] Verify results\n[~] Write summary");
+  await expect(strip).toBeVisible();
+  await expect(strip).toContainText("3 / 4 completed");
+  await expect(strip.getByTestId("composer-plan-dismiss")).toHaveCount(0);
+  await expect(strip.getByTestId("composer-plan-steps")).toHaveCount(0);
+});
+
+test("execution plan shows real steps and keeps tool metadata in details", async ({ page }) => {
+  await enterApp(page, "/?mockSessionModels=1");
+  await page.locator('[data-session-id="s-model-a"]').click();
+  await emitTauriEvent(page, "agent", {
+    kind: "ToolCall", frame_id: "s-model-a", name: "update_plan", preview: "0/4 steps done",
+  });
+  await page.locator(".steps-head").last().click();
+  const card = page.getByTestId("execution-plan").last();
+  await expect(card).toContainText("Updating plan…");
+  await expect(card.locator(".execution-plan-count")).toHaveText("0 / 4 completed");
+  await expect(card.locator("li")).toHaveCount(0);
+  await expect(card.locator("pre")).toHaveCount(0);
+
+  await emitTauriEvent(page, "agent", {
+    kind: "ToolResult", frame_id: "s-model-a", name: "update_plan", ok: true, duration_ms: 12,
+    content: "Plan (4 steps):\n[x] Inspect input data\n[~] Run analysis\n[ ] Write report\n[-] Optional comparison",
+  });
+  await expect(card.locator(".execution-plan-count")).toHaveText("1 / 4 completed");
+  await expect(card.locator("li")).toHaveCount(4);
+  await expect(card.locator('li[data-status="running"]')).toContainText("In progress");
+  await expect(card.locator('li[data-status="cancelled"]')).toContainText("Cancelled");
+  await expect(card.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "1");
+  await expect(card).not.toContainText("update_plan");
+  await expect(card).not.toContainText("12ms");
+  await expect(card.locator(".execution-plan-head")).toHaveAttribute("aria-expanded", "true");
+  await card.getByRole("button", { name: "Tool details" }).click();
+  await expect(card.locator(".execution-plan-meta")).toContainText("Plan updated");
+  await expect(card.locator(".execution-plan-meta")).toContainText("update_plan");
+  await expect(card.locator("pre")).toHaveCount(2);
+  await card.getByRole("button", { name: "Tool details" }).click();
+  await expect(card.locator("pre")).toHaveCount(0);
+
+  // Explicitly collapsed cards stay collapsed across later transcript updates.
+  await card.locator(".execution-plan-head").click();
+  await expect(card.locator(".execution-plan-body")).toHaveCount(0);
+  await emitTauriEvent(page, "agent", { kind: "Reasoning", frame_id: "s-model-a", delta: "Checking the next step" });
+  await expect(card.locator(".execution-plan-head")).toHaveAttribute("aria-expanded", "false");
+  await card.locator(".execution-plan-head").click();
+  await expect(card.locator("li")).toHaveCount(4);
+});
+
+test("execution plan automatically collapses only when every step completes", async ({ page }) => {
+  await enterApp(page, "/?mockSessionModels=1");
+  await page.locator('[data-session-id="s-model-a"]').click();
+  await emitTauriEvent(page, "agent", {
+    kind: "ToolCall", frame_id: "s-model-a", name: "update_plan", preview: "2/2 steps done",
+  });
+  await page.locator(".steps-head").last().click();
+  const card = page.getByTestId("execution-plan").last();
+  await expect(card.locator(".execution-plan-head")).toHaveAttribute("aria-expanded", "true");
+  await emitTauriEvent(page, "agent", {
+    kind: "ToolResult", frame_id: "s-model-a", name: "update_plan", ok: true, duration_ms: 1,
+    content: "Plan (2 steps):\n[x] Inspect data\n[x] Write report",
+  });
+  await expect(card.locator(".execution-plan-head")).toHaveAttribute("aria-expanded", "false");
+  await expect(card).toContainText("Plan completed");
+  await expect(card.locator(".execution-plan-body")).toHaveCount(0);
+  // Native keyboard activation opens the collapsed header.
+  await card.locator(".execution-plan-head").focus();
+  await page.keyboard.press("Enter");
+  await expect(card.locator("li")).toHaveCount(2);
+  await expect(card.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "2");
+});
+
+test("execution plan failures remain visible and never claim completion", async ({ page }) => {
+  await enterApp(page, "/?mockSessionModels=1");
+  await page.locator('[data-session-id="s-model-a"]').click();
+  await emitTauriEvent(page, "agent", {
+    kind: "ToolCall", frame_id: "s-model-a", name: "update_plan", preview: "4/4 steps done",
+  });
+  await emitTauriEvent(page, "agent", {
+    kind: "ToolResult", frame_id: "s-model-a", name: "update_plan", ok: false,
+    content: "Plan rejected by the user. Revise the plan.",
+  });
+  await page.locator(".steps-head").last().click();
+  const card = page.getByTestId("execution-plan").last();
+  await expect(card.getByRole("alert")).toContainText("Plan rejected by the user");
+  await expect(card).toContainText("Plan update failed");
+  await expect(card.locator(".execution-plan-count")).toHaveCount(0);
+  await expect(card.getByRole("progressbar")).toHaveCount(0);
+  await expect(card.locator(".execution-plan-head")).toHaveAttribute("aria-expanded", "true");
+});
+
+test("execution plan fits narrow panes in light and dark themes", async ({ page }, testInfo) => {
+  await page.goto("/?mockSessionModels=1&mockLocale=zh");
+  await page.locator(".proj-card-main").first().click();
+  await page.locator('[data-session-id="s-model-a"]').click();
+  await emitTauriEvent(page, "agent", {
+    kind: "ToolResult", frame_id: "s-model-a", name: "update_plan", ok: true,
+    content: "Plan (4 steps):\n[x] 检查输入数据\n[~] 执行分析流程\n[ ] 整理结果与报告\n[-] 可选对照分析",
+  });
+  await page.locator(".steps-head").last().click();
+  const card = page.getByTestId("execution-plan").last();
+  await expect(card.locator("li")).toHaveCount(4);
+  await expect(card.locator(".execution-plan-title")).toHaveText("执行计划");
+  await expect(card.locator(".execution-plan-count")).toHaveText("1 / 4 已完成");
+  for (const theme of ["light", "dark"]) {
+    await page.evaluate((theme) => document.documentElement.setAttribute("data-theme", theme), theme);
+    for (const width of [600, 320]) {
+      // Exercise the component's container width independently of desktop chrome.
+      await card.evaluate((element, width) => { (element as HTMLElement).style.width = `${width}px`; }, width);
+      const box = await card.boundingBox();
+      expect(box).not.toBeNull();
+      for (const row of await card.locator(".execution-plan-head, li").all()) {
+        expect(await row.evaluate((el) => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
+      }
+      await card.screenshot({ path: testInfo.outputPath(`plan-${theme}-${width}.png`) });
+    }
+  }
+});
+
+test("update_plan approval renders structured multiline Markdown", async ({ page }) => {
+  await enterApp(page, "/?mockSessionModels=1");
+  await page.locator('[data-session-id="s-model-a"]').click();
+  await page.evaluate(() => (window as any).__tauriEmit("confirm-request", {
+    frame_id: "s-model-a",
+    message: "Review the proposed plan",
+    tool: "update_plan",
+    preview: JSON.stringify({
+      v: 1,
+      steps: [{
+        status: "pending",
+        content: "**实现 Fast**\n\n- Chat Completions\n  - `service_tier=priority`\n\n> 保持默认兼容",
+      }],
+    }),
+  }));
+
+  const step = page.locator(".plan-step-text");
+  await expect(step.locator("strong")).toHaveText("实现 Fast");
+  await expect(step.locator("ul li")).toHaveCount(2);
+  await expect(step.locator("code")).toHaveText("service_tier=priority");
+  await expect(step.locator("blockquote")).toContainText("保持默认兼容");
+  await expect(step).not.toContainText("**实现 Fast**");
+});
+
 test("Escape closes plan feedback before rejecting the plan", async ({ page }) => {
   await enterApp(page);
   await composer(page).fill("NEEDPLAN");
@@ -9338,6 +11646,107 @@ test("settings permissions lists and revokes remembered approvals", async ({ pag
   await expect(page.getByText("No remembered approvals.")).toBeVisible();
 });
 
+test("project approval modes live in Permissions and persist independently of grants", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Connections");
+  await expect(page.getByTestId("project-approval-settings")).toHaveCount(0);
+  const featured = page.locator(".conn-group-label").first();
+  const note = page.locator(".connections-pane > .settings-note");
+  const gap = (await featured.boundingBox())!.y - ((await note.boundingBox())!.y + (await note.boundingBox())!.height);
+  expect(gap).toBeLessThan(40);
+  await expect(page.locator(".connections-pane > .settings-list").first()).toHaveJSProperty("scrollHeight",
+    await page.locator(".connections-pane > .settings-list").first().evaluate(el => el.clientHeight));
+
+  await page.getByRole("button", { name: "Permissions", exact: true }).click();
+  const mode = page.getByTestId("project-approval-settings");
+  const rules = mode.getByRole("button", { name: "Per-tool rules", exact: true });
+  const auto = mode.getByRole("button", { name: "Auto-approve", exact: true });
+  await expect(mode).toContainText("Current project · applies from the next tool call");
+  await expect(rules).toHaveAttribute("aria-pressed", "true");
+  await expect(mode.getByRole("button", { name: "Full bypass", exact: true })).toBeHidden();
+  await auto.click();
+  await expect(auto).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByTestId("approval-mode-description")).toContainText("Dangerous commands still require confirmation.");
+  await page.getByRole("button", { name: "Revoke all" }).click();
+  await expect(page.getByText("No remembered approvals.")).toBeVisible();
+  await expect(auto).toHaveAttribute("aria-pressed", "true");
+  await page.keyboard.press("Escape");
+  await openSettingsSection(page, "Permissions");
+  await expect(auto).toHaveAttribute("aria-pressed", "true");
+  await rules.click();
+  await expect(rules).toHaveAttribute("aria-pressed", "true");
+  await expect.poll(() => page.evaluate(() => (window as any).__skillInvokeLog
+    .filter((entry: any) => entry.cmd === "set_approval_scope")
+    .map((entry: any) => entry.args instanceof Map ? entry.args.get("scope") : entry.args.scope))).toEqual(["auto", "ask"]);
+});
+
+test("full bypass is an advanced choice and stays visible when collapsed or reopened", async ({ page }) => {
+  await enterApp(page, "/?mockApprovalScope=full");
+  await openSettingsSection(page, "Permissions");
+  const mode = page.getByTestId("project-approval-settings");
+  const advanced = page.getByTestId("approval-mode-advanced");
+  const description = page.getByTestId("approval-mode-description");
+  await expect(advanced).not.toHaveAttribute("open", "");
+  await expect(description).toContainText("Full bypass");
+  await expect(description).toContainText("including confirmation for dangerous commands");
+  await mode.getByRole("button", { name: "Per-tool rules", exact: true }).click();
+  await expect(description).toContainText("Per-tool rules");
+  await advanced.locator("summary").click();
+  await mode.getByRole("button", { name: "Full bypass", exact: true }).click();
+  await expect(mode.getByRole("button", { name: "Full bypass", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await advanced.locator("summary").click();
+  await expect(description).toContainText("Full bypass");
+  await expect(mode.getByRole("button", { name: "Full bypass", exact: true })).toBeHidden();
+  await page.keyboard.press("Escape");
+  await openSettingsSection(page, "Permissions");
+  await expect(description).toContainText("Full bypass");
+  await mode.getByRole("button", { name: "Auto-approve", exact: true }).click();
+  await expect(description).toContainText("Auto-approve");
+});
+
+test("approval mode save failures keep the previous selection and allow retry", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Permissions");
+  await page.evaluate(() => { (window as any).__mockApprovalScopeError = "Could not save project approval mode"; });
+  const mode = page.getByTestId("project-approval-settings");
+  const auto = mode.getByRole("button", { name: "Auto-approve", exact: true });
+  await auto.click();
+  await expect(mode.getByRole("alert")).toContainText("Could not save project approval mode");
+  await expect(mode.getByRole("button", { name: "Per-tool rules", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(auto).toBeEnabled();
+  await page.evaluate(() => { (window as any).__mockApprovalScopeError = null; });
+  await auto.click();
+  await expect(auto).toHaveAttribute("aria-pressed", "true");
+  await expect(mode.getByRole("alert")).toHaveCount(0);
+});
+
+test("Chinese approval settings fit desktop and narrow windows", async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto("/?mockLocale=zh");
+  await page.locator(".proj-card-main").first().click();
+  await page.getByRole("button", { name: "设置", exact: true }).click();
+  await page.locator(".settings-nav").getByRole("button", { name: "连接", exact: true }).click();
+  await expect(page.getByText("审批范围", { exact: true })).toHaveCount(0);
+  await expect(page.locator(".settings-list-row-link", { hasText: "BioMart" })).toBeVisible();
+  await page.screenshot({ animations: "disabled", path: testInfo.outputPath("connections-zh.png") });
+  await page.locator(".settings-nav").getByRole("button", { name: "权限", exact: true }).click();
+  const mode = page.getByTestId("project-approval-settings");
+  await expect(mode).toContainText("工具审批模式");
+  await expect(mode).toContainText("当前项目 · 从下一次工具调用起生效");
+  await page.screenshot({ animations: "disabled", path: testInfo.outputPath("permissions-zh.png") });
+  await page.setViewportSize({ width: 820, height: 740 });
+  await expectInsideViewport(mode, 820, 740);
+  await expectInsideViewport(mode.getByRole("button", { name: "按工具规则", exact: true }), 820, 740);
+  await expectInsideViewport(mode.getByRole("button", { name: "自动批准", exact: true }), 820, 740);
+  await page.getByTestId("approval-mode-advanced").locator("summary").click();
+  const full = mode.getByRole("button", { name: "完全放行", exact: true });
+  await expectInsideViewport(full, 820, 740);
+  await full.click();
+  await expect(page.getByTestId("approval-mode-description")).toContainText("完全放行");
+  await expect(full).toHaveCSS("color", "rgb(255, 255, 255)");
+  await page.screenshot({ animations: "disabled", path: testInfo.outputPath("permissions-narrow-zh.png") });
+});
+
 test("browser URL filters persist block and prefer hosts", async ({ page }) => {
   await enterApp(page);
   await openSettingsSection(page, "Browser");
@@ -9363,6 +11772,185 @@ test("browser URL filters persist block and prefer hosts", async ({ page }) => {
 
   await page.getByTestId("browser-block-remove").click();
   await expect(page.getByTestId("browser-block-list")).toContainText("No blocked hosts.");
+});
+
+test("browser auto-close tabs setting persists", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Browser");
+  const autoClose = page.getByTestId("browser-auto-close-tabs");
+  await expect(autoClose).not.toBeChecked();
+  await autoClose.locator("..").click();
+  await expect(autoClose).toBeChecked();
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".settings-page")).toHaveCount(0);
+
+  await openSettingsSection(page, "Browser");
+  await expect(page.getByTestId("browser-auto-close-tabs")).toBeChecked();
+});
+
+test("browser tab cleanup confirms selected tabs and Escape keeps them", async ({ page }) => {
+  await enterApp(page);
+  const prompt = {
+    turn_id: "turn-ui",
+    frame_id: "s1",
+    tabs: [
+      { session: "shared", tab_id: 11, url: "https://keep.example/paper", title: "Keep me", initial_url: "https://keep.example" },
+      { session: "shared", tab_id: 12, url: "https://close.example/paper", title: "Close me", initial_url: "https://close.example" },
+    ],
+  };
+  await emitTauriEvent(page, "browser-tab-cleanup", prompt);
+  const dialog = page.getByTestId("browser-tab-cleanup");
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("This turn opened 2 tabs");
+  await expect(page.getByTestId("browser-tab-cleanup-check-11")).toBeChecked();
+  await expect(page.getByTestId("browser-tab-cleanup-check-12")).toBeChecked();
+  await page.getByTestId("browser-tab-cleanup-check-11").uncheck();
+  await page.getByTestId("browser-tab-cleanup-close").click();
+  await expect(dialog).toHaveCount(0);
+  await expect.poll(async () => page.evaluate(() => {
+    const call = ((window as any).__skillInvokeLog ?? []).find((c: any) => c.cmd === "confirm_browser_tab_cleanup");
+    if (!call) return null;
+    const args = call.args instanceof Map ? Object.fromEntries(call.args) : (call.args ?? {});
+    const tabs = Array.isArray(args.tabs) ? args.tabs.map((tab: any) => tab instanceof Map ? Object.fromEntries(tab) : tab) : [];
+    return { turnId: args.turnId, tabIds: tabs.map((tab: any) => tab.tab_id) };
+  })).toEqual({ turnId: "turn-ui", tabIds: [12] });
+
+  await emitTauriEvent(page, "browser-tab-cleanup", {
+    ...prompt,
+    turn_id: "turn-escape",
+  });
+  await expect(page.getByTestId("browser-tab-cleanup")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("browser-tab-cleanup")).toHaveCount(0);
+  await expect.poll(async () => page.evaluate(() =>
+    ((window as any).__skillInvokeLog ?? []).some((c: any) => c.cmd === "dismiss_browser_tab_cleanup")
+  )).toBe(true);
+});
+
+test("switching projects clears browser prompts without dismissing the other project's tabs", async ({ page }) => {
+  await enterApp(page);
+  const tabs = [{ session: "shared", tab_id: 11, url: "https://paper.example", title: "Project A", frame_id: "s1", turn_id: "turn-a" }];
+  await emitTauriEvent(page, "browser-tab-cleanup", { turn_id: "turn-a", frame_id: "s1", tabs });
+  await emitTauriEvent(page, "browser-tab-cleanup", { turn_id: "turn-queued", frame_id: "s1", tabs });
+  await emitTauriEvent(page, "browser-needs-human", { tabs });
+  await expect(page.getByTestId("browser-needs-human")).toBeVisible();
+  await emitTauriEvent(page, "open-session", { projectId: "other", sessionId: "pet-frame" });
+  await expect.poll(() => lastInvokeArgs(page, "load_session")).toMatchObject({ id: "pet-frame" });
+  await expect(page.getByTestId("browser-tab-cleanup")).toHaveCount(0);
+  await expect(page.getByTestId("browser-needs-human")).toHaveCount(0);
+  expect(await lastInvokeArgs(page, "dismiss_browser_tab_cleanup")).toBeNull();
+  expect(await lastInvokeArgs(page, "confirm_browser_tab_cleanup")).toBeNull();
+});
+
+test("a delayed browser verification cannot restore another project's prompt", async ({ page }) => {
+  await enterApp(page);
+  await page.evaluate(() => {
+    const core = (window as any).__TAURI__.core;
+    const invoke = core.invoke;
+    core.invoke = (cmd: string, args: unknown) => cmd === "confirm_browser_needs_human"
+      ? new Promise((resolve) => { (window as any).__resolveVerification = resolve; })
+      : invoke(cmd, args);
+  });
+  const tabs = [{ session: "shared", tab_id: 11, url: "https://paper.example", title: "Project A", frame_id: "s1", turn_id: "turn-a" }];
+  await emitTauriEvent(page, "browser-needs-human", { tabs });
+  await page.getByTestId("browser-needs-human-done").click();
+  await expect.poll(() => page.evaluate(() => typeof (window as any).__resolveVerification)).toBe("function");
+  await emitTauriEvent(page, "open-session", { projectId: "other", sessionId: "pet-frame" });
+  await expect.poll(() => lastInvokeArgs(page, "load_session")).toMatchObject({ id: "pet-frame" });
+  await page.evaluate((tabs) => {
+    (window as any).__resolveVerification({ still_required: tabs, cleared: [] });
+  }, tabs);
+  await emitTauriEvent(page, "native-menu-action", "settings");
+  await expect(page.getByTestId("settings-nav-session")).toBeVisible();
+  await expect(page.getByTestId("browser-needs-human")).toHaveCount(0);
+});
+
+test("browser needs-human overlay reminds, confirms, and Escape snoozes", async ({ page }) => {
+  await enterApp(page);
+  const prompt = {
+    tabs: [
+      {
+        session: "shared",
+        tab_id: 12,
+        url: "https://www.sciencedirect.com/science",
+        title: "Just a moment...",
+        reason: "captcha_challenge",
+        frame_id: "s1",
+        turn_id: "turn-human",
+      },
+    ],
+  };
+  await emitTauriEvent(page, "browser-needs-human", prompt);
+  const dialog = page.getByTestId("browser-needs-human");
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("Human verification needed");
+  await expect(dialog).toContainText("Just a moment...");
+  await page.getByTestId("browser-needs-human-row-12").click();
+  await expect.poll(() => lastInvokeArgs(page, "focus_browser_needs_human")).toMatchObject({
+    session: "shared",
+    tabId: 12,
+  });
+
+  await page.evaluate(() => { (window as any).__mockNeedsHumanStillRequired = true; });
+  await page.getByTestId("browser-needs-human-done").click();
+  await expect(page.getByTestId("browser-needs-human-error")).toContainText("still on the page");
+  await expect(dialog).toBeVisible();
+
+  await page.evaluate(() => { (window as any).__mockNeedsHumanStillRequired = false; });
+  await page.getByTestId("browser-needs-human-done").click();
+  await expect(dialog).toHaveCount(0);
+  await expect.poll(() => lastInvokeArgs(page, "confirm_browser_needs_human")).toMatchObject({
+    tabs: [{ tab_id: 12 }],
+  });
+  await expect.poll(() => lastInvokeArgs(page, "send_message")).toMatchObject({
+    sessionId: "s1",
+    message: "I completed the human verification in the browser. Continue.",
+  });
+
+  await emitTauriEvent(page, "browser-needs-human", prompt);
+  await expect(page.getByTestId("browser-needs-human")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("browser-needs-human")).toHaveCount(0);
+});
+
+test("browser needs-human Escape closes only the overlay while settings stay open", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Browser");
+  await expect(page.getByTestId("browser-url-filters")).toBeVisible();
+  await emitTauriEvent(page, "browser-needs-human", {
+    tabs: [
+      {
+        session: "shared",
+        tab_id: 7,
+        url: "https://www.sciencedirect.com/science",
+        title: "Are you a robot?",
+        reason: "captcha_challenge",
+        frame_id: "s1",
+        turn_id: "turn-settings",
+      },
+    ],
+  });
+  await expect(page.getByTestId("browser-needs-human")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("browser-needs-human")).toHaveCount(0);
+  await expect(page.getByTestId("browser-url-filters")).toBeVisible();
+});
+
+test("browser tab cleanup Escape closes only the overlay while settings stay open", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Browser");
+  await expect(page.getByTestId("browser-url-filters")).toBeVisible();
+  await emitTauriEvent(page, "browser-tab-cleanup", {
+    turn_id: "turn-settings",
+    frame_id: "s1",
+    tabs: [
+      { session: "shared", tab_id: 7, url: "https://example.com", title: "Example", initial_url: "https://example.com" },
+    ],
+  });
+  await expect(page.getByTestId("browser-tab-cleanup")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("browser-tab-cleanup")).toHaveCount(0);
+  await expect(page.getByTestId("browser-url-filters")).toBeVisible();
 });
 
 test("chat stays pinned to the bottom while streaming a long reply (#61)", async ({ page }) => {
@@ -9419,21 +12007,34 @@ test("streaming assistant keeps formatted Markdown with a lightweight live tail"
   await expect(live.locator(".streaming-markdown-prefix strong").first()).toBeVisible();
   // Deltas and the Markdown commit interval are both ~50 ms. A Playwright poll
   // started after line 18 can miss every pending-tail window under CI load, so
-  // watch the attribute continuously from the page instead.
+  // watch the attribute continuously from the page instead. The live tail is
+  // removed when the turn finishes, which a slow runner can reach before the
+  // assertions below, so both the pending-byte peak and the node identity are
+  // recorded on `window` rather than re-resolved through the locator.
   await live.evaluate((element) => {
-    (element as any).__liveMarkdownProbe = true;
     const seen = { max: 0 };
-    const record = () => {
-      seen.max = Math.max(seen.max, Number(element.getAttribute("data-pending-bytes") ?? 0));
+    const record = (pending: string | null) => {
+      seen.max = Math.max(seen.max, Number(pending ?? 0));
       (window as any).__maxPendingBytes = seen.max;
+      const current = document.querySelector(".msg.assistant .streaming-markdown");
+      if (current && current !== element) (window as any).__liveMarkdownReplaced = true;
     };
     (window as any).__maxPendingBytes = 0;
-    record();
-    const observer = new MutationObserver(record);
-    observer.observe(element, { attributes: true, attributeFilter: ["data-pending-bytes"] });
+    (window as any).__liveMarkdownReplaced = false;
+    record(element.getAttribute("data-pending-bytes"));
+    const observer = new MutationObserver((mutations) => {
+      for (const mutation of mutations) record(mutation.oldValue);
+      record(element.getAttribute("data-pending-bytes"));
+    });
+    observer.observe(element, {
+      attributes: true,
+      attributeFilter: ["data-pending-bytes"],
+      attributeOldValue: true,
+    });
     const tick = () => {
-      record();
+      record(element.getAttribute("data-pending-bytes"));
       if (element.isConnected) requestAnimationFrame(tick);
+      else observer.disconnect();
     };
     requestAnimationFrame(tick);
   });
@@ -9441,7 +12042,7 @@ test("streaming assistant keeps formatted Markdown with a lightweight live tail"
   await expect(page.getByText("stream line 18", { exact: false })).toBeVisible({ timeout: 10_000 });
   await expect.poll(() => page.evaluate(() => Number((window as any).__maxPendingBytes ?? 0)))
     .toBeGreaterThan(0);
-  expect(await live.evaluate((element) => (element as any).__liveMarkdownProbe === true)).toBe(true);
+  expect(await page.evaluate(() => (window as any).__liveMarkdownReplaced === false)).toBe(true);
 
   await expect(page.getByText("stream line 23", { exact: false })).toBeVisible({ timeout: 10_000 });
   await expect(page.locator(".msg.assistant .body.md")).toBeVisible();
@@ -9472,6 +12073,48 @@ test("step commentary renders full Markdown before the overall turn finishes", a
   await expect(settledStep.locator("code")).toHaveText("normalized_counts.csv");
 });
 
+test("long workspace scrolling keeps all headers visible across session switches (#1110)", async ({ page }) => {
+  await enterApp(page);
+  await composer(page).fill("make volcano.png");
+  await page.getByRole("button", { name: "Send" }).click();
+  await page.getByRole("button", { name: "Toggle panel" }).click();
+  await page.locator(".rp-tabs").getByRole("button", { name: /^Artifacts/ }).click();
+  const tiles = page.locator(".rp-tiles");
+  await expect(tiles).toBeVisible();
+  await tiles.evaluate((el) => {
+    const content = document.createElement("div");
+    content.style.cssText = "min-height:4000px;flex-shrink:0";
+    const end = document.createElement("button");
+    end.textContent = "Last artifact";
+    content.appendChild(end);
+    el.appendChild(content);
+    el.scrollTop = el.scrollHeight;
+  });
+  await expect.poll(() => tiles.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
+  // A focus/outline jump must not turn clipped shell ancestors into scrollers.
+  await page.evaluate(() => {
+    for (const selector of [".app", ".sidebar", ".center", ".rightpane"]) {
+      const shell = document.querySelector<HTMLElement>(selector)!;
+      const overflow = document.createElement("div");
+      overflow.style.cssText = "position:absolute;top:1800px;width:1px;height:1px";
+      shell.appendChild(overflow);
+      overflow.scrollIntoView({ block: "start" });
+      shell.scrollTop = 600;
+    }
+  });
+  const viewport = page.viewportSize()!;
+  for (const selector of [".sidebar-head", ".center > .topbar", ".rp-tabs"]) {
+    await expectInsideViewport(page.locator(selector), viewport.width, viewport.height);
+  }
+  await newSessionButton(page).click();
+  await composer(page).fill("make second.png");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect.poll(() => tiles.evaluate((el) => el.scrollTop)).toBe(0);
+  for (const name of ["Agents", "Files", "Artifacts"]) {
+    await page.locator(".rp-tabs").getByRole("button", { name: new RegExp(`^${name}`) }).click();
+  }
+});
+
 test("chat keeps the user's reading position when streaming finishes (#670)", async ({ page }) => {
   await enterApp(page);
   await composer(page).fill("SCROLLTEST");
@@ -9494,6 +12137,7 @@ test("closing a center-file tab restores the conversation reading position", asy
   await page.locator(".proj-card-main").first().click();
   const scroller = page.locator("#chat-scroller");
   await expect(page.getByText(/Window page 0 row 19/)).toBeVisible();
+  await waitForTranscriptFonts(page);
   await scroller.evaluate((element) => {
     element.scrollTop = Math.max(120, element.scrollHeight / 3);
     element.dispatchEvent(new WheelEvent("wheel", { deltaY: -80, bubbles: true }));
@@ -9665,7 +12309,7 @@ test("home search opens artifacts, sessions, and settings", async ({ page }) => 
   await expect(page.getByRole("button", { name: "Back to app" })).toBeVisible();
   await page.locator(".settings-head-close").click();
 
-  await page.getByRole("button", { name: "Search" }).click();
+  await page.getByRole("button", { name: "Search", exact: true }).click();
   const search = commandPalette(page);
   await expect(search).toBeVisible();
   await expect(page.locator(".project-search-row", { hasText: "nif3.treefile" })).toBeVisible();
@@ -9680,7 +12324,7 @@ test("home search opens artifacts, sessions, and settings", async ({ page }) => 
   await expect(page.locator(".am-name")).toHaveText("nif3.treefile");
   await page.locator(".artifact-modal").getByRole("button", { name: "Close panel" }).click();
 
-  await page.getByRole("button", { name: "Search" }).click();
+  await page.getByRole("button", { name: "Search", exact: true }).click();
   await search.fill("Enumerate");
   await expect(page.locator(".project-search-row", { hasText: "Enumerate MCP bio-tools databases" })).toBeVisible();
   await search.press("Enter");
@@ -9691,6 +12335,195 @@ test("home search opens artifacts, sessions, and settings", async ({ page }) => 
     }));
     return calls.find((c: any) => c.cmd === "load_session") ?? null;
   })).toMatchObject({ cmd: "load_session", args: { id: "s-complete" } });
+});
+
+test("a recent conversation in another project opens at the latest message (#1197)", async ({ page }) => {
+  await page.goto("/?mockLongPages=8");
+  await page.locator(".proj-card-main").first().click();
+  await expect(page.getByText(/Window page 0 row 19/)).toBeVisible();
+  const scroller = page.locator("#chat-scroller");
+  await scroller.evaluate((el) => {
+    el.dispatchEvent(new WheelEvent("wheel", { deltaY: -100 }));
+    el.scrollTop = 100;
+  });
+  await page.evaluate(() => {
+    const core = (window as any).__TAURI__.core;
+    const original = core.invoke;
+    core.invoke = async (cmd: string, args: any) => {
+      const result = await original(cmd, args);
+      return cmd === "list_recent_sessions"
+        ? result.map((row: any) => ({ ...row, project_id: "other" }))
+        : result;
+    };
+  });
+  await page.getByRole("button", { name: "Back to projects", exact: true }).click();
+  await page.getByTestId("recent-session-card").nth(1).click();
+  await expect.poll(() => lastInvokeArgs(page, "open_project")).toMatchObject({ id: "other" });
+  await expect(page.getByText(/Window page 0 row 19/)).toBeVisible();
+  await expect.poll(() => scroller.evaluate((el) =>
+    el.scrollHeight - el.clientHeight - el.scrollTop,
+  )).toBeLessThan(8);
+});
+
+for (const failure of ["command", "payload"]) {
+  test(`earlier history reports ${failure} failures and can retry (#1199)`, async ({ page }) => {
+    await page.goto("/?mockLongSession=1");
+    await page.locator(".proj-card-main").first().click();
+    const loadEarlier = page.getByRole("button", { name: "Load earlier messages", exact: true });
+    await expect(loadEarlier).toBeVisible();
+    await page.evaluate((failure) => {
+      const core = (window as any).__TAURI__.core;
+      const original = core.invoke;
+      let fail = true;
+      core.invoke = async (cmd: string, args: any) => {
+        const before = args instanceof Map ? args.get("beforeSeq") : args?.beforeSeq;
+        if (cmd === "load_session" && before != null && fail) {
+          fail = false;
+          await new Promise((resolve) => { (window as any).__releaseHistory = resolve; });
+          if (failure === "command") throw new Error("History read failed");
+          return { items: "invalid transcript" };
+        }
+        return original(cmd, args);
+      };
+    }, failure);
+    await loadEarlier.click();
+    await expect(page.getByRole("button", { name: "Loading earlier messages…", exact: true })).toBeDisabled();
+    await page.evaluate(() => (window as any).__releaseHistory());
+    await expect(page.getByRole("alert")).toContainText("Could not load earlier messages:");
+    await expect(loadEarlier).toBeEnabled();
+    await loadEarlier.click();
+    await expect(page.getByText("Oldest loaded question", { exact: true })).toBeAttached();
+    await expect(page.getByRole("alert")).toHaveCount(0);
+  });
+}
+
+test("earlier history remains available while the current turn is running (#1199)", async ({ page }) => {
+  await page.goto("/?mockLongSession=1");
+  await page.locator(".proj-card-main").first().click();
+  await expect(page.getByRole("button", { name: "Load earlier messages", exact: true })).toBeVisible();
+  await page.evaluate(() => {
+    const core = (window as any).__TAURI__.core;
+    const original = core.invoke;
+    core.invoke = (cmd: string, args: any) => cmd === "send_message"
+      ? new Promise(() => {})
+      : original(cmd, args);
+  });
+  await composer(page).fill("Keep working while I read the earlier context");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await page.getByRole("button", { name: "Load earlier messages", exact: true }).click();
+  await expect(page.getByText("Oldest loaded question", { exact: true })).toBeAttached();
+  await expect.poll(() => page.evaluate(() => (window as any).__transcriptPageCalls)).toEqual([null, 41]);
+  await emitTauriEvent(page, "agent", {
+    kind: "Text", frame_id: "long-session", delta: "Still working on the latest answer",
+  });
+  await expect(page.getByText("Oldest loaded question", { exact: true })).toBeAttached();
+  await page.getByRole("button", { name: "Show newer messages", exact: true }).click();
+  await expect(page.getByText("Still working on the latest answer", { exact: true })).toBeAttached();
+  await page.getByRole("button", { name: "Show earlier loaded messages", exact: true }).click();
+  await page.locator("#chat-scroller").evaluate((el) => {
+    el.dispatchEvent(new WheelEvent("wheel", { deltaY: -100 }));
+    el.scrollTop = 100;
+  });
+  await page.locator("#chat-jump-pill").click();
+  await expect(page.getByText("Still working on the latest answer", { exact: true })).toBeAttached();
+  await expect.poll(() => page.locator("#chat-scroller").evaluate((el) =>
+    el.scrollHeight - el.clientHeight - el.scrollTop,
+  )).toBeLessThan(8);
+});
+
+test("a stale earlier page does not duplicate history after reloading a session (#1199)", async ({ page }) => {
+  await page.goto("/?mockLongSession=1");
+  await page.locator(".proj-card-main").first().click();
+  await expect(page.getByRole("button", { name: "Load earlier messages", exact: true })).toBeVisible();
+  await page.evaluate(() => {
+    const core = (window as any).__TAURI__.core;
+    const original = core.invoke;
+    core.invoke = async (cmd: string, args: any) => {
+      const before = args instanceof Map ? args.get("beforeSeq") : args?.beforeSeq;
+      if (cmd === "load_session" && before != null) {
+        await new Promise((resolve) => { (window as any).__releaseHistory = resolve; });
+      }
+      return original(cmd, args);
+    };
+  });
+  await page.getByRole("button", { name: "Load earlier messages", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Loading earlier messages…", exact: true })).toBeDisabled();
+  await newSessionButton(page).click();
+  await page.locator(".side-item.ses", { hasText: "Long transcript" }).click();
+  await expect(page.getByRole("button", { name: "Load earlier messages", exact: true })).toBeEnabled();
+  await page.evaluate(() => (window as any).__releaseHistory());
+  await expect.poll(() => page.evaluate(() => (window as any).__transcriptPageCalls)).toEqual([null, null, 41]);
+  await expect(page.getByText("Oldest loaded question", { exact: true })).toHaveCount(0);
+  await expect(page.locator(".msg.user")).toHaveCount(10);
+});
+
+for (const staleOutcome of ["success", "failure"]) {
+  test(`reloaded history rejects an old ${staleOutcome} while the same cursor is requested again`, async ({ page }) => {
+    await enterApp(page, "/?mockLongSession=1");
+    await page.evaluate((staleOutcome) => {
+      const core = (window as any).__TAURI__.core;
+      const original = core.invoke;
+      (window as any).__historyRequests = [];
+      core.invoke = async (cmd: string, args: any) => {
+        const before = args instanceof Map ? args.get("beforeSeq") : args?.beforeSeq;
+        if (cmd === "load_session" && before != null) {
+          const index = (window as any).__historyRequests.length;
+          await new Promise((resolve) => (window as any).__historyRequests.push(resolve));
+          if (index === 0 && staleOutcome === "failure") throw new Error("Obsolete history failure");
+          const result = await original(cmd, args);
+          if (index === 0) result.items[0].text = "Obsolete historical question";
+          return result;
+        }
+        return original(cmd, args);
+      };
+    }, staleOutcome);
+    const loadEarlier = page.getByRole("button", { name: "Load earlier messages", exact: true });
+    const loading = page.getByRole("button", { name: "Loading earlier messages…", exact: true });
+    await loadEarlier.click();
+    await expect(loading).toBeDisabled();
+    await newSessionButton(page).click();
+    await page.locator(".side-item.ses", { hasText: "Long transcript" }).click();
+    await loadEarlier.click();
+    await expect.poll(() => page.evaluate(() => (window as any).__historyRequests.length)).toBe(2);
+    await page.evaluate(() => (window as any).__historyRequests[0]());
+    // Flush the rejected promise / decoded response and the browser render.
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    await expect(page.getByText("Obsolete historical question", { exact: true })).toHaveCount(0);
+    await expect(loading).toBeDisabled();
+    await page.evaluate(() => (window as any).__historyRequests[1]());
+    await expect(page.getByText("Oldest loaded question", { exact: true })).toBeAttached();
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    await expect(loading).toHaveCount(0);
+  });
+}
+
+test("a 62-turn history with a large message reaches its first question (#1199)", async ({ page }) => {
+  await page.goto("/?mockLongPages=4&mockLongRows=40");
+  await page.evaluate(() => {
+    const core = (window as any).__TAURI__.core;
+    const original = core.invoke;
+    core.invoke = async (cmd: string, args: any) => {
+      const result = await original(cmd, args);
+      if (cmd === "load_session") {
+        const before = args instanceof Map ? args.get("beforeSeq") : args?.beforeSeq;
+        const index = Number(before ?? 0);
+        result.user_offset = Math.max(0, 62 - (index + 1) * 20);
+        if (index === 3) result.items = result.items.slice(0, 4);
+        if (index === 2) result.items[1].text = "Large historical answer " + "x".repeat(380_000);
+      }
+      return result;
+    };
+  });
+  await page.locator(".proj-card-main").first().click();
+  for (let index = 1; index <= 3; index++) {
+    await page.getByRole("button", { name: "Load earlier messages", exact: true }).click();
+    await expect(page.getByText(new RegExp(`Window page ${index} row 0 `))).toBeAttached();
+  }
+  await expect(page.getByRole("button", { name: "Load earlier messages", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => (window as any).__transcriptPageCalls)).toEqual([null, 1, 2, 3]);
+  await expect(page.locator(".msg.user")).toHaveCount(20);
 });
 
 test("long transcripts load earlier turns without jumping to the new top", async ({ page }) => {
@@ -9730,11 +12563,22 @@ test("opening a long conversation lands at the latest message and stays stable o
   await expect.poll(() => scroller.evaluate((element) => element.scrollTop)).toBeGreaterThan(before - 240);
 
   const readingPosition = await scroller.evaluate((element) => element.scrollTop);
+  await expect(scroller).toHaveCSS("overflow-anchor", "auto");
   // Unfollow flips overflow-anchor back to auto, but Chromium only picks a
-  // scroll anchor at layout time. Wait for a frame so the anchor is armed —
-  // otherwise a same-frame prepend is never compensated (#663).
+  // scroll anchor at layout time. Waiting frames alone is not enough: if no
+  // layout ran in between, the prepend below is never compensated (#663).
+  // Dirty layout with a zero-height node and force a reflow so the anchor is
+  // deterministically armed before the real prepend.
   await page.evaluate(
-    () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+    () => new Promise((resolve) => {
+      const thread = document.getElementById("chat-thread");
+      const probe = document.createElement("div");
+      probe.style.height = "0px";
+      probe.style.flex = "0 0 0px";
+      thread?.prepend(probe);
+      void (thread as HTMLElement | null)?.offsetHeight;
+      requestAnimationFrame(() => requestAnimationFrame(resolve));
+    }),
   );
   await page.evaluate(() => {
     const thread = document.getElementById("chat-thread");
@@ -9745,29 +12589,59 @@ test("opening a long conversation lands at the latest message and stays stable o
   });
   await expect.poll(() => scroller.evaluate((element) => element.scrollTop))
     .toBeGreaterThan(readingPosition + 400);
+  // ResizeObserver runs after layout. Verify the scroll helper keeps the
+  // browser's prepend compensation instead of briefly accepting it and then
+  // restoring the stale pre-prepend bookmark.
+  await page.evaluate(
+    () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+  );
+  expect(await scroller.evaluate((element) => element.scrollTop))
+    .toBeGreaterThan(readingPosition + 400);
 });
 
-test("switching conversations restores each reading position (#849)", async ({ page }) => {
-  await page.goto("/?mockLongPages=8");
-  await page.locator(".proj-card-main").first().click();
+for (const delayedFont of [false, true]) {
+  test(`reopening a conversation lands at latest after reading older messages${delayedFont ? " with delayed fonts" : ""}`, async ({ page }) => {
+    let releaseFont = () => {};
+    if (delayedFont) {
+      const fontGate = new Promise<void>((resolve) => { releaseFont = resolve; });
+      await page.route("**/fonts/source-serif-4-latin.woff2", async (route) => {
+        await fontGate;
+        await route.continue();
+      });
+    }
+    await page.goto("/?mockLongPages=8", { waitUntil: "domcontentloaded" });
+    await page.locator(".proj-card-main").first().click();
 
-  const scroller = page.locator("#chat-scroller");
-  await expect(page.getByText(/Window page 0 row 19/)).toBeVisible();
-  await scroller.evaluate((element) => {
-    element.scrollTop = Math.max(120, element.scrollHeight / 3);
-    element.dispatchEvent(new WheelEvent("wheel", { deltaY: -80, bubbles: true }));
+    const scroller = page.locator("#chat-scroller");
+    await expect(page.getByText(/Window page 0 row 19/)).toBeVisible();
+    if (delayedFont) {
+      await expect.poll(() => page.evaluate(() => document.fonts.status)).toBe("loading");
+    }
+    releaseFont();
+    await waitForTranscriptFonts(page);
+    await scroller.evaluate((element) => {
+      element.scrollTop = Math.max(120, element.scrollHeight / 3);
+      element.dispatchEvent(new WheelEvent("wheel", { deltaY: -80, bubbles: true }));
+    });
+    const readingTop = await scroller.evaluate((element) => element.scrollTop);
+
+    await newSessionButton(page).click();
+    await expect(page.locator(".empty")).toBeVisible();
+    await page.locator(".side-item.ses", { hasText: "Long transcript" }).click();
+    await expect(page.getByText(/Window page 0 row 19/)).toBeVisible();
+    await expect.poll(() => scroller.evaluate((element) =>
+      element.scrollHeight - element.clientHeight - element.scrollTop,
+    )).toBeLessThan(8);
+    await expect(page.locator("#chat-jump-pill")).not.toHaveClass(/visible/);
+    expect(await scroller.evaluate((element) => element.scrollTop)).toBeGreaterThan(readingTop + 40);
+
+    // Opening starts at latest, but reading older messages in this session
+    // must still disable follow and keep the jump-to-latest control useful.
+    await scroller.hover();
+    await page.mouse.wheel(0, -320);
+    await expect(page.locator("#chat-jump-pill")).toHaveClass(/visible/);
   });
-  const readingTop = await scroller.evaluate((element) => element.scrollTop);
-
-  await newSessionButton(page).click();
-  await expect(page.locator(".empty")).toBeVisible();
-  await page.locator(".side-item.ses", { hasText: "Long transcript" }).click();
-  await expect(page.getByText(/Window page 0 row 19/)).toBeVisible();
-  await expect.poll(() => scroller.evaluate((element) => element.scrollTop))
-    .toBeGreaterThan(readingTop - 40);
-  await expect.poll(() => scroller.evaluate((element) => element.scrollTop))
-    .toBeLessThan(readingTop + 40);
-});
+}
 
 test("a thread rebuild clamp does not park a followed view at the top (#927)", async ({ page }) => {
   await page.goto("/?mockLongPages=8");
@@ -9874,6 +12748,7 @@ test("conversation outline loads and jumps to an older user question", async ({ 
   );
   await expect(oldestOutline.locator(".conversation-outline-time")).not.toBeEmpty();
   await oldestOutline.click();
+  await expect(oldestOutline).toHaveAttribute("aria-current", "location");
 
   await expect.poll(() => lastInvokeArgs(page, "load_session")).toMatchObject({
     id: "long-session",
@@ -9933,7 +12808,7 @@ test("a continuously open conversation unloads old live rows after a completed t
   await enterApp(page);
   await composer(page).fill("seed turn");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.locator(".msg.assistant")).toContainText("Hello from mock wisp-science.");
+  await expect(page.locator(".msg.assistant")).toContainText("Hello from mock wisp-depmap.");
   const sent = await lastInvokeArgs(page, "send_message");
   const frameId = String(sent?.sessionId ?? "");
   expect(frameId).not.toBe("");
@@ -10024,7 +12899,7 @@ test("branching from a paged transcript uses the global user-turn index", async 
 
 test("HTML artifact modal uses a desktop preview viewport", async ({ page }) => {
   await page.goto("/");
-  await page.getByRole("button", { name: "Search" }).click();
+  await page.getByRole("button", { name: "Search", exact: true }).click();
   const search = commandPalette(page);
   await search.fill("dashboard");
   await search.press("Enter");
@@ -10042,7 +12917,7 @@ test("HTML artifact modal uses a desktop preview viewport", async ({ page }) => 
 
 test("MCP App opens as a persistent center tab and delivers tool data", async ({ page }) => {
   await enterApp(page);
-  const html = `<!doctype html><html><body><div id="state">waiting</div><script>
+  const html = `<!doctype html><html><body><div id="state">waiting</div><div id="sequence">TTTACGTACGTGGG</div><button id="map-mbp" class="motif-pm-feature" data-feature-id="mbp" aria-pressed="false">MBP map feature</button><div id="sequence-pane" class="motif-cs-sequence-column" style="height:80px;overflow:auto"><div style="height:500px"></div><button id="sequence-mbp" class="motif-cs-feature-block" aria-pressed="false">MBP sequence feature</button><div style="height:500px"></div></div><div class="motif-cs-selection-bar"><span class="motif-cs-selection-name">4-11 (8)</span></div><script>
     const state = document.getElementById("state");
     let initialized = false;
     let contextCapability = false;
@@ -10050,6 +12925,16 @@ test("MCP App opens as a persistent center tab and delivers tool data", async ({
     let contextAcknowledged = false;
     let input = false;
     let result = false;
+    // Production Motif bundles contain HTML closing-tag text inside minified
+    // JavaScript. The host bridge must never splice into this literal.
+    window.__motifEmbeddedClosingBody = "</body>";
+    window.motifGetActiveRecord = () => ({ id: "pet-28a", name: "pET-28a", molecule: "dna", seq: "TTTACGTACGTGGG", annotations: [{ id: "mbp", name: "MBP", start: 4, end: 12, strand: -1 }] });
+    window.motifAddRecords = (records) => { window.__addedMotifRecords = records; };
+    document.getElementById("map-mbp").addEventListener("click", () => {
+      document.getElementById("map-mbp").setAttribute("aria-pressed", "true");
+      document.getElementById("sequence-mbp").setAttribute("aria-pressed", "true");
+      document.querySelector(".motif-cs-selection-name").textContent = "MBP 5-12";
+    });
     const render = () => {
       state.textContent = [initialized, contextCapability, input, result, contextAcknowledged].join(":");
     };
@@ -10068,7 +12953,7 @@ test("MCP App opens as a persistent center tab and delivers tool data", async ({
     };
     addEventListener("message", (event) => {
       const message = event.data || {};
-      if (message.id === 1 && message.result?.hostInfo?.name === "wisp-science") {
+      if (message.id === 1 && message.result?.hostInfo?.name === "wisp-depmap") {
         initialized = true;
         contextCapability = !!message.result?.hostCapabilities?.updateModelContext?.text;
         parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} }, "*");
@@ -10077,7 +12962,8 @@ test("MCP App opens as a persistent center tab and delivers tool data", async ({
       } else if (message.method === "ui/notifications/tool-input") {
         input = message.params?.arguments?.sequence === "ACGT";
       } else if (message.method === "ui/notifications/tool-result") {
-        result = message.params?.structuredContent?.accepted === true;
+        result = message.params?.structuredContent?.accepted === true
+          || (message.params?.structuredContent?.payload?.records?.length ?? 0) > 0;
       }
       updateContext();
       render();
@@ -10109,6 +12995,17 @@ test("MCP App opens as a persistent center tab and delivers tool data", async ({
 
   const app = page.frameLocator('iframe[title="Motif test app"]');
   await expect(app.locator("#state")).toHaveText("true:true:true:true:true");
+  await expect(app.locator("body")).not.toContainText("const reply =");
+  await expect.poll(() => app.locator("body").evaluate(() => (window as any).__motifEmbeddedClosingBody)).toBe("</body>");
+  await expect(app.locator("[data-wisp-motif-selection-length]")).toHaveText("8 bp");
+  await app.locator(".motif-cs-selection-name").evaluate((element) => {
+    element.textContent = "12-3 wrap (6)";
+  });
+  await expect(app.locator("[data-wisp-motif-selection-length]")).toHaveText("6 bp");
+  await app.locator(".motif-cs-selection-name").evaluate((element) => {
+    element.textContent = "4-11 (8)";
+  });
+  await expect(app.locator("[data-wisp-motif-selection-length]")).toHaveText("8 bp");
   await expect.poll(() => lastInvokeArgs(page, "update_mcp_app_context")).toMatchObject({
     instanceId: expect.stringContaining(`mcp-app:${frameId}:`),
     appName: "Motif test app",
@@ -10117,12 +13014,187 @@ test("MCP App opens as a persistent center tab and delivers tool data", async ({
       structuredContent: { recordId: "pet-28a", length: 5369 },
     },
   });
+  const sendCountBeforeContextNotice = (await invokeArgsList(page, "send_message")).length;
+  await page.evaluate(({ frameId }) => {
+    (window as any).__tauriEmit("agent", {
+      kind: "AppContextUpdate",
+      frame_id: frameId,
+      context_id: `mcp-app:${frameId}:ui://motif/workbench.html`,
+      instance_id: `mcp-app:${frameId}:ui://motif/workbench.html`,
+      app_name: "Motif test app",
+      update_mode: "replace",
+      state: "active",
+      summary: "Active record: pET-28a(+)",
+      structured_preview: JSON.stringify({ recordId: "pet-28a", length: 5369 }),
+    });
+  }, { frameId });
+  const contextNotice = page.getByTestId("mcp-app-context-attachment");
+  await expect(contextNotice).toContainText("Motif test app");
+  await expect(contextNotice.locator(".composer-reference-card")).toHaveAttribute(
+    "title",
+    "Active record: pET-28a(+)",
+  );
+  await expect(contextNotice).toContainText("MCP App context");
+  await expect.poll(() => invokeArgsList(page, "send_message")).toHaveLength(sendCountBeforeContextNotice);
+  await contextNotice.getByRole("button", { name: "Remove attachment" }).click();
+  await expect(page.getByTestId("mcp-app-context-attachment")).toHaveCount(0);
+  await expect.poll(() => lastInvokeArgs(page, "update_mcp_app_context")).toMatchObject({ context: {} });
+
+  await page.evaluate(({ frameId }) => {
+    (window as any).__tauriEmit("agent", {
+      kind: "AppContextUpdate",
+      frame_id: frameId,
+      context_id: `mcp-app:${frameId}:ui://motif/workbench.html`,
+      instance_id: `mcp-app:${frameId}:ui://motif/workbench.html`,
+      app_name: "Motif test app",
+      update_mode: "replace",
+      state: "replaced",
+      summary: "Active record: pBR322",
+      structured_preview: null,
+    });
+  }, { frameId });
+  await expect(page.getByTestId("mcp-app-context-attachment")).toHaveCount(1);
+  await expect(page.getByTestId("mcp-app-context-attachment")).toContainText("Motif test app");
+  await page.evaluate(({ frameId }) => {
+    (window as any).__tauriEmit("agent", {
+      kind: "AppContextUpdate",
+      frame_id: frameId,
+      context_id: `mcp-app:${frameId}:ui://motif/workbench.html`,
+      instance_id: `mcp-app:${frameId}:ui://motif/workbench.html`,
+      app_name: "Motif test app",
+      update_mode: "clear",
+      state: "cleared",
+      summary: "",
+      structured_preview: null,
+    });
+  }, { frameId });
+  await expect(page.getByTestId("mcp-app-context-attachment")).toHaveCount(0);
+
   const frame = page.locator('iframe[title="Motif test app"]');
   await expect(frame).toHaveAttribute("sandbox", "allow-scripts");
   const appTab = page.locator('.center-tab[data-center-path^="mcp-app:"]');
   await expect(appTab).toContainText("Motif test app");
   await expect(page.locator("main.center")).toHaveClass(/split/);
   await expect(page.locator(".center-mcp-app-preview")).toBeVisible();
+
+  // Motif gets a host-owned picker that can read an explicitly selected file
+  // from outside the project and reload the live workbench through its MCP
+  // tool. The local path itself is never sent to the plugin.
+  await page.evaluate(() => {
+    (window as any).__mcpAppLiveBridges = true;
+    (window as any).__mcpAppToolResults = {
+      motif_open_workbench: {
+        content: [],
+        structuredContent: {
+          schema: "motif.mcp.workbench.v1",
+          mode: "artifact",
+          recordCount: 1,
+          residueCount: 8,
+          payload: { records: [{ name: "local", type: "dna", sequence: "ACGTACGT" }] },
+        },
+        isError: false,
+      },
+    };
+  });
+  const chooserPromise = page.waitForEvent("filechooser");
+  await page.getByRole("button", { name: "Load DNA file" }).click();
+  const chooser = await chooserPromise;
+  await chooser.setFiles({
+    name: "existing-local.fasta",
+    mimeType: "text/x-fasta",
+    buffer: Buffer.from(">local\nACGTACGT\n"),
+  });
+  await expect.poll(() => lastInvokeArgs(page, "call_mcp_app_tool")).toMatchObject({
+    name: "motif_open_workbench",
+    arguments: { filename: "existing-local.fasta", content: ">local\nACGTACGT\n" },
+  });
+  await expect.poll(() => lastInvokeArgs(page, "save_motif_workbench_snapshot")).toMatchObject({
+    instanceId: expect.stringContaining(`mcp-app:${frameId}:`),
+    result: {
+      structuredContent: {
+        payload: { records: [{ name: "local", sequence: "ACGTACGT" }] },
+      },
+    },
+  });
+  await expect(page.locator(".center-mcp-import-status")).toContainText("existing-local.fasta");
+
+  const cookie = Buffer.alloc(5 + 14);
+  cookie[0] = 0x09;
+  cookie.writeUInt32BE(14, 1);
+  cookie.write("SnapGene", 5, "ascii");
+  const snapSequence = Buffer.from("ACGTRYSWKMBDHVN", "ascii");
+  const dnaPacket = Buffer.alloc(5 + 1 + snapSequence.length);
+  dnaPacket[0] = 0x00;
+  dnaPacket.writeUInt32BE(1 + snapSequence.length, 1);
+  dnaPacket[5] = 0x01; // SnapGene flags bit 0 denotes circular topology
+  snapSequence.copy(dnaPacket, 6);
+  const snapChooserPromise = page.waitForEvent("filechooser");
+  await page.getByRole("button", { name: "Load DNA file" }).click();
+  const snapChooser = await snapChooserPromise;
+  await snapChooser.setFiles({
+    name: "pET-28a.dna",
+    mimeType: "application/octet-stream",
+    buffer: Buffer.concat([cookie, dnaPacket]),
+  });
+  await expect.poll(() => lastInvokeArgs(page, "call_mcp_app_tool")).toMatchObject({
+    name: "motif_open_workbench",
+    arguments: {
+      payload: {
+        records: [{
+          name: "pET-28a",
+          type: "dna",
+          topology: "circular",
+          sequence: "ACGTRYSWKMBDHVN",
+          annotations: [],
+        }],
+      },
+    },
+  });
+  await expect.poll(() => lastInvokeArgs(page, "save_motif_workbench_snapshot")).toMatchObject({
+    result: {
+      structuredContent: {
+        payload: {
+          records: [{
+            name: "local",
+            type: "dna",
+            sequence: "ACGTACGT",
+          }],
+        },
+      },
+    },
+  });
+  await expect(page.locator(".center-mcp-import-status")).toContainText("pET-28a.dna");
+
+  await app.locator("#sequence").evaluate((element) => {
+    const node = element.firstChild!;
+    const range = document.createRange();
+    range.setStart(node, 3);
+    range.setEnd(node, 11);
+    const selection = getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+  });
+  // Clicking a control outside an opaque iframe can clear WebView's native
+  // DOM selection. Motif's own rendered range remains authoritative.
+  await app.locator("#sequence").evaluate(() => getSelection()?.removeAllRanges());
+  await page.getByRole("button", { name: "Add selection to chat" }).click();
+  await expect(page.getByTestId("motif-selection-reference")).toContainText("pET-28a");
+  await expect(page.getByTestId("motif-selection-reference")).toContainText("8 bp");
+  await expect(composer(page)).toHaveValue(/Coordinates: 4-11 \(forward\)/);
+  await expect(composer(page)).toHaveValue(/Length: 8 bp/);
+  await expect(composer(page)).toHaveValue(/Sequence: ACGTACGT/);
+
+  await app.locator("#map-mbp").click();
+  await expect.poll(() => app.locator("#sequence-pane").evaluate((element) => element.scrollTop))
+    .toBeGreaterThan(0);
+  await page.getByRole("button", { name: "Add selection to chat" }).click();
+  await expect(page.getByTestId("motif-selection-reference")).toContainText("MBP");
+  await expect(page.getByTestId("motif-selection-reference")).toContainText("8 bp");
+  await expect(app.locator("[data-wisp-motif-selection-length]")).toHaveText("8 bp");
+  await expect(composer(page)).toHaveValue(/Feature: MBP/);
+  await expect(composer(page)).toHaveValue(/Coordinates: 5-12 \(reverse\)/);
+  await expect(composer(page)).toHaveValue(/Length: 8 bp/);
+  await expect(composer(page)).toHaveValue(/Sequence: CGTACGTG/);
 
   // Switching back to the conversation parks the iframe, and returning to
   // the app preserves its live state instead of reloading it.
@@ -10198,6 +13270,77 @@ test("live MCP App tools/call reaches the host without a new agent turn", async 
   expect((await invokeArgsList(page, "send_message")).length).toBe(sendsBefore);
 });
 
+test("repeated MCP App presentations reuse one center tab", async ({ page }) => {
+  await enterApp(page);
+  const appHtml = (state: string) =>
+    `<!doctype html><html><body><div id="state">${state}</div></body></html>`;
+  await composer(page).fill("open the figure library");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect.poll(() => lastInvokeArgs(page, "send_message")).not.toBeNull();
+  const frameId = String((await lastInvokeArgs(page, "send_message")).sessionId);
+
+  await emitTauriEvent(page, "agent", {
+    kind: "ToolPresentation",
+    frame_id: frameId,
+    presentation_id: "open-1",
+    presentation_kind: "mcp_app",
+    payload: {
+      tool: { name: "figure_open", title: "Open Scientific Figure Library" },
+      arguments: {},
+      result: { content: [] },
+      resource: { uri: "ui://figure/library.html", text: appHtml("catalog"), _meta: {} },
+    },
+  });
+
+  const figureTab = page.locator(
+    `.center-tab[data-center-path="mcp-app:${frameId}:ui://figure/library.html"]`,
+  );
+  await expect(figureTab).toHaveCount(1);
+  await expect(figureTab).toContainText("Open Scientific Figure Library");
+  await expect(figureTab).toHaveAttribute("title", "Open Scientific Figure Library");
+  await expect(page.frameLocator('iframe[title="Open Scientific Figure Library"]').locator("#state"))
+    .toHaveText("catalog");
+
+  await emitTauriEvent(page, "agent", {
+    kind: "ToolPresentation",
+    frame_id: frameId,
+    presentation_id: "search-2",
+    presentation_kind: "mcp_app",
+    payload: {
+      tool: { name: "figure_search", title: "Search scientific figure templates" },
+      arguments: { q: "survival" },
+      result: { content: [] },
+      resource: {
+        uri: "ui://figure/library.html?q=survival#hits",
+        text: appHtml("survival"),
+        _meta: {},
+      },
+    },
+  });
+
+  await expect(page.locator('.center-tab[data-center-path^="mcp-app:"]')).toHaveCount(1);
+  await expect(figureTab).toContainText("Open Scientific Figure Library");
+  await expect(page.frameLocator('iframe[title="Search scientific figure templates"]').locator("#state"))
+    .toHaveText("survival");
+
+  await emitTauriEvent(page, "agent", {
+    kind: "ToolPresentation",
+    frame_id: frameId,
+    presentation_id: "motif-3",
+    presentation_kind: "mcp_app",
+    payload: {
+      tool: { name: "motif_open_workbench", title: "Motif workbench" },
+      arguments: {},
+      result: { content: [] },
+      resource: { uri: "ui://motif/workbench.html", text: appHtml("motif"), _meta: {} },
+    },
+  });
+
+  await expect(page.locator('.center-tab[data-center-path^="mcp-app:"]')).toHaveCount(2);
+  await expect(page.locator('.center-tab[data-center-path$="ui://motif/workbench.html"]'))
+    .toContainText("Motif workbench");
+});
+
 test("reopening a saved session restores its MCP App workbench", async ({ page }) => {
   const openSavedSession = async () => {
     await page.locator(".proj-card-main").first().click();
@@ -10214,7 +13357,7 @@ test("reopening a saved session restores its MCP App workbench", async ({ page }
   await openSavedSession();
 });
 
-test("real Motif MCP App reaches ready state through the Wisp host", async ({ page }) => {
+test("real Motif MCP App sends its internal sequence range through the Wisp host", async ({ page }) => {
   test.skip(!motifAppHtmlPath, "set WISP_MOTIF_APP_HTML for release acceptance");
   const html = readFileSync(motifAppHtmlPath!, "utf8");
   await enterApp(page);
@@ -10261,12 +13404,126 @@ test("real Motif MCP App reaches ready state through the Wisp host", async ({ pa
   }, { frameId, html });
 
   const motif = page.frameLocator('iframe[title="Motif for Claude Science"]');
-  await expect(motif.locator("html")).toHaveAttribute("data-motif-mcp-state", "ready", { timeout: 20_000 });
+  const sequence = motif.locator(".motif-cs-sequence");
+  await expect(sequence).toBeVisible({ timeout: 20_000 });
+  for (let index = 0; index < 8; index += 1) {
+    await sequence.press("Shift+ArrowRight");
+  }
+  await expect(motif.locator(".motif-cs-selection-name")).toHaveText("1-8 (8)");
+  await expect(motif.locator("[data-wisp-motif-selection-length]")).toHaveText("8 bp");
+
+  const active = await sequence.evaluate(() => {
+    const record = (window as any).motifGetActiveRecord();
+    getSelection()?.removeAllRanges();
+    return { name: record.name, sequence: record.seq.slice(0, 8) };
+  });
+  await page.getByRole("button", { name: "Add selection to chat" }).click();
+  await expect(page.getByTestId("motif-selection-reference")).toContainText(active.name);
+  await expect(page.getByTestId("motif-selection-reference")).toContainText("8 bp");
+  await expect(composer(page)).toHaveValue(/Coordinates: 1-8 \(forward\)/);
+  await expect(composer(page)).toHaveValue(/Length: 8 bp/);
+  await expect(composer(page)).toHaveValue(new RegExp(`Sequence: ${active.sequence}`));
+});
+
+test("real SnapGene annotations render in the real Motif MCP App", async ({ page }) => {
+  test.skip(!motifAppHtmlPath || !snapGeneFixturePath,
+    "set WISP_MOTIF_APP_HTML and WISP_SNAPGENE_FIXTURE for release acceptance");
+  const html = readFileSync(motifAppHtmlPath!, "utf8");
+  await enterApp(page);
+  await composer(page).fill("open annotated Motif acceptance");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect.poll(() => lastInvokeArgs(page, "send_message")).not.toBeNull();
+  const frameId = String((await lastInvokeArgs(page, "send_message")).sessionId);
+  await page.evaluate(({ frameId, html }) => {
+    (window as any).__tauriEmit("agent", {
+      kind: "ToolPresentation",
+      frame_id: frameId,
+      presentation_kind: "mcp_app",
+      payload: {
+        tool: { name: "motif_open_workbench", title: "Motif annotated acceptance" },
+        arguments: { content: ">seed\nACGT", filename: "seed.fasta" },
+        result: {
+          content: [],
+          structuredContent: {
+            schema: "motif.mcp.workbench.v1",
+            payload: { records: [{ name: "seed", type: "dna", sequence: "ACGT" }] },
+          },
+          isError: false,
+        },
+        resource: { uri: "ui://motif/workbench.html", text: html, _meta: {} },
+      },
+    });
+    (window as any).__mcpAppLiveBridges = true;
+    (window as any).__mcpAppToolResults = {
+      motif_open_workbench: { content: [], structuredContent: { payload: { records: [] } }, isError: false },
+    };
+  }, { frameId, html });
+
+  const motif = page.frameLocator('iframe[title="Motif annotated acceptance"]');
+  await expect(motif.locator(".motif-cs-sequence")).toBeVisible({ timeout: 20_000 });
+  const chooserPromise = page.waitForEvent("filechooser");
+  await page.getByRole("button", { name: "Load DNA file" }).click();
+  const chooser = await chooserPromise;
+  await chooser.setFiles(snapGeneFixturePath!);
+  await expect.poll(() => lastInvokeArgs(page, "call_mcp_app_tool")).not.toBeNull();
+  const call = await lastInvokeArgs(page, "call_mcp_app_tool");
+  const record = call.arguments.payload.records[0];
+  expect(record.topology).toBe("circular");
+  expect(record.sequence.length).toBe(11_891);
+  expect(record.annotations.length).toBeGreaterThanOrEqual(30);
+  expect(record.annotations.map((annotation: any) => annotation.name)).toEqual(
+    expect.arrayContaining(["T7 promoter", "RBS", "KanR", "ori", "lacI"]),
+  );
+  expect(record.annotations.find((annotation: any) => annotation.name === "KanR")).toMatchObject({
+    type: "cds",
+    strand: -1,
+    color: expect.stringMatching(/^#/),
+  });
+
+  const rendered = await motif.locator("html").evaluate(async (_element, importedRecord) => {
+    await (window as any).motifAddRecords([importedRecord]);
+    const active = (window as any).motifGetActiveRecord();
+    return {
+      name: active.name,
+      length: active.length,
+      annotations: active.annotations.map((annotation: any) => annotation.name),
+    };
+  }, record);
+  expect(rendered.name).toBe("pET-28a-250kd");
+  expect(rendered.length).toBe(11_891);
+  expect(rendered.annotations.length).toBeGreaterThanOrEqual(30);
+  expect(rendered.annotations).toEqual(expect.arrayContaining(["T7 promoter", "KanR", "lacI"]));
+  await expect(motif.locator("body")).toContainText("KanR");
+
+  const mbp = record.annotations.find((annotation: any) => annotation.name === "MBP");
+  expect(mbp).toBeTruthy();
+  await motif.locator(`.motif-pm-feature[data-feature-id="${mbp.id}"]`).press("Enter");
+  await expect(motif.locator(".motif-cs-selection-name")).toContainText("MBP");
+  const mbpLength = mbp.end - mbp.start;
+  await expect(motif.locator("[data-wisp-motif-selection-length]")).toHaveText(`${mbpLength} bp`);
+  await expect.poll(() => motif.locator(".motif-cs-sequence-column").evaluate((pane) => {
+    const block = pane.querySelector(".motif-cs-feature-block[aria-pressed=\'true\']");
+    if (!block) return false;
+    const blockRect = block.getBoundingClientRect();
+    const paneRect = pane.getBoundingClientRect();
+    return blockRect.top >= paneRect.top && blockRect.bottom <= paneRect.bottom;
+  })).toBe(true);
+  await page.getByRole("button", { name: "Add selection to chat" }).click();
+  await expect(page.getByTestId("motif-selection-reference")).toContainText("MBP");
+  await expect(page.getByTestId("motif-selection-reference")).toContainText(`${mbpLength} bp`);
+  await expect(composer(page)).toHaveValue(/Feature: MBP/);
+  await expect(composer(page)).toHaveValue(new RegExp(`Length: ${mbpLength} bp`));
+  await expect(composer(page)).toHaveValue(
+    new RegExp(`Coordinates: ${mbp.start + 1}-${mbp.end} \\(${mbp.strand === -1 ? "reverse" : "forward"}\\)`),
+  );
+  await expect(composer(page)).toHaveValue(
+    new RegExp(`Sequence: ${record.sequence.slice(mbp.start, mbp.end)}`),
+  );
 });
 
 test("Markdown artifact modal opens its rendered preview in center", async ({ page }) => {
   await page.goto("/");
-  await page.getByRole("button", { name: "Search" }).click();
+  await page.getByRole("button", { name: "Search", exact: true }).click();
   const search = commandPalette(page);
   await search.fill("analysis-report");
   await search.press("Enter");
@@ -10285,7 +13542,7 @@ test("Markdown artifact modal opens its rendered preview in center", async ({ pa
 
 test("reverse preview selections anchor the action popup above the first selected line (#779)", async ({ page }) => {
   await page.goto("/");
-  await page.getByRole("button", { name: "Search" }).click();
+  await page.getByRole("button", { name: "Search", exact: true }).click();
   const search = commandPalette(page);
   await search.fill("analysis-report");
   await search.press("Enter");
@@ -10319,14 +13576,76 @@ test("reverse preview selections anchor the action popup above the first selecte
   const popup = page.locator(".selection-popup");
   await expect(popup).toBeVisible();
   const anchorY = await popup.evaluate((element) => Number.parseFloat((element as HTMLElement).style.top));
-  expect(anchorY).toBeCloseTo(selection.top, 0);
+  // selection_popup_y keeps ≥120px clearance. CI fonts often land the heading
+  // just under that (~117px), so the popup clamps to 120 instead of selection.top.
+  const expectedY = Math.max(120, Math.round(selection.top));
+  expect(anchorY).toBeCloseTo(expectedY, 0);
   await expect.poll(() => popup.evaluate((element) => element.getBoundingClientRect().bottom))
     .toBeLessThan(selection.top);
 });
 
+test("bound report links own file actions and copy file paths", async ({ page }) => {
+  await page.goto("/?mockResourceSession=1");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  const search = commandPalette(page);
+  await search.fill("Enumerate");
+  await search.press("Enter");
+  await page.evaluate(() => {
+    Object.defineProperty(navigator.clipboard, "writeText", {
+      configurable: true,
+      value: async (text: string) => { (window as any).__copiedResourcePath = text; },
+    });
+  });
+  const link = page.getByRole("link", { name: "quality_report.html", exact: true });
+  await expect(link).toHaveAttribute("href", "#");
+  const menu = page.locator(".ctx-menu");
+  await link.click({ button: "right" });
+  await expect(menu.getByRole("button", { name: "Open with default app" })).toBeVisible();
+  await expect(menu.getByRole("button", { name: "Copy message" })).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await expect(menu).toHaveCount(0);
+  await expect(link).toBeVisible();
+
+  // A leftover text selection must not replace the file menu.
+  await link.evaluate(el => {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+  });
+  for (const [label, expected] of [
+    ["Copy relative path", "results/quality report.html"],
+    ["Copy absolute path", "/mock/root/results/quality report.html"],
+  ]) {
+    await link.click({ button: "right" });
+    await menu.getByRole("button", { name: label, exact: true }).click();
+    await expect.poll(() => page.evaluate(() => (window as any).__copiedResourcePath)).toBe(expected);
+  }
+  for (const [label, command] of [
+    ["Open with default app", "open_workspace_path"],
+    ["Show in file manager", "reveal_in_file_manager"],
+  ]) {
+    await link.click({ button: "right" });
+    await menu.getByRole("button", { name: label }).click();
+    await expect.poll(() => lastInvokeArgs(page, command)).toMatchObject({ path: "results/quality report.html" });
+  }
+  await link.click({ button: "right" });
+  await menu.getByRole("button", { name: "Download", exact: true }).click();
+  await expect.poll(() => lastInvokeArgs(page, "download_artifact_version"))
+    .toMatchObject({ versionId: "resource-version-html" });
+
+  const references = page.getByRole("link", { name: "Open bound references" });
+  await references.click({ button: "right" });
+  await menu.getByRole("button", { name: "Open in center" }).click();
+  await expect(page.locator('.center-tab[data-center-path="artifact-version:resource-version-bib"]'))
+    .toContainText("references.bib");
+  await expect.poll(() => lastInvokeArgs(page, "read_artifact_version"))
+    .toMatchObject({ versionId: "resource-version-bib" });
+});
+
 test("bound Markdown resources use immutable versions and a scrollable center preview", async ({ page }) => {
   await page.goto("/?mockResourceSession=1");
-  await page.getByRole("button", { name: "Search" }).click();
+  await page.getByRole("button", { name: "Search", exact: true }).click();
   const search = commandPalette(page);
   await search.fill("Enumerate");
   await search.press("Enter");
@@ -10335,6 +13654,13 @@ test("bound Markdown resources use immutable versions and a scrollable center pr
   const modal = page.locator(".artifact-modal");
   await expect(modal).toBeVisible();
   await expect(modal.locator(".am-name")).toHaveText("report.md");
+  // Downloading a pinned version must go through the version command — the
+  // workspace-path download would fail on branch/exploration views where the
+  // file only exists as a stored artifact version.
+  await modal.getByRole("button", { name: "Download" }).click();
+  await expect.poll(() => lastInvokeArgs(page, "download_artifact_version"))
+    .toMatchObject({ versionId: "resource-version-markdown" });
+  expect(await lastInvokeArgs(page, "download_file")).toBeNull();
   await modal.getByRole("button", { name: "Open in center" }).click();
   const tab = page.locator('.center-tab[data-center-path="artifact-version:resource-version-markdown"]');
   await expect(tab).toContainText("report.md");
@@ -10358,7 +13684,7 @@ test("bound Markdown resources use immutable versions and a scrollable center pr
 
 test("bound DOCX resources open their immutable preview", async ({ page }) => {
   await page.goto("/?mockResourceSession=1");
-  await page.getByRole("button", { name: "Search" }).click();
+  await page.getByRole("button", { name: "Search", exact: true }).click();
   const search = commandPalette(page);
   await search.fill("Enumerate");
   await search.press("Enter");
@@ -10376,9 +13702,85 @@ test("bound DOCX resources open their immutable preview", async ({ page }) => {
     .toMatchObject({ versionId: "resource-version-docx" });
 });
 
+test("bound Python resources open their immutable code preview", async ({ page }) => {
+  await page.goto("/?mockResourceSession=1");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  const search = commandPalette(page);
+  await search.fill("Enumerate");
+  await search.press("Enter");
+
+  const pythonLink = page.getByRole("link", { name: "Open bound Python script" });
+  await expect(pythonLink).toHaveAttribute("title", "random_walk_demo.py");
+  await pythonLink.click();
+  const modal = page.locator(".artifact-modal");
+  await expect(modal).toBeVisible();
+  await expect(modal.locator(".am-name")).toHaveText("random_walk_demo.py");
+  const figure = modal.locator(".am-figure .rp-code-body code");
+  await expect(figure).toHaveClass(/language-python/);
+  await expect(figure).toContainText("SEED = 42");
+  await modal.getByRole("button", { name: "Open in center" }).click();
+  await expect(page.locator('.center-tab[data-center-path="artifact-version:resource-version-python"]'))
+    .toContainText("random_walk_demo.py");
+  const preview = page.locator(".center-file-preview");
+  await expect(preview.locator(".center-file-head > span").first())
+    .toHaveText("analysis/scripts/random_walk_demo.py");
+  await expect(preview.locator(".center-file-head")).not.toContainText("artifact-version:");
+  await expect(preview.locator(".center-file-snapshot-badge")).toHaveText("Snapshot");
+  const pythonCode = preview.locator(".rp-code-body code");
+  await expect(pythonCode).toHaveClass(/language-python/);
+  await expect(pythonCode.locator(".hljs-string")).toHaveText("'random walk'");
+  await expect(preview).toContainText("SEED = 42");
+  await preview.getByRole("button", { name: "Open in editor" }).click();
+  await expect(page.locator('.center-tab[data-center-path="analysis/scripts/random_walk_demo.py"]'))
+    .toHaveClass(/active/);
+  await expect(page.locator(".center-file-preview")).toHaveClass(/center-file-runtime-preview/);
+  await expect.poll(() => lastInvokeArgs(page, "read_artifact_version"))
+    .toMatchObject({ versionId: "resource-version-python" });
+});
+
+test("bound R resources open their immutable code preview", async ({ page }) => {
+  await page.goto("/?mockResourceSession=1");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  const search = commandPalette(page);
+  await search.fill("Enumerate");
+  await search.press("Enter");
+
+  const rLink = page.getByRole("link", { name: "Open bound R script" });
+  await expect(rLink).toHaveAttribute("title", "plot.R");
+  await rLink.click();
+  const modal = page.locator(".artifact-modal");
+  await expect(modal).toBeVisible();
+  await expect(modal.locator(".am-name")).toHaveText("plot.R");
+  const figure = modal.locator(".am-figure .rp-code-body code");
+  await expect(figure).toHaveClass(/language-r/);
+  await expect(figure).toContainText("plot(1:3)");
+  await modal.getByRole("button", { name: "Open in center" }).click();
+  await expect(page.locator('.center-tab[data-center-path="artifact-version:resource-version-r"]'))
+    .toContainText("plot.R");
+  const preview = page.locator(".center-file-preview");
+  await expect(preview.locator(".center-file-head > span").first()).toHaveText("analysis/plot.R");
+  await expect(preview.locator(".center-file-head")).not.toContainText("artifact-version:");
+  await expect(preview.locator(".center-file-snapshot-badge")).toHaveText("Snapshot");
+  const rCode = preview.locator(".rp-code-body code");
+  await expect(rCode).toHaveClass(/language-r/);
+  await expect(rCode.locator(".hljs-string")).toHaveText('"data"');
+  await expect(preview).toContainText("plot(1:3)");
+  await expect.poll(() => preview.evaluate((element) => {
+    const code = element.querySelector<HTMLElement>(".rp-code");
+    if (!code) return 0;
+    return code.getBoundingClientRect().height / element.getBoundingClientRect().height;
+  })).toBeGreaterThan(0.75);
+  await preview.getByRole("button", { name: "Open in editor" }).click();
+  await expect(page.locator('.center-tab[data-center-path="analysis/plot.R"]')).toHaveClass(/active/);
+  await expect(page.locator(".center-file-preview")).toHaveClass(/center-file-runtime-preview/);
+  await expect(page.locator(".center-file-preview .rp-code-editor")).toBeVisible();
+  await expect.poll(() => lastInvokeArgs(page, "read_artifact_version"))
+    .toMatchObject({ versionId: "resource-version-r" });
+});
+
 test("bound BibTeX resources open their immutable text preview", async ({ page }) => {
   await page.goto("/?mockResourceSession=1");
-  await page.getByRole("button", { name: "Search" }).click();
+  await page.getByRole("button", { name: "Search", exact: true }).click();
   const search = commandPalette(page);
   await search.fill("Enumerate");
   await search.press("Enter");
@@ -10392,6 +13794,7 @@ test("bound BibTeX resources open their immutable text preview", async ({ page }
     .toContainText("references.bib");
   await expect(page.locator(".center-file-preview"))
     .toContainText("@article{wisp");
+  await expect(page.locator(".center-file-preview [data-open-editor]")).toHaveCount(0);
   await expect.poll(() => lastInvokeArgs(page, "read_artifact_version"))
     .toMatchObject({ versionId: "resource-version-bib" });
 });
@@ -10414,7 +13817,7 @@ async function selectCenterPreviewText(page: Page) {
 
 test("selecting preview text quotes it into chat and saves a review annotation", async ({ page }) => {
   await page.goto("/");
-  await page.getByRole("button", { name: "Search" }).click();
+  await page.getByRole("button", { name: "Search", exact: true }).click();
   const search = commandPalette(page);
   await search.fill("analysis-report");
   await search.press("Enter");
@@ -10468,7 +13871,7 @@ test("projects landing stays centered on wide windows", async ({ page }) => {
   await page.goto("/");
   await expect(page.locator(".projects-head")).toBeVisible();
   await expect(page.locator(".projects-brand-mark")).toBeVisible();
-  await expect(page.locator(".projects-title")).toHaveText("Wisp Science");
+  await expect(page.getByRole("heading", { name: "wisp-depmap", exact: true })).toBeVisible();
   await expect.poll(async () => page.locator(".projects-head").evaluate((el) => {
     const rect = el.getBoundingClientRect();
     return Math.round(rect.width);
@@ -10483,7 +13886,7 @@ test("empty session shows the branded chat empty state", async ({ page }) => {
   await expect(empty.locator(".empty-logo")).toBeVisible();
   await expect.poll(() => empty.locator(".empty-logo").evaluate((el) =>
     Math.round(el.getBoundingClientRect().width)
-  )).toBe(32);
+  )).toBe(208);
   await expect(empty.locator("h1")).not.toBeEmpty();
   await expect(empty.locator("h1")).toHaveCSS("font-family", /Source Serif/);
 });
@@ -10497,6 +13900,8 @@ test("Windows uses the integrated title bar without covering the project landing
   await page.goto("/");
 
   await expect(page.locator(".window-titlebar")).toBeVisible();
+  await expect(page.getByTestId("window-brand-title")).toHaveText("wisp-depmap");
+  await expect(page).toHaveTitle("wisp-depmap");
   await expect(page.getByRole("button", { name: "Minimize" })).toBeVisible();
   await expect(page.getByTestId("window-maximize")).toBeVisible();
   await expect(page.locator("#titlebar-maximize")).toHaveAttribute("aria-label", "Maximize");
@@ -10515,6 +13920,7 @@ test("Windows uses the integrated title bar without covering the project landing
   // Home menus only list actions that work without an open project.
   await page.getByRole("button", { name: "File", exact: true }).click();
   await expect(page.getByRole("menuitem", { name: "New project" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "New Window" })).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "Import project" })).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "Scratch chat" })).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "Open settings" })).toBeVisible();
@@ -10551,6 +13957,7 @@ test("Windows uses the integrated title bar without covering the project landing
   await page.getByRole("button", { name: "File", exact: true }).click();
   // Inside a workspace the menus flip back to the session-scoped set.
   await expect(page.getByRole("menuitem", { name: "New session" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "New Window" })).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "New project" })).toHaveCount(0);
   const exportCurrentProject = page.getByRole("menuitem", { name: "Export current project" });
   await expect(exportCurrentProject).toBeEnabled();
@@ -10594,7 +14001,37 @@ test("Windows uses the integrated title bar without covering the project landing
     ((window as any).__skillInvokeLog ?? [])
       .filter((c: any) => c.cmd === "open_external_url")
       .map((c: any) => (c.args instanceof Map ? c.args.get("url") : c.args?.url))
-  )).toContain("https://github.com/xuzhougeng/wisp-science#readme");
+  )).toContain("https://github.com/Yu-Qiao-sjtu/wisp-science-depmap#readme");
+
+  await context.close();
+});
+
+test("window title includes the open project name (#1017)", async ({ browser }) => {
+  const context = await browser.newContext({
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/136 Safari/537.36",
+  });
+  const page = await context.newPage();
+  await page.addInitScript(tauriMock);
+  await page.goto("/");
+
+  await expect(page.getByTestId("window-brand-title")).toHaveText("wisp-depmap");
+  await expect(page).toHaveTitle("wisp-depmap");
+
+  await page.locator(".proj-card-main").first().click();
+  await expect(newSessionButton(page)).toBeVisible();
+  await expect(page.getByTestId("window-brand-title")).toHaveText("wisp-depmap \u2014 wisp-depmap");
+  await expect(page).toHaveTitle("wisp-depmap \u2014 wisp-depmap");
+
+  await page.locator(".proj-switch").click();
+  await page.locator(".proj-menu").getByRole("button", { name: "Other project" }).click();
+  await expect(page.locator(".proj-name")).toHaveText("Other project");
+  await expect(page.getByTestId("window-brand-title")).toHaveText("wisp-depmap \u2014 Other project");
+  await expect(page).toHaveTitle("wisp-depmap \u2014 Other project");
+
+  await page.getByRole("button", { name: "Back to projects" }).click();
+  await expect(page.locator(".projects-screen")).toBeVisible();
+  await expect(page.getByTestId("window-brand-title")).toHaveText("wisp-depmap");
+  await expect(page).toHaveTitle("wisp-depmap");
 
   await context.close();
 });
@@ -10704,6 +14141,30 @@ test("Windows titlebar menus close on Escape", async ({ browser }) => {
   await context.close();
 });
 
+test("File New Window asks the host for a second GUI", async ({ browser }) => {
+  // File/Edit/View live on the Windows integrated titlebar; Linux/macOS CI
+  // user agents never render that bar, so this must pin a Windows UA.
+  const context = await browser.newContext({
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/136 Safari/537.36",
+  });
+  const page = await context.newPage();
+  await page.addInitScript(tauriMock);
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "File", exact: true }).click();
+  await page.getByRole("menuitem", { name: "New Window" }).click();
+  await expect.poll(() => lastInvokeArgs(page, "open_new_window")).not.toBeNull();
+
+  // Stay on this document so the invoke log is not wiped by enterApp()'s goto.
+  await page.locator(".proj-card-main").first().click();
+  await expect(newSessionButton(page)).toBeVisible();
+  await page.getByRole("button", { name: "File", exact: true }).click();
+  await page.getByRole("menuitem", { name: "New Window" }).click();
+  await expect.poll(() => invokeCount(page, "open_new_window")).toBeGreaterThan(1);
+
+  await context.close();
+});
+
 test("compact workspace keeps the conversation usable and opens Inspector as a drawer", async ({ page }) => {
   await page.setViewportSize({ width: 800, height: 720 });
   await enterApp(page);
@@ -10734,7 +14195,7 @@ test("project switcher does not show a stale fallback name while opening", async
   await page.locator(".proj-card-main").first().click();
 
   await expect(page.locator(".proj-name")).toHaveText("Opening project…");
-  await expect(page.locator(".proj-name")).toHaveText("wisp-science");
+  await expect(page.locator(".proj-name")).toHaveText("wisp-depmap");
 });
 
 test("project switcher has no caret and switches workspace in the current window", async ({ page }) => {
@@ -10857,6 +14318,110 @@ test("import can open an existing folder in place without copying it", async ({ 
     standardLayout: false,
   });
   await expect.poll(() => lastInvokeArgs(page, "import_project")).toBeNull();
+});
+
+test("opening a registered folder offers every project identity before switching", async ({ page }) => {
+  await page.goto("/?mockWorkspaceProjects=multiple");
+  const openFolder = async () => {
+    await page.getByRole("button", { name: "Import project" }).click();
+    await page.getByTestId("project-import-options")
+      .getByRole("button", { name: "Open a folder in place" }).click();
+  };
+  await openFolder();
+  const picker = page.getByTestId("workspace-project-picker");
+  await expect(picker).toBeVisible();
+  await expect(picker.locator("[data-project-id]")).toHaveCount(4);
+  await expect(picker.locator('[data-project-id="P15"]')).toContainText("31 sessions");
+  await expect(picker.locator('[data-project-id="P37"]')).toContainText("9 sessions");
+  await expect(picker.locator('[data-project-id="P15"]')).toContainText("ID: P15");
+  await expect.poll(() => lastInvokeArgs(page, "list_workspace_projects"))
+    .toMatchObject({ workspaceDir: "/mock/root/new-project" });
+  await expect.poll(() => lastInvokeArgs(page, "open_project")).toBeNull();
+  await expect.poll(() => lastInvokeArgs(page, "create_project")).toBeNull();
+  await page.keyboard.press("Escape");
+  await expect(picker).toBeHidden();
+  await expect(page.locator(".projects-screen")).toBeVisible();
+  await expect.poll(() => lastInvokeArgs(page, "open_project")).toBeNull();
+
+  await openFolder();
+  await picker.locator('[data-project-id="P15"]').click();
+  await expect.poll(() => lastInvokeArgs(page, "open_project")).toMatchObject({ id: "P15" });
+  await expect.poll(() => lastInvokeArgs(page, "create_project")).toBeNull();
+  await expect.poll(() => lastInvokeArgs(page, "recover_workspace_sessions")).toBeNull();
+});
+
+test("opening a folder with one existing project reuses its identity", async ({ page }) => {
+  await page.goto("/?mockWorkspaceProjects=single");
+  await page.getByRole("button", { name: "Import project" }).click();
+  await page.getByTestId("project-import-options")
+    .getByRole("button", { name: "Open a folder in place" }).click();
+  const picker = page.getByTestId("workspace-project-picker");
+  await expect(picker.locator("[data-project-id]")).toHaveCount(1);
+  await picker.locator('[data-project-id="P37"]').click();
+  await expect.poll(() => lastInvokeArgs(page, "open_project")).toMatchObject({ id: "P37" });
+  await expect.poll(() => lastInvokeArgs(page, "create_project")).toBeNull();
+});
+
+test("registered folder chooser respects hidden project identities", async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("wisp-privacy-mode-active", "1");
+    localStorage.setItem("wisp-privacy-mode-projects", JSON.stringify(["P15"]));
+  });
+  await page.goto("/?mockWorkspaceProjects=multiple");
+  await page.getByRole("button", { name: "Import project" }).click();
+  await page.getByTestId("project-import-options")
+    .getByRole("button", { name: "Open a folder in place" }).click();
+  const picker = page.getByTestId("workspace-project-picker");
+  await expect(picker.locator("[data-project-id]")).toHaveCount(3);
+  await expect(picker.locator('[data-project-id="P15"]')).toHaveCount(0);
+  await expect(picker).toContainText("Projects hidden by Privacy mode are omitted");
+});
+
+for (const mode of ["error", "malformed"]) {
+  test(`workspace lookup ${mode} does not fall through to registration`, async ({ page }) => {
+    await page.goto(`/?mockWorkspaceProjects=${mode}`);
+    await page.getByRole("button", { name: "Import project" }).click();
+    await page.getByTestId("project-import-options")
+      .getByRole("button", { name: "Open a folder in place" }).click();
+    await expect(page.locator(".project-open-error")).toBeVisible();
+    await expect(page.locator("#new-project-name")).toHaveCount(0);
+    await expect(page.getByTestId("workspace-project-picker")).toHaveCount(0);
+    await expect.poll(() => lastInvokeArgs(page, "create_project")).toBeNull();
+    await expect.poll(() => lastInvokeArgs(page, "open_project")).toBeNull();
+  });
+}
+
+test("workspace recovery previews archived conversations before transactional import", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Import project" }).click();
+  const options = page.getByTestId("project-import-options");
+  await expect(options.getByRole("button", { name: "Recover conversations from a workspace" })).toBeVisible();
+  await options.getByRole("button", { name: "Recover conversations from a workspace" }).click();
+
+  const recovery = page.getByTestId("workspace-session-recovery");
+  await expect(recovery).toBeVisible();
+  await expect(recovery.getByRole("heading", { name: "Recover workspace conversations" })).toBeVisible();
+  await expect(recovery.locator("#workspace-recovery-name")).toHaveValue("Recovered study");
+  await expect(recovery.locator(".workspace-recovery-stats")).toContainText("2conversations");
+  await expect(recovery.locator(".workspace-recovery-stats")).toContainText("648messages");
+  await expect(recovery).toContainText("1 damaged archive(s) and 1 duplicate archive(s) will be skipped");
+
+  // The preview owns the top Escape layer and closes immediately without a
+  // prior focus move or any import side effect.
+  await page.keyboard.press("Escape");
+  await expect(recovery).toBeHidden();
+  await expect.poll(() => lastInvokeArgs(page, "recover_workspace_sessions")).toBeNull();
+
+  await page.getByRole("button", { name: "Import project" }).click();
+  await page.getByTestId("project-import-options")
+    .getByRole("button", { name: "Recover conversations from a workspace" }).click();
+  await expect(recovery).toBeVisible();
+  await recovery.getByRole("button", { name: "Recover and open" }).click();
+  await expect.poll(() => lastInvokeArgs(page, "recover_workspace_sessions")).toMatchObject({
+    workspaceDir: "/mock/root/new-project",
+    name: "Recovered study",
+  });
+  await expect.poll(() => lastInvokeArgs(page, "open_project")).toMatchObject({ id: "recovered" });
 });
 
 test("project transfers stay in a lower-right progress card without blocking other projects", async ({ page }) => {
@@ -11137,12 +14702,28 @@ test("session settings enable automatic context compaction by default", async ({
   });
 });
 
+test("session settings include model-switch semantic compact and idle hours", async ({ page }) => {
+  await page.goto("/");
+  await openSettingsSection(page, "Session");
+  const toggle = page.getByTestId("semantic-compact-on-model-switch");
+  await expect(toggle).not.toBeChecked();
+  await expect(page.getByTestId("semantic-compact-idle-hours")).toHaveValue("24");
+  await toggle.locator("..").click();
+  await page.getByTestId("semantic-compact-idle-hours").fill("12");
+  await page.locator(".settings-footer").getByRole("button", { name: "Save" }).click();
+  await expect.poll(() => lastInvokeArgs(page, "set_settings")).toMatchObject({
+    settings: { semantic_compact_on_model_switch: true, semantic_compact_idle_hours: 12 },
+  });
+});
+
 test("session settings configure truncated-output auto-continue", async ({ page }) => {
   await page.goto("/");
   await openSettingsSection(page, "Session");
   const toggle = page.getByTestId("auto-continue-enabled");
   await expect(toggle).not.toBeChecked();
+  await expect(page.getByTestId("auto-continue-limit")).toBeDisabled();
   await toggle.locator("..").click();
+  await expect(page.getByTestId("auto-continue-limit")).toBeEnabled();
   await page.getByTestId("auto-continue-limit").fill("4");
   await page.locator(".settings-footer").getByRole("button", { name: "Save" }).click();
   await expect.poll(() => lastInvokeArgs(page, "set_settings")).toMatchObject({
@@ -11163,24 +14744,206 @@ test("session settings enable follow-up question suggestions by default", async 
   });
 });
 
-test("general settings keep workspace prefs without agent loop or proxy controls", async ({ page }) => {
+for (const locale of ["en", "zh"]) {
+  test(`general settings cards align and fit in ${locale}`, async ({ page }, testInfo) => {
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.goto(`/?mockLocale=${locale}`);
+    await page.getByRole("button", { name: locale === "zh" ? "设置" : "Settings", exact: true }).click();
+    await page.locator(".settings-nav").getByRole("button", { name: locale === "zh" ? "常规" : "General", exact: true }).click();
+    const pane = page.getByTestId("general-settings-pane");
+    const groups = pane.locator(".general-group");
+    const first = await groups.nth(0).boundingBox();
+    const second = await groups.nth(1).boundingBox();
+    expect(Math.abs(first!.y - second!.y)).toBeLessThan(2);
+    expect(second!.x).toBeGreaterThan(first!.x + first!.width);
+    const language = await page.getByTestId("settings-language").boundingBox();
+    expect(language!.width).toBeLessThan(200);
+    await expect(pane.locator(".general-preferences-footer")).toContainText(locale === "zh" ? "分别保存" : "saved separately");
+    await page.screenshot({ animations: "disabled", path: testInfo.outputPath(`general-${locale}-desktop.png`) });
+    await page.setViewportSize({ width: 820, height: 740 });
+    const narrowFirst = await groups.nth(0).boundingBox();
+    const narrowSecond = await groups.nth(1).boundingBox();
+    expect(narrowSecond!.y).toBeGreaterThanOrEqual(narrowFirst!.y + narrowFirst!.height);
+    const environment = page.getByTestId("local-environment");
+    await environment.getByRole("button", { name: locale === "zh" ? "编辑路径" : "Edit paths", exact: true }).click();
+    const python = environment.getByRole("textbox", { name: "Python", exact: true });
+    await python.fill("C:/Users/Researcher/" + "long-environment-directory/".repeat(12) + "python.exe");
+    await python.scrollIntoViewIfNeeded();
+    await expectInsideViewport(python, 820, 740);
+    for (const scope of ["model", "mcp", "command"]) {
+      await page.getByTestId(`proxy-mode-${scope}`).selectOption("custom");
+      const save = page.getByTestId(`save-proxy-${scope}`);
+      await save.evaluate(el => el.scrollIntoView({ block: "center" }));
+      await expectInsideViewport(save, 820, 740);
+      await expectInsideViewport(page.getByTestId(`proxy-address-${scope}`), 820, 740);
+    }
+    expect(await pane.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+    await page.screenshot({ animations: "disabled", path: testInfo.outputPath(`general-${locale}-narrow.png`) });
+  });
+}
+
+test("general settings group workspace prefs, local environment, and network", async ({ page }) => {
   await page.goto("/");
   await openSettingsSection(page, "General");
+  await expect(page.locator(".settings-content > .settings-head h2")).toHaveText("General");
   await expect(page.getByTestId("settings-language")).toBeVisible();
   await expect(page.getByTestId("resume-last-session-enabled")).toBeAttached();
   await expect(page.getByTestId("max-iter")).toHaveCount(0);
   await expect(page.getByTestId("proxy-url")).toHaveCount(0);
+  await expect(page.getByTestId("local-environment")).toBeVisible();
+  await expect(page.getByTestId("network-proxy-model")).toBeVisible();
+  await expect(page.locator(".settings-nav").getByRole("button", { name: "Network", exact: true })).toHaveCount(0);
+  await page.locator(".settings-nav").getByRole("button", { name: "Models", exact: true }).click();
+  await expect(page.getByTestId("local-environment")).toHaveCount(0);
+  await expect(page.locator(".network-settings")).toHaveCount(0);
+  await expect(page.getByTestId("models-category-http")).toBeVisible();
 });
 
-test("model settings save the model API proxy", async ({ page }) => {
-  await page.goto("/");
+test("network saves each proxy independently and preserves the legacy model proxy", async ({ page }) => {
+  await page.goto("/?mockLegacyProxy=http://127.0.0.1:7890");
   await openSettingsSection(page, "Models");
-  await expect(page.getByTestId("proxy-url")).toBeVisible();
-  await page.getByTestId("proxy-url").fill("none");
-  await page.locator(".model-settings-pane .settings-footer").getByRole("button", { name: "Save" }).click();
-  await expect.poll(() => lastInvokeArgs(page, "set_settings")).toMatchObject({
-    settings: { proxy_url: "none" },
+  await expect(page.getByTestId("proxy-url")).toHaveCount(0);
+  await page.locator(".settings-nav").getByRole("button", { name: "General", exact: true }).click();
+  await expect(page.getByTestId("proxy-address-model")).toHaveValue("http://127.0.0.1:7890");
+  await page.getByTestId("proxy-address-model").fill("");
+  await expect(page.getByTestId("proxy-mode-model")).toHaveValue("custom");
+  await expect(page.getByTestId("proxy-address-model")).toBeEnabled();
+  await page.getByTestId("proxy-address-model").fill("http://127.0.0.1:7890");
+  await page.getByTestId("proxy-mode-command").selectOption("custom");
+  await page.getByTestId("proxy-address-command").fill("http://127.0.0.1:8080");
+  await page.getByTestId("proxy-mode-mcp").selectOption("direct");
+  await page.getByTestId("save-proxy-mcp").click();
+  await expect(page.getByRole("status")).toHaveText("Saved");
+  await expect.poll(() => lastInvokeArgs(page, "set_network_settings")).toMatchObject({
+    settings: { model_proxy_url: "http://127.0.0.1:7890", mcp_proxy_url: "none", command_proxy_url: "" },
   });
+  await expect(page.getByTestId("proxy-address-command")).toHaveValue("http://127.0.0.1:8080");
+  await page.getByTestId("save-proxy-command").click();
+  await expect.poll(() => lastInvokeArgs(page, "set_network_settings")).toMatchObject({
+    settings: { command_proxy_url: "http://127.0.0.1:8080", mcp_proxy_url: "none" },
+  });
+  await page.getByTestId("network-proxy-model").getByRole("button", { name: "Clear" }).click();
+  await page.getByTestId("save-proxy-model").click();
+  await expect.poll(() => lastInvokeArgs(page, "set_network_settings")).toMatchObject({
+    settings: { model_proxy_url: "", mcp_proxy_url: "none", command_proxy_url: "http://127.0.0.1:8080" },
+  });
+  await page.getByRole("button", { name: "General", exact: true }).click();
+  await page.locator(".settings-footer").getByRole("button", { name: "Save", exact: true }).click();
+  await expect(page.locator(".settings-page")).toHaveCount(0);
+  await openSettingsSection(page, "General");
+  await expect(page.getByTestId("proxy-mode-model")).toHaveValue("system");
+  await expect(page.getByTestId("proxy-mode-mcp")).toHaveValue("direct");
+  await expect(page.getByTestId("proxy-address-command")).toHaveValue("http://127.0.0.1:8080");
+});
+
+test("network package mirror saves guidance and Escape closes only its subpage", async ({ page }) => {
+  await page.goto("/");
+  await openSettingsSection(page, "General");
+  await page.getByTestId("configure-package-mirrors").click();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("package-mirrors")).toHaveCount(0);
+  await expect(page.getByTestId("configure-package-mirrors")).toBeVisible();
+  await page.getByTestId("configure-package-mirrors").click();
+  await page.getByTestId("conda-mirror").fill("https://mirror.example.com/conda-forge");
+  await page.getByTestId("pip-index").fill("https://mirror.example.com/simple");
+  await page.getByTestId("mirror-ca-bundle").fill("C:/certs/corp.pem");
+  await page.getByTestId("save-package-mirrors").click();
+  await expect(page.getByRole("status")).toHaveText("Saved");
+  await expect.poll(() => lastInvokeArgs(page, "set_network_settings")).toMatchObject({
+    settings: { conda_mirror_url: "https://mirror.example.com/conda-forge", pip_index_url: "https://mirror.example.com/simple", ca_bundle_path: "C:/certs/corp.pem" },
+  });
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("package-mirror-summary")).toContainText("Configured");
+  await page.getByTestId("configure-package-mirrors").click();
+  await expect(page.getByTestId("pip-index")).toHaveValue("https://mirror.example.com/simple");
+  await page.getByTestId("pip-index").fill("https://unsaved.example.com/simple");
+  await page.getByTestId("package-mirrors").getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.getByTestId("configure-package-mirrors").click();
+  await expect(page.getByTestId("pip-index")).toHaveValue("https://mirror.example.com/simple");
+  await page.getByTestId("conda-mirror").fill("");
+  await page.getByTestId("pip-index").fill("");
+  await page.getByTestId("mirror-ca-bundle").fill("");
+  await page.getByTestId("save-package-mirrors").click();
+  await expect(page.getByRole("status")).toHaveText("Saved");
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("package-mirror-summary")).toContainText("Not configured");
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".settings-page")).toHaveCount(0);
+});
+
+test("network Chinese pages fit desktop and narrow windows", async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto("/?mockLocale=zh&mockLegacyProxy=http://127.0.0.1:7890");
+  await page.getByRole("button", { name: "设置", exact: true }).click();
+  await page.locator(".settings-nav").getByRole("button", { name: "常规", exact: true }).click();
+  await expect(page.locator(".settings-content > .settings-head h2")).toHaveText("常规");
+  await expect(page.locator(".network-heading h3")).toHaveText("网络");
+  await page.locator(".network-settings").scrollIntoViewIfNeeded();
+  await expect(page.getByTestId("save-proxy-model")).toBeVisible();
+  await page.screenshot({ animations: "disabled", path: testInfo.outputPath("network-zh.png") });
+  await page.getByTestId("configure-package-mirrors").click();
+  await expect(page.getByTestId("save-package-mirrors")).toBeVisible();
+  await page.screenshot({ animations: "disabled", path: testInfo.outputPath("package-mirror-zh.png") });
+  await page.keyboard.press("Escape");
+  await page.setViewportSize({ width: 820, height: 740 });
+  for (const scope of ["model", "mcp", "command"]) {
+    await page.getByTestId(`network-proxy-${scope}`).scrollIntoViewIfNeeded();
+    if (scope === "model") {
+      await expectInsideViewport(page.getByTestId(`proxy-address-${scope}`), 820, 740);
+    } else {
+      await expect(page.getByTestId(`proxy-address-${scope}`)).toHaveCount(0);
+    }
+    await expectInsideViewport(page.getByTestId(`save-proxy-${scope}`), 820, 740);
+  }
+  await page.screenshot({ animations: "disabled", path: testInfo.outputPath("network-narrow.png") });
+});
+
+test("network address fields appear only for custom proxies in every scope", async ({ page }) => {
+  await page.goto("/");
+  await openSettingsSection(page, "General");
+  for (const scope of ["model", "mcp", "command"]) {
+    const mode = page.getByTestId(`proxy-mode-${scope}`);
+    const address = page.getByTestId(`proxy-address-${scope}`);
+    await expect(mode).toHaveValue("system");
+    await expect(address).toHaveCount(0);
+    await mode.selectOption("direct");
+    await expect(address).toHaveCount(0);
+    await page.getByTestId(`save-proxy-${scope}`).click();
+    await expect.poll(() => lastInvokeArgs(page, "set_network_settings")).toMatchObject({
+      settings: { [`${scope}_proxy_url`]: "none" },
+    });
+    await mode.selectOption("custom");
+    await expect(address).toBeVisible();
+    await expect(address).toBeEnabled();
+    await address.fill("http://localhost:8080");
+    await page.getByTestId(`save-proxy-${scope}`).click();
+    await expect.poll(() => lastInvokeArgs(page, "set_network_settings")).toMatchObject({
+      settings: { [`${scope}_proxy_url`]: "http://localhost:8080" },
+    });
+    await expect(address).toHaveValue("http://localhost:8080");
+    await mode.selectOption("system");
+    await expect(address).toHaveCount(0);
+    await page.getByTestId(`save-proxy-${scope}`).click();
+    await expect.poll(() => lastInvokeArgs(page, "set_network_settings")).toMatchObject({
+      settings: { [`${scope}_proxy_url`]: "" },
+    });
+  }
+});
+
+test("network shows validation errors without discarding the draft", async ({ page }) => {
+  await page.goto("/");
+  await openSettingsSection(page, "General");
+  await page.getByTestId("proxy-mode-mcp").selectOption("custom");
+  await page.getByTestId("save-proxy-mcp").click();
+  await expect(page.getByRole("alert")).toContainText("Enter a proxy address");
+  await page.getByTestId("proxy-address-mcp").fill("invalid address");
+  await page.getByTestId("save-proxy-mcp").click();
+  await expect(page.getByRole("alert")).toContainText("complete URL");
+  await expect(page.getByTestId("proxy-address-mcp")).toHaveValue("invalid address");
+  await page.getByTestId("proxy-address-mcp").fill("http://localhost:8080");
+  await page.getByTestId("save-proxy-mcp").click();
+  await expect(page.getByRole("status")).toHaveText("Saved");
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
 test("general settings resume the last workspace conversation by default", async ({ page }) => {
@@ -11200,7 +14963,7 @@ test("context compaction leaves a visible timeline flag", async ({ page }) => {
   await enterApp(page);
   await composer(page).fill("start a context-heavy analysis");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible();
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible();
   const frameId = String((await lastInvokeArgs(page, "send_message")).sessionId);
 
   await emitTauriEvent(page, "agent", {
@@ -11208,7 +14971,15 @@ test("context compaction leaves a visible timeline flag", async ({ page }) => {
     frame_id: frameId,
     strategy: "auto",
   });
-  await expect(page.getByTestId("context-compaction-live")).toContainText("Centrifuging context");
+  const live = page.getByTestId("context-compaction-live");
+  await expect(live).toContainText("Compacting context");
+  await expect(live).toHaveAttribute("role", "status");
+  await expect(page.locator(".topbar")).not.toContainText(/compacting|centrifuging/i);
+  const animatedPath = live.locator("svg path").first();
+  await expect(animatedPath).toHaveCSS("animation-name", "context-gather-top");
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await expect(animatedPath).toHaveCSS("animation-name", "none");
+  await expect(live).toBeVisible();
 
   await emitTauriEvent(page, "agent", {
     kind: "Compaction",
@@ -11221,14 +14992,65 @@ test("context compaction leaves a visible timeline flag", async ({ page }) => {
   const flag = page.getByTestId("context-compaction-flag");
   await expect(page.getByTestId("context-compaction-live")).toBeHidden();
   await expect(flag).toContainText("Context automatically compacted");
-  await expect(flag).toContainText("812.0k → 236.0k");
+  await expect(flag).toContainText("812.0k → 236.0k tokens");
+  await expect(flag).toContainText("71% smaller");
+  await expect(flag).toHaveCSS("animation-name", "none");
+  await expect(page.locator(".topbar")).not.toContainText(/compact|812000|236000/i);
+});
+
+for (const locale of ["en", "zh"]) {
+  test(`context compaction presentation fits narrow and dark layouts (${locale})`, async ({ page }) => {
+    await page.goto(`/?mockLocale=${locale}`);
+    await page.locator(".proj-card-main").first().click();
+    await expect(composer(page)).toBeVisible();
+    await composer(page).fill("Summarize the plant single-cell analysis");
+    await page.getByRole("button", { name: locale === "zh" ? "发送" : "Send", exact: true }).click();
+    await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible();
+    const frameId = String((await lastInvokeArgs(page, "send_message")).sessionId);
+    await emitTauriEvent(page, "agent", { kind: "CompactionStarted", frame_id: frameId, strategy: "manual" });
+    const live = page.getByTestId("context-compaction-live");
+    await expect(live).toContainText(locale === "zh" ? "正在压缩上下文" : "Compacting context");
+    await waitForTranscriptFonts(page);
+    await live.screenshot({ path: test.info().outputPath(`compacting-${locale}.png`), animations: "disabled" });
+    await emitTauriEvent(page, "agent", { kind: "Compaction", frame_id: frameId, before: 682749, after: 355570, strategy: "manual" });
+    const flag = page.getByTestId("context-compaction-flag");
+    await expect(flag).toContainText(locale === "zh" ? "上下文已压缩" : "Context compacted");
+    await expect(flag).toContainText(locale === "zh" ? "减少 48%" : "48% smaller");
+    await expect(page.locator(".topbar")).not.toContainText(/压缩|compact|682749|355570/i);
+    await page.screenshot({ path: test.info().outputPath(`compacted-${locale}-light.png`), animations: "disabled" });
+    await page.setViewportSize({ width: 760, height: 800 });
+    await page.evaluate(() => document.documentElement.setAttribute("data-theme", "dark"));
+    await expectInsideViewport(flag, 760, 800);
+    expect(await flag.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+    await page.screenshot({ path: test.info().outputPath(`compacted-${locale}-dark-narrow.png`), animations: "disabled" });
+    for (const [before, after] of [[0, 0], [100, 120]]) {
+      await emitTauriEvent(page, "agent", { kind: "Compaction", frame_id: frameId, before, after, strategy: "manual" });
+      await expect(flag.last()).toContainText(`${before} → ${after} tokens`);
+      await expect(flag.last().locator(".context-compaction-reduction")).toHaveCount(0);
+    }
+  });
+}
+
+test("context compaction stays with its session and clears on failure", async ({ page }) => {
+  await enterApp(page, "/?mockSessionModels=1");
+  const frameId = "s-model-a";
+  await page.locator(`[data-session-id="${frameId}"]`).click();
+  await emitTauriEvent(page, "agent", { kind: "CompactionStarted", frame_id: frameId, strategy: "auto" });
+  await expect(page.getByTestId("context-compaction-live")).toBeVisible();
+  await page.locator('[data-session-id="s-model-b"]').click();
+  await expect(page.getByTestId("context-compaction-live")).toHaveCount(0);
+  await page.locator(`[data-session-id="${frameId}"]`).click();
+  await expect(page.getByTestId("context-compaction-live")).toBeVisible();
+  await emitTauriEvent(page, "agent", { kind: "Error", frame_id: frameId, message: "Compaction interrupted" });
+  await expect(page.getByTestId("context-compaction-live")).toHaveCount(0);
+  await expect(page.getByTestId("context-compaction-flag")).toHaveCount(0);
 });
 
 test("context-limit recovery offers three actions and owns the first Escape", async ({ page }) => {
   await enterApp(page);
   await composer(page).fill("continue a long analysis");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible();
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible();
   const frameId = String((await lastInvokeArgs(page, "send_message")).sessionId);
   const overflow = {
     kind: "Error",
@@ -11252,9 +15074,16 @@ test("context-limit recovery offers three actions and owns the first Escape", as
 
   await emitTauriEvent(page, "agent", overflow);
   await page.getByTestId("context-recovery-compact").click();
+  // Overflow recovery uses the guided compaction flow. The interrupted turn
+  // still resumes after the new epoch is durable.
+  await expect(modal).toHaveCount(0);
+  await expect(page.getByTestId("compact-modal")).toBeVisible();
+  await expect(page.getByTestId("compact-mode-semantic")).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByTestId("compact-instruction")).toHaveValue("");
+  await page.getByTestId("compact-start").click();
   await expect.poll(async () => {
     const calls = await invokeArgsList(page, "send_message");
-    return calls.some((args) => args.message === "/compact")
+    return calls.some((args) => args.message === "/compact --semantic")
       && calls.some((args) => args.resume === true);
   }).toBe(true);
 });
@@ -11263,7 +15092,7 @@ test("context-limit recovery can continue in a new session with the old one atta
   await enterApp(page);
   await composer(page).fill("finish the long analysis");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible();
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible();
   const frameId = String((await lastInvokeArgs(page, "send_message")).sessionId);
 
   await emitTauriEvent(page, "agent", {
@@ -11286,11 +15115,11 @@ test("context-limit recovery can continue in a new session with the old one atta
   });
 });
 
-test("a leftover proxy connect error points at Model API proxy", async ({ page }) => {
+test("a leftover proxy connect error points at General Network settings", async ({ page }) => {
   await enterApp(page);
   await composer(page).fill("hello");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible();
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible();
   const frameId = String((await lastInvokeArgs(page, "send_message")).sessionId);
 
   await emitTauriEvent(page, "agent", {
@@ -11301,8 +15130,10 @@ test("a leftover proxy connect error points at Model API proxy", async ({ page }
 
   const card = page.locator(".finding.err");
   await expect(card).toBeVisible();
-  await expect(card.locator(".finding-body")).toContainText("Model API proxy");
-  await expect(card.locator(".finding-body")).toContainText("none");
+  await expect(card.locator(".finding-title")).toContainText("via leftover HTTPS_PROXY=http://127.0.0.1:7890");
+  await expect(card.locator(".finding-body")).toContainText("Settings → General → Network");
+  await expect(card.locator(".finding-body")).toContainText("Direct");
+  await expect(card.locator(".finding-body")).not.toContainText("Settings → Models");
 });
 
 test("pet stays off until the user explicitly configures its directory", async ({ page }) => {
@@ -11328,6 +15159,16 @@ test("pet stays off until the user explicitly configures its directory", async (
   await expect.poll(() => pet.getAttribute("data-state")).toMatch(/^(idle|looking)$/);
   await pet.click();
   await expect(pet).toHaveAttribute("data-state", "waving");
+});
+
+test("disabled desktop pet skips runtime run polling", async ({ page }) => {
+  await page.goto("/?pet=desktop");
+
+  // Wait for both the initial settings read and one interval tick. Neither
+  // should query the run snapshot while the pet is disabled.
+  await expect.poll(() => invokeCount(page, "get_pet")).toBeGreaterThanOrEqual(2);
+  expect(await invokeCount(page, "get_pet_runtime_status")).toBe(0);
+  await expect.poll(() => page.evaluate(() => (window as any).__petWindowVisible)).toBe(false);
 });
 
 test("desktop pet remains independent and reflects global agent state", async ({ page }) => {
@@ -11406,6 +15247,57 @@ test("desktop pet shows active Run titles and celebrates completion (#693)", asy
   await expect(pet.getByText("Done")).toBeVisible();
 });
 
+test("session and native menu events listen on the current window", async ({ page }) => {
+  await enterApp(page);
+  const windowEvents = [
+    "agent",
+    "confirm-request",
+    "browser-tab-cleanup",
+    "permission-request",
+    "acp-session-update",
+    "acp-session-state",
+    "permission-resolved",
+    "ask-user-request",
+    "ask-user-resolved",
+    "native-menu-action",
+    "browser-needs-human",
+  ];
+  for (const event of windowEvents) {
+    await expect.poll(() => page.evaluate((name) =>
+      Boolean((window as any).__tauriListenerReady?.(name)), event
+    )).toBe(true);
+    await expect.poll(() => page.evaluate((name) =>
+      (window as any).__tauriListenerScope(name), event
+    )).toBe("window");
+  }
+  await expect.poll(() => page.evaluate(() =>
+    Boolean((window as any).__tauriListenerReady?.("bootstrap-status")),
+  )).toBe(true);
+  await expect.poll(() => page.evaluate(() =>
+    (window as any).__tauriListenerScope("bootstrap-status"),
+  )).toBe("app");
+});
+
+test("native menu actions from another window leave this project alone", async ({ page }) => {
+  await enterApp(page);
+  await composer(page).fill("keep this draft");
+  await expect.poll(() => page.evaluate(() =>
+    (window as any).__tauriListenerReady("native-menu-action"),
+  )).toBe(true);
+  await page.evaluate(() => {
+    (window as any).__tauriEmitToOtherWindow("native-menu-action", "new-window");
+    (window as any).__tauriEmitToOtherWindow("native-menu-action", "projects");
+  });
+  // Await a local menu action to ensure the callbacks above have been handled.
+  await emitTauriEvent(page, "native-menu-action", "settings");
+  await expect(page.getByTestId("settings-nav-session")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(composer(page)).toHaveValue("keep this draft");
+  expect(await lastInvokeArgs(page, "open_new_window")).toBeNull();
+  await emitTauriEvent(page, "native-menu-action", "new-window");
+  await expect.poll(() => invokeArgsList(page, "open_new_window")).toHaveLength(1);
+});
+
 test("notification navigation opens the project and session that need the user (#499)", async ({ page }) => {
   await page.goto("/");
   await expect.poll(() => page.evaluate(() =>
@@ -11426,6 +15318,29 @@ test("notification navigation opens the project and session that need the user (
 
   await expect.poll(() => lastInvokeArgs(page, "open_project")).toMatchObject({ id: "other" });
   await expect.poll(() => lastInvokeArgs(page, "load_session")).toMatchObject({ id: "pet-frame" });
+});
+
+test("open-session for the project already on screen switches conversations without rebuilding the shell", async ({ page }) => {
+  await page.goto("/");
+  await expect.poll(() => page.evaluate(() =>
+    (window as any).__tauriListenerReady("open-session"),
+  )).toBe(true);
+  await emitTauriEvent(page, "open-session", { projectId: "other", sessionId: "pet-frame" });
+  await expect.poll(() => lastInvokeArgs(page, "load_session")).toMatchObject({ id: "pet-frame" });
+  await expect(page.locator("#chat-scroller")).toBeVisible();
+  const projectOpens = await invokeCount(page, "open_project");
+  const sessionLoads = await invokeCount(page, "load_session");
+  // The backend replays a turn-end notification target on the next window
+  // focus. Tearing the shell down for a conversation that is already visible
+  // is the "page flashes on the first click after a reply" report on Windows.
+  await page.evaluate(() => { (document.getElementById("chat-scroller") as any).__sameNode = true; });
+  await emitTauriEvent(page, "open-session", { projectId: "other", sessionId: "pet-frame" });
+  await emitTauriEvent(page, "open-session", { projectId: "other", sessionId: "pet-frame-2" });
+  await expect.poll(() => lastInvokeArgs(page, "load_session")).toMatchObject({ id: "pet-frame-2" });
+  expect(await invokeCount(page, "load_session")).toBe(sessionLoads + 1);
+  expect(await invokeCount(page, "open_project")).toBe(projectOpens);
+  expect(await page.evaluate(() => (document.getElementById("chat-scroller") as any)?.__sameNode === true)).toBe(true);
+  await expect(page.locator(".app-entering")).toHaveCount(0);
 });
 
 test("a sync conflict requires an explicit authoritative device choice", async ({ page }) => {
@@ -11965,15 +15880,81 @@ test("main-Agent dynamic batches show parallel roots and pending dependencies", 
   await expect(panel.locator(".agent-workflow-card.dynamic")).toHaveCount(1);
   await expect(panel).not.toContainText("Completed dynamic research");
   await expect(card).toContainText("Main Agent parallel research batch");
+  const progress = card.getByTestId("agent-workflow-progress");
+  await expect(progress).toContainText("0/3");
+  await expect(progress).toContainText("research_a、research_b");
+  await expect(progress.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "0");
   const researchA = card.locator('[data-step-id$=":research_a"]');
   await expect(researchA.locator(".agent-attempt-status")).toHaveText("Running");
   await expect(researchA).toContainText("Temporary Agent · native · default");
   await expect(researchA.locator(".agent-chip.capability")).toHaveText("project_read");
-  await expect(card.locator('[data-step-id$=":research_b"] .agent-attempt-status')).toHaveText("Running");
+  await expect(researchA.locator(".agent-current-activity")).toContainText("Waiting for the model's first response");
+  await expect(researchA.locator(".agent-current-activity")).toContainText("37s");
+  await expect(researchA.locator(".agent-usage")).toContainText("— tokens · 0 tools");
+  const researchB = card.locator('[data-step-id$=":research_b"]');
+  await expect(researchB.locator(".agent-attempt-status")).toHaveText("Running");
+  await expect(researchB.locator(".agent-current-activity")).toContainText("Using tools and consolidating evidence");
+  await expect(researchB.locator(".agent-usage")).toContainText("5 events");
+  const researchProgress = researchB.getByTestId("agent-research-progress");
+  await expect(researchProgress).toContainText("Research progress");
+  await expect(researchProgress).toContainText("Screening sources");
+  await expect(researchProgress).toContainText("5");
+  await expect(researchProgress).toContainText("6 / 11 / 18");
+  await expect(researchProgress).toContainText("PTK7 liver cancer clinical evidence");
   const synthesis = card.locator('[data-step-id$=":synthesize"]');
   await expect(synthesis.locator(".agent-attempt-status")).toHaveText("Pending");
   await expect(synthesis.locator(".agent-chip.dependency")).toHaveText(["research_a", "research_b"]);
   await expect(panel.locator(".agent-workflow-group-head")).toContainText("Conversation");
+});
+
+test("starting delegated tasks opens live per-Agent progress automatically", async ({ page }) => {
+  await enterApp(page, "/?mockAgentWorkflow=parallel");
+  await page.evaluate(() => {
+    (window as any).__tauriEmit("agent", {
+      kind: "ToolResult",
+      frame_id: "s-current",
+      name: "delegate_tasks",
+      ok: true,
+      content: JSON.stringify({ workflow_id: "workflow-dynamic", status: "running" }),
+      duration_ms: 12,
+    });
+  });
+
+  const panel = page.getByTestId("agent-workflows");
+  await expect(panel).toBeVisible();
+  const card = panel.locator(".agent-workflow-card.dynamic").first();
+  await expect(card.getByTestId("agent-workflow-progress")).toContainText(
+    "research_a、research_b",
+  );
+  await expect.poll(() => lastInvokeArgs(page, "list_agent_workflows"))
+    .toMatchObject({ sessionId: "s-current" });
+});
+
+test("a registered Workflow draft opens Agents for approval without starting", async ({ page }) => {
+  await enterApp(page, "/?mockAgentWorkflow=draft");
+  await page.evaluate(() => {
+    (window as any).__tauriEmit("agent", {
+      kind: "ToolResult",
+      frame_id: "s-current",
+      name: "start_workflow",
+      ok: true,
+      content: JSON.stringify({
+        workflow_id: "workflow-1",
+        status: "awaiting_user_approval",
+        started: false,
+      }),
+      duration_ms: 12,
+    });
+  });
+
+  const panel = page.getByTestId("agent-workflows");
+  await expect(panel).toBeVisible();
+  const card = panel.locator(".agent-workflow-card.dynamic").first();
+  await expect(card.locator(".agent-workflow-status")).toHaveText("Draft");
+  await expect(card.getByTestId("agent-approve")).toBeVisible();
+  await expect(card.getByTestId("agent-run")).toHaveCount(0);
+  await expect.poll(() => lastInvokeArgs(page, "list_agent_workflows"))
+    .toMatchObject({ sessionId: "s-current" });
 });
 
 test("nested Agent workflows render under their root without independent controls", async ({ page }) => {
@@ -12021,6 +16002,25 @@ test("failed dynamic tasks and dependency-blocked tasks stay distinct", async ({
   await card.getByTestId("agent-run").click();
   await expect(card.locator(".agent-workflow-status")).toHaveText("Succeeded", { timeout: 2_000 });
   await expect(card.locator('[data-step-id$=":research_b"] .agent-attempt-status')).toHaveText("Succeeded");
+});
+
+test("clearing a failed task retry token limit requests unlimited budget", async ({ page }) => {
+  await enterApp(page, "/?mockAgentWorkflow=partial");
+  await enableDelegation(page);
+  await page.getByRole("button", { name: "Toggle panel" }).click();
+  await page.locator(".rightpane").getByRole("button", { name: "Agents", exact: true }).click();
+  const card = page.getByTestId("agent-workflows").locator(".agent-workflow-card.dynamic").first();
+  const retryBudget = card.locator('[data-step-id$=":research_a"]')
+    .getByTestId("agent-retry-max-tokens");
+  await expect(retryBudget).toHaveValue("8000");
+  await expect(retryBudget.locator("xpath=..")).toContainText("blank/0 = unlimited");
+  await retryBudget.fill("");
+  const workflowId = await card.getAttribute("data-workflow-id");
+  await card.getByTestId("agent-retry").click();
+  await expect.poll(() => lastInvokeArgs(page, "retry_agent_workflow")).toMatchObject({
+    workflowId,
+    budgetOverrides: { research_a: { max_tokens: 0 } },
+  });
 });
 
 test("task results are readable without exposing the child Agent conversation", async ({ page }) => {
@@ -12128,7 +16128,7 @@ test("an SVG star saves a Notebook cell in the global library", async ({ page })
   await page.getByRole("button", { name: "Library", exact: true }).click();
   await expect(page.getByTestId("library-screen")).toBeVisible();
   await expect(page.locator('.library-card[data-library-kind="code"]')).toContainText("zcat counts.txt.gz");
-  await expect(page.locator('.library-card[data-library-kind="code"]')).toContainText("wisp-science / Current analysis");
+  await expect(page.locator('.library-card[data-library-kind="code"]')).toContainText("wisp-depmap / Current analysis");
 
   // Library search runs against SQLite so full saved source remains searchable
   // even though the global list only carries bounded previews.
@@ -12361,6 +16361,7 @@ test("a ?project window opens straight into the project, skipping the landing (#
   await expect.poll(async () => page.evaluate(() =>
     ((window as any).__skillInvokeLog ?? []).some((c: any) => c.cmd === "open_project"),
   )).toBe(true);
+  await expect(page).toHaveTitle("wisp-depmap \u2014 wisp-depmap");
 });
 
 test("specialists page configures the builtin Reader and saves a custom specialist", async ({ page }) => {
@@ -12369,6 +16370,7 @@ test("specialists page configures the builtin Reader and saves a custom speciali
   await expect(page.getByText("Reviewer")).toBeVisible();
   await expect(page.getByText("Reader")).toBeVisible();
   await expect(page.getByText("Scientific Illustrator")).toBeVisible();
+  await expect(page.getByText("DepMap Agent")).toBeVisible();
   // Builtin rows have no remove button.
   await expect(page.locator(".settings-list-remove")).toHaveCount(0);
 
@@ -12397,6 +16399,27 @@ test("specialists page configures the builtin Reader and saves a custom speciali
   await page.getByLabel("Name").fill("Paper hunter");
   await page.getByRole("button", { name: "Save" }).click();
   await expect(page.getByText("Paper hunter")).toBeVisible();
+});
+
+test("DepMap specialist starts a bound session from settings and accepts the research question", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Specialists");
+  await page.getByText("DepMap Agent", { exact: true }).click();
+  await expect(page.getByLabel("Instructions")).toBeDisabled();
+
+  await page.getByTestId("start-specialist-session").click();
+  await expect(page.locator(".settings-page")).toHaveCount(0);
+  await expect(page.locator(".session-specialist")).toHaveText("DepMap Agent");
+  await expect.poll(() => lastInvokeArgs(page, "set_session_specialist")).toMatchObject({
+    id: "depmap_r_agent",
+  });
+
+  await composer(page).fill("分析 ESR1 的共依赖，并给出可复现图表");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect.poll(() => lastInvokeArgs(page, "send_message")).toMatchObject({
+    message: "分析 ESR1 的共依赖，并给出可复现图表",
+  });
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible({ timeout: 10_000 });
 });
 
 test("specialist skills whitelist uses a searchable picker instead of a full list", async ({ page }) => {
@@ -12531,7 +16554,7 @@ test("new session can pick a specialist and it locks after the first message", a
 
   await composer(page).fill("hello there");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Hello from mock wisp-science.")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("Hello from mock wisp-depmap.")).toBeVisible({ timeout: 10_000 });
 
   agentMenu = await openAgentMenu(page);
   await expect(agentMenu.getByRole("button", { name: /^Specialist/ })).toBeDisabled();
@@ -12568,6 +16591,12 @@ test("remote access settings: Feishu, WeChat, and StickS3 setup", async ({ page 
   // setup path.
   await page.getByTestId("feishu-channel-row").click();
   await expect(page.getByTestId("feishu-channel-card")).toBeVisible();
+  await expect(page.getByTestId("feishu-pending-owner")).toBeVisible();
+  await expect(page.getByTestId("feishu-pending-owner")).toContainText("ou_pending");
+  await page.getByTestId("feishu-pending-reject").click();
+  await expect.poll(() => lastInvokeArgs(page, "reject_feishu_pending_owner")).not.toBeNull();
+  await expect(page.getByTestId("feishu-pending-owner")).toHaveCount(0);
+  await expect(page.getByTestId("feishu-owner-status")).toContainText("No owner bound");
   await page.getByTestId("feishu-international").check();
   await page.getByTestId("feishu-app-id").fill("cli_test123");
   await page.getByTestId("feishu-app-secret").fill("secret-xyz");
@@ -12588,6 +16617,13 @@ test("remote access settings: Feishu, WeChat, and StickS3 setup", async ({ page 
   await expect(page.getByTestId("feishu-qr")).toBeVisible();
   await expect(page.getByTestId("feishu-unbind")).toBeVisible({ timeout: 10_000 });
   await expect(page.getByTestId("feishu-app-id")).toHaveValue("cli_scan_created");
+  await expect(page.getByTestId("feishu-owner-status")).toContainText("ou_scan_owner");
+  await page.getByTestId("feishu-owner-id").fill("ou_manual");
+  await page.getByTestId("feishu-owner-save").click();
+  await expect.poll(() => lastInvokeArgs(page, "set_feishu_owner")).toMatchObject({
+    openId: "ou_manual",
+  });
+  await expect(page.getByTestId("feishu-owner-status")).toContainText("ou_manual");
 
   // Back on the list the bound bot's toggle is now enabled.
   await page.locator(".settings-head-back").click();
@@ -12701,6 +16737,15 @@ test("Ctrl+P imports Codex conversations from local, WSL, or SSH without rescann
   await expect.poll(() => lastInvokeArgs(page, "list_codex_sessions"))
     .toMatchObject({ contextId: "local", refresh: true });
 
+  const search = modal.getByRole("searchbox", { name: "Search conversations" });
+  await search.fill("renderer");
+  await expect(modal.locator(".codex-import-row")).toHaveCount(1);
+  await expect(modal.locator(".codex-import-title")).toHaveText("Fix the renderer crash");
+  await search.fill("does-not-exist");
+  await expect(modal.locator(".codex-import-row")).toHaveCount(0);
+  await expect(modal).toContainText("No conversations match this search");
+  await search.fill("");
+
   // The already-imported rollout renders disabled; the new one is actionable.
   await expect(modal.locator(".codex-import-row.imported").getByRole("button", { name: "Imported" })).toBeDisabled();
   const targetRow = modal
@@ -12777,4 +16822,846 @@ test("Escape after leaving the projects screen does not touch disposed signals",
   await page.keyboard.press("Escape");
   await expect(newSessionButton(page)).toBeVisible();
   expect(browserErrors.filter((message) => message.includes("disposed"))).toEqual([]);
+});
+
+test("bundled connector details show real descriptions, parameters and operator links", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Connections");
+  await page.locator(".settings-list-row-link", { hasText: "BioMart" }).click();
+  const detail = page.getByTestId("connector-detail");
+  await expect(detail.getByRole("heading", { name: "BioMart", exact: true })).toBeVisible();
+  await expect(detail).toContainText("genomic annotations, identifier translation");
+  await expect(detail.locator(".conn-tool")).toHaveCount(8);
+  await expect(detail.locator(".conn-tool").first()).toHaveAttribute("data-tool", "list_marts");
+  await expect(detail.getByTestId("connector-tool-documentation")).toHaveCount(0);
+  const datasets = detail.locator('[data-tool="list_datasets"]');
+  await datasets.getByRole("button", { name: "list_datasets", exact: true }).click();
+  await expect(datasets.getByRole("button", { name: "list_datasets", exact: true })).toHaveAttribute("aria-expanded", "true");
+  await expect(datasets).toContainText("List species datasets");
+  await expect(datasets.locator("tr", { hasText: "Mart identifier returned by list_marts." })).toContainText("Required");
+  await expect(datasets.locator("tr", { hasText: "max_results" })).toContainText("200");
+  await datasets.getByText("Full input schema", { exact: true }).click();
+  await expect(datasets.locator("pre")).toContainText('"required"');
+  const sources = detail.getByTestId("connector-source-details");
+  await expect(sources).toContainText("wisp-depmap");
+  await expect(sources.getByRole("link", { name: "Ensembl usage terms" })).toHaveAttribute("href", "https://www.ensembl.org/info/about/legal/disclaimer.html");
+  await sources.getByRole("link", { name: "Ensembl BioMart", exact: true }).click();
+  await expect.poll(() => lastInvokeArgs(page, "open_external_url")).toMatchObject({ url: "https://www.ensembl.org/info/data/biomart/index.html" });
+  expect(await invokeArgsList(page, "test_mcp_connection")).toHaveLength(0);
+});
+
+test("connector approval changes preserve expanded documentation and enabled state", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Connections");
+  await page.locator(".settings-list-row-link", { hasText: "BioMart" }).click();
+  const detail = page.getByTestId("connector-detail");
+  const tool = detail.locator('[data-tool="list_marts"]');
+  await tool.getByRole("button", { name: "list_marts", exact: true }).click();
+  const deny = tool.getByRole("button", { name: "Deny — block this tool", exact: true });
+  await deny.click();
+  await expect(deny).toHaveAttribute("aria-pressed", "true");
+  await expect(tool.getByTestId("connector-tool-documentation")).toBeVisible();
+  await expect.poll(() => lastInvokeArgs(page, "set_tool_approval")).toMatchObject({ tool: "list_marts", mode: "deny" });
+  const skip = detail.locator(".settings-list-row", { hasText: "Skip approvals" }).locator("label.toggle");
+  await skip.click();
+  await expect(deny).toBeDisabled();
+  await expect(tool.getByTestId("connector-tool-documentation")).toBeVisible();
+  await skip.click();
+  await expect(deny).toBeEnabled();
+  await expect(deny).toHaveAttribute("aria-pressed", "true");
+  await detail.locator(".conn-detail-heading label.toggle").click();
+  await expect.poll(() => lastInvokeArgs(page, "set_connector_enabled")).toMatchObject({ key: "biomart", enabled: false });
+  await expect(detail.getByRole("checkbox", { name: "Enable connector" })).not.toBeChecked();
+  await expect(tool.getByTestId("connector-tool-documentation")).toBeVisible();
+});
+
+test("custom connector documentation keeps server schemas and escapes untrusted text", async ({ page }) => {
+  await enterApp(page);
+  await page.evaluate(() => {
+    (window as any).__mockMcpTools = [
+      { name: "remote_query", description: 'Search records.\n<script>window.__connectorScriptRan = true</script>', inputSchema: { type: "object", required: ["query"], properties: { query: { type: "string", description: "Search words" } } }, outputSchema: { type: "object", properties: { total: { type: "integer" } } } },
+      { name: "legacy_tool" },
+    ];
+  });
+  await openSettingsSection(page, "Connections");
+  await page.locator(".settings-list-row-link", { hasText: "wolai_cmp" }).click();
+  const detail = page.getByTestId("connector-detail");
+  await detail.getByRole("button", { name: "remote_query", exact: true }).click();
+  const remote = detail.locator('[data-tool="remote_query"]');
+  await expect(remote).toContainText("<script>");
+  await expect(remote.locator("script")).toHaveCount(0);
+  await expect(remote.locator("tr", { hasText: "Search words" })).toContainText("Required");
+  await remote.getByText("Output schema", { exact: true }).click();
+  await expect(remote.locator("details[open] pre")).toContainText('"total"');
+  await detail.getByRole("button", { name: "legacy_tool", exact: true }).click();
+  await expect(detail.locator('[data-tool="legacy_tool"]')).toContainText("No description provided.");
+  expect(await page.evaluate(() => (window as any).__connectorScriptRan)).toBeUndefined();
+  await expect(detail.getByTestId("connector-source-details")).toHaveCount(0);
+});
+
+test("connector detail uses the Chinese introduction and Escape returns to its parent", async ({ page }) => {
+  await page.goto("/?mockLocale=zh");
+  await page.locator(".proj-card-main").first().click();
+  await page.getByRole("button", { name: "设置", exact: true }).click();
+  await page.locator(".settings-nav").getByRole("button", { name: "连接", exact: true }).click();
+  await page.locator(".settings-list-row-link", { hasText: "BioMart" }).click();
+  const detail = page.getByTestId("connector-detail");
+  await expect(detail).toContainText("查询基因组注释");
+  await page.keyboard.press("Escape");
+  await expect(detail).toBeHidden();
+  await expect(page.locator(".settings-page")).toBeVisible();
+  await expect(page.getByRole("button", { name: "添加连接", exact: true })).toBeVisible();
+});
+
+
+test("optional environment detection does not block first-run model setup", async ({ page }) => {
+  await page.addInitScript(() => {
+    (window as any).__mockLocalEnvironment = { paths: {}, warning: null };
+  });
+  await page.goto("/?mockOnboarding=1");
+  const onboard = page.locator(".onboard-overlay");
+  await expect(onboard).toBeVisible();
+  await onboard.getByRole("button", { name: "Next" }).click();
+  await onboard.getByRole("button", { name: "Next" }).click();
+  await expect(onboard.getByTestId("local-environment")).toHaveCount(0);
+  await onboard.getByRole("button", { name: "Set up later" }).click();
+  const environment = onboard.getByTestId("local-environment");
+  await expect(environment).toContainText("local-env-setup");
+  await expect(environment.locator("dd")).toHaveCount(7);
+  await expect(environment.locator("dd").first()).toContainText("Not found");
+  await expect(onboard.getByRole("button", { name: "Get started" })).toBeEnabled();
+  const viewport = page.viewportSize()!;
+  await expectInsideViewport(onboard.getByRole("button", { name: "Get started" }), viewport.width, viewport.height);
+  await onboard.getByRole("button", { name: "Get started" }).click();
+  await expect(onboard).toBeHidden();
+  expect(await lastInvokeArgs(page, "send_message")).toBeNull();
+});
+
+test("general settings show discovered paths and can recheck without installing", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "General");
+  const environment = page.getByTestId("local-environment");
+  await expect(environment).toContainText("/mock/bin/python3");
+  await expect(environment).toContainText("/mock/bin/Rscript");
+  await expect(environment).toContainText("/mock/bin/uv");
+  await expect(environment).toContainText("/mock/bin/node");
+  await page.evaluate(() => {
+    (window as any).__mockLocalEnvironment = {
+      paths: { python_executable: "C:\\Users\\Researcher\\python.exe" }, warning: null,
+    };
+  });
+  await environment.getByRole("button", { name: "Check paths again" }).click();
+  await expect(environment).toContainText("Researcher");
+  await expect(environment).not.toContainText("/mock/bin/python3");
+  expect(await lastInvokeArgs(page, "send_message")).toBeNull();
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".settings-page")).toBeHidden();
+});
+
+for (const platform of ["Linux x86_64", "MacIntel"]) {
+  test(`command palette reopens quick setup without resetting settings (${platform})`, async ({ page }) => {
+    await page.addInitScript((value) => {
+      Object.defineProperty(navigator, "platform", { configurable: true, value });
+      Object.defineProperty(navigator, "userAgent", { configurable: true, value: "wisp-depmap/Tauri" });
+    }, platform);
+    await enterApp(page);
+    await openSettingsSection(page, "Models");
+    const shortcut = platform === "MacIntel" ? "Meta+p" : "Control+p";
+    for (let reopen = 0; reopen < 2; reopen++) {
+      await page.keyboard.press(shortcut);
+      const palette = page.getByRole("dialog", { name: "Command Palette" });
+      await expect(palette).toBeVisible();
+      await page.locator("#action-palette-input").fill(platform === "MacIntel" ? "environment" : "配置");
+      await palette.getByText("Quick setup", { exact: true }).click();
+      const setup = page.locator(".onboard-overlay");
+      await expect(setup).toBeVisible();
+      await expect(setup.getByRole("heading", { name: "Welcome to wisp-depmap" })).toBeVisible();
+      await expect(setup.getByLabel("API key (stored in OS keyring)")).toHaveCount(0);
+      await expect(setup.getByTestId("local-environment")).toHaveCount(0);
+      // Immediate Escape closes the topmost setup page, preserving Settings.
+      await page.keyboard.press("Escape");
+      await expect(setup).toBeHidden();
+      await expect(page.locator(".settings-page")).toBeVisible();
+      await expect(page.locator(".settings-nav button.active")).toHaveText("Models");
+    }
+    expect(await lastInvokeArgs(page, "save_model")).toBeNull();
+    expect(await lastInvokeArgs(page, "send_message")).toBeNull();
+    await expect.poll(() => page.evaluate(() => ((window as any).__skillInvokeLog ?? [])
+      .filter((call: any) => call.cmd === "detect_local_environment").length)).toBe(2);
+  });
+}
+
+test("onboarding Enter advances once, respects composition and controls, and finishes", async ({ page }) => {
+  await page.goto("/?mockOnboarding=1");
+  const modal = page.locator(".onboard");
+  await expect(modal).toBeFocused();
+  await page.keyboard.down("Enter");
+  await expect(modal.locator(".onboard-dot.active")).toHaveCount(1);
+  await expect(modal.getByRole("heading")).toHaveText("What wisp-depmap can do");
+  await page.keyboard.down("Enter"); // Auto-repeat must not skip another page.
+  await page.keyboard.up("Enter");
+  await expect(modal.getByRole("heading")).toHaveText("What wisp-depmap can do");
+  await modal.dispatchEvent("keydown", { key: "Enter", isComposing: true, bubbles: true });
+  await modal.dispatchEvent("compositionend", { bubbles: true });
+  await modal.dispatchEvent("keydown", { key: "Enter", keyCode: 229, bubbles: true });
+  await page.keyboard.press("Shift+Enter");
+  await expect(modal.getByRole("heading")).toHaveText("What wisp-depmap can do");
+  // Native keyboard activation of Back still returns exactly one page.
+  await modal.getByRole("button", { name: "Back", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  await expect(modal.getByRole("heading")).toHaveText("Welcome to wisp-depmap");
+  await page.keyboard.press("Enter");
+  await expect(modal.getByRole("heading")).toHaveText("What wisp-depmap can do");
+  await modal.locator(".row > .primary").focus();
+  await page.keyboard.press("Enter");
+  await expect(modal.getByRole("heading")).toHaveText("Set up your model");
+  await modal.locator('input[type="password"]').focus();
+  await page.keyboard.press("Enter");
+  await expect(modal.getByRole("heading")).toHaveText("Local environment (optional)");
+  expect(await lastInvokeArgs(page, "save_model")).toBeNull();
+  await modal.getByRole("button", { name: "Edit paths" }).focus();
+  await page.keyboard.press("Enter");
+  const python = modal.getByRole("textbox", { name: "Python", exact: true });
+  await python.fill("C:\\Custom Python\\python.exe");
+  await page.keyboard.press("Enter");
+  await expect(python).toHaveValue("C:\\Custom Python\\python.exe");
+  await expect(modal).toBeVisible();
+  await modal.getByRole("button", { name: "Cancel", exact: true }).click();
+  await modal.focus();
+  await page.keyboard.press("Enter");
+  await expect(modal).toBeHidden();
+  expect(await lastInvokeArgs(page, "send_message")).toBeNull();
+  await expect.poll(() => page.evaluate(() => ((window as any).__skillInvokeLog ?? [])
+    .filter((call: any) => call.cmd === "dismiss_onboarding").length)).toBe(1);
+});
+
+test("onboarding keeps its backdrop and dialog mounted when navigating", async ({ page }) => {
+  await page.goto("/?mockOnboarding=1");
+  const modal = page.locator(".onboard");
+  await expect(modal).toBeVisible();
+  const shell = await page.evaluateHandle(() => ({
+    backdrop: document.querySelector(".onboard-overlay"),
+    dialog: document.querySelector(".onboard"),
+    next: document.querySelector(".onboard > .row > .primary"),
+  }));
+  // Let the initial opening animation finish before watching for restarts.
+  await modal.evaluate(async el => {
+    await Promise.all(el.parentElement!.getAnimations({ subtree: true }).map(a => a.finished));
+    (window as any).__onboardAnimationStarts = [];
+    el.parentElement!.addEventListener("animationstart", event => {
+      (window as any).__onboardAnimationStarts.push((event as AnimationEvent).animationName);
+    });
+  });
+  let previousStep = 0;
+  for (const step of [1, 2, 3, 2, 1, 0]) {
+    if (step < previousStep) {
+      await page.keyboard.press("Escape");
+    } else {
+      await modal.locator(".row > .primary").click();
+    }
+    await expect(modal.locator(".onboard-dot").nth(step)).toHaveClass(/active/);
+    expect(await shell.evaluate(saved => saved.backdrop === document.querySelector(".onboard-overlay")
+      && saved.dialog === document.querySelector(".onboard")
+      && saved.next === document.querySelector(".onboard > .row > .primary"))).toBe(true);
+    previousStep = step;
+  }
+  expect(await page.evaluate(() => (window as any).__onboardAnimationStarts)).toEqual([]);
+  await shell.dispose();
+  await page.keyboard.press("Escape");
+  await expect(modal).toBeHidden();
+});
+
+for (const locale of ["en", "zh"]) {
+  test(`onboarding has four separate pages without overflowing the modal (${locale})`, async ({ page }) => {
+    await page.setViewportSize({ width: 700, height: 620 });
+    await page.addInitScript(() => {
+      (window as any).__mockLocalEnvironment = { paths: {
+        python_executable: "C:\\Users\\Researcher\\AppData\\Roaming\\science.wisp-science\\wisp-science\\python\\.venv\\Scripts\\python.exe",
+        rscript_executable: "C:\\Program Files\\R-4.6.1\\bin\\x64\\Rscript.exe",
+        uv_executable: "C:\\Users\\Researcher\\AppData\\Local\\Microsoft\\WinGet\\Links\\uv.exe",
+        node_executable: "C:\\Program Files\\nodejs\\node.exe",
+        npm_executable: "C:\\Program Files\\nodejs\\npm.cmd",
+        sci_executable: "C:\\Users\\Researcher\\AppData\\Roaming\\npm\\sci.cmd",
+        pixi_executable: "C:\\Users\\Researcher\\.pixi\\bin\\pixi.exe",
+      }, warning: null };
+    });
+    await page.goto(`/?mockOnboarding=1&mockLocale=${locale}`);
+    const modal = page.locator(".onboard");
+    const titles = locale === "zh"
+      ? ["欢迎使用 wisp-depmap", "wisp-depmap 能做什么", "配置模型", "本地环境（可选）"]
+      : ["Welcome to wisp-depmap", "What wisp-depmap can do", "Set up your model", "Local environment (optional)"];
+    const next = locale === "zh" ? "下一步" : "Next";
+    for (let step = 0; step < 4; step++) {
+      await expect(modal.getByRole("heading", { name: titles[step], exact: true })).toBeVisible();
+      await expect(modal.locator(".onboard-dot")).toHaveCount(4);
+      await expect(modal.locator(".onboard-dot").nth(step)).toHaveClass(/active/);
+      await expect(modal.locator('input[type="password"]')).toHaveCount(step === 2 ? 1 : 0);
+      await expect(modal.getByTestId("local-environment")).toHaveCount(step === 3 ? 1 : 0);
+      await expectInsideViewport(modal, 700, 620);
+      expect(await modal.evaluate((el) => el.scrollWidth <= el.clientWidth && el.scrollHeight <= el.clientHeight)).toBe(true);
+      expect(await modal.locator(".onboard-content").evaluate((el) => ({
+        fits: el.scrollWidth <= el.clientWidth && el.scrollHeight <= el.clientHeight,
+        scrollbar: getComputedStyle(el).scrollbarWidth,
+      }))).toEqual({ fits: true, scrollbar: "none" });
+      await page.screenshot({ path: test.info().outputPath(`onboarding-${locale}-${step}.png`), animations: "disabled" });
+      if (step < 3) await modal.getByRole("button", { name: step === 2 ? (locale === "zh" ? "稍后配置" : "Set up later") : next, exact: true }).click();
+    }
+    // Even at high zoom / short window height, navigation stays outside the
+    // scrollable content and long paths never force horizontal scrolling.
+    await page.setViewportSize({ width: 460, height: 360 });
+    const content = modal.locator(".onboard-content");
+    await expectInsideViewport(modal.locator(".row"), 460, 360);
+    expect(await content.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+    await content.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+    await expect(modal.getByRole("button", { name: locale === "zh" ? "编辑路径" : "Edit paths", exact: true })).toBeInViewport();
+    await page.keyboard.press("Escape");
+    await expect(modal.getByRole("heading", { name: titles[2], exact: true })).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(modal.getByRole("heading", { name: titles[1], exact: true })).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(modal.getByRole("heading", { name: titles[0], exact: true })).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(modal).toBeHidden();
+    expect(await lastInvokeArgs(page, "save_model")).toBeNull();
+  });
+}
+
+test("local environment manual paths save, survive reopening, and preserve failed edits", async ({ page }) => {
+  await page.goto("/?mockOnboarding=1");
+  const modal = page.locator(".onboard");
+  await modal.getByRole("button", { name: "Next", exact: true }).click();
+  await modal.getByRole("button", { name: "Next", exact: true }).click();
+  await modal.getByRole("button", { name: "Set up later" }).click();
+  const env = modal.getByTestId("local-environment");
+  await env.getByRole("button", { name: "Edit paths" }).click();
+  await expect(env.getByRole("textbox")).toHaveCount(7);
+  await expect(env.getByRole("textbox", { name: "Python", exact: true })).toHaveValue("/mock/bin/python3");
+  await env.getByRole("textbox", { name: "Python", exact: true }).fill("C:\\Custom Python\\python.exe");
+  await expect(env.getByRole("textbox", { name: "Python", exact: true })).toBeFocused();
+  await env.getByRole("textbox", { name: "npm", exact: true }).fill("C:\\Program Files\\nodejs\\npm.cmd");
+  await env.getByRole("textbox", { name: "uv", exact: true }).fill("");
+  await page.evaluate(() => { (window as any).__failSaveLocalEnvironment = true; });
+  await env.getByRole("button", { name: "Save paths" }).click();
+  await expect(env.getByRole("alert")).toContainText("file not found");
+  await expect(env.getByRole("textbox", { name: "Python", exact: true })).toHaveValue("C:\\Custom Python\\python.exe");
+  await page.evaluate(() => { (window as any).__failSaveLocalEnvironment = false; });
+  await env.getByRole("button", { name: "Save paths" }).click();
+  await expect(env.getByRole("textbox")).toHaveCount(0);
+  await expect(env).toContainText("C:\\Custom Python\\python.exe");
+  await expect.poll(() => lastInvokeArgs(page, "save_local_environment_paths")).toMatchObject({ paths: {
+    python_executable: "C:\\Custom Python\\python.exe", npm_executable: "C:\\Program Files\\nodejs\\npm.cmd", uv_executable: "",
+  } });
+  await env.getByRole("button", { name: "Check paths again" }).click();
+  await expect(env).toContainText("C:\\Custom Python\\python.exe");
+  await modal.getByRole("button", { name: "Back", exact: true }).click();
+  await modal.getByRole("button", { name: "Set up later" }).click();
+  await expect(env).toContainText("C:\\Custom Python\\python.exe");
+  await env.getByRole("button", { name: "Edit paths" }).click();
+  await env.getByRole("textbox", { name: "Python", exact: true }).fill("/discard/python");
+  await env.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(env).toContainText("C:\\Custom Python\\python.exe");
+  expect(await lastInvokeArgs(page, "send_message")).toBeNull();
+});
+
+
+test("Generated outputs use a collapsed nested directory tree with working previews", async ({ page }) => {
+  await enterApp(page);
+  await composer(page).fill("GENERATEDTREE");
+  await page.getByRole("button", { name: "Send" }).click();
+  const reply = page.locator(".msg.assistant", { hasText: "Generated tree fixture complete." });
+  const summary = reply.locator(".message-artifacts-label");
+  await expect(summary).toHaveText("Generated · 66");
+  const tree = reply.locator(".generated-artifact-tree");
+  await expect(tree).not.toBeVisible();
+  await summary.focus();
+  await page.keyboard.press("Enter");
+  await expect(tree).toBeVisible();
+  await expect(tree.locator(".generated-directory > summary").filter({ hasText: "@analysis" })).toBeVisible();
+  await expect(tree.locator('[data-artifact-name="notes.md"]')).not.toBeVisible();
+  const results = tree.locator(".generated-directory").filter({ has: page.locator(":scope > summary .generated-directory-name", { hasText: /^results$/ }) });
+  await expect(results.locator(":scope > summary")).toContainText("63");
+  await expect(tree.locator('[data-artifact-name="new.png"]')).not.toBeVisible();
+  await results.locator(":scope > summary").click();
+  const batch = results.locator(".generated-directory > summary").filter({ hasText: "batch" });
+  await expect(batch).toContainText("62");
+  await expect(tree.locator('[data-artifact-name="output-0.csv"]')).not.toBeVisible();
+  await batch.click();
+  await expect(tree.locator('[data-artifact-name="output-0.csv"]')).toBeVisible();
+  await expect.poll(() => tree.evaluate(el => el.getBoundingClientRect().height)).toBeLessThanOrEqual(375);
+  await results.locator(":scope > summary").click();
+  await expect(tree.locator('[data-artifact-name="output-0.csv"]')).not.toBeVisible();
+  const reports = tree.locator('[data-artifact-name="report.md"]');
+  await expect(reports).toHaveCount(2);
+  await expect(reports.filter({ visible: true })).toHaveCount(1);
+  await tree.locator(".generated-directory > summary").filter({ hasText: "docs" }).click();
+  await expect(reports.filter({ visible: true })).toHaveCount(2);
+  await summary.click();
+  await expect(tree).not.toBeVisible();
+  await summary.click();
+  await results.locator(":scope > summary").click();
+  await tree.locator('[data-artifact-name="new.png"]').click();
+  await expect(page.locator(".artifact-modal")).toBeVisible();
+});
+
+test("Generated folders stay open when another reply updates an existing artifact", async ({ page }) => {
+  await enterApp(page);
+  await composer(page).fill("GENERATEDTREE");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  const reply = page.locator(".msg.assistant", { hasText: "Generated tree fixture complete." });
+  await reply.locator(".message-artifacts-label").click();
+  const results = reply.locator(".generated-directory").filter({ has: page.locator(":scope > summary .generated-directory-name", { hasText: /^results$/ }) });
+  await results.locator(":scope > summary").click();
+  await results.locator(".generated-directory > summary").filter({ hasText: "batch" }).click();
+  const output = reply.locator('[data-artifact-name="output-1.csv"]');
+  await expect(output).toBeVisible();
+  const frameId = await page.locator(".side-item.ses.active").getAttribute("data-session-id");
+  expect(frameId).toBeTruthy();
+  await emitTauriEvent(page, "agent", { kind: "User", frame_id: frameId, text: "Update the first result" });
+  await emitTauriEvent(page, "agent", { kind: "ToolCall", frame_id: frameId, name: "write", preview: "Update output-0.csv" });
+  await emitTauriEvent(page, "agent", { kind: "FileChanged", frame_id: frameId, path: "/mock/root/results/batch/output-0.csv" });
+  await emitTauriEvent(page, "agent", { kind: "ToolResult", frame_id: frameId, name: "write", ok: true, content: "Updated." });
+  await emitTauriEvent(page, "agent", { kind: "Text", frame_id: frameId, delta: "Result updated." });
+  await emitTauriEvent(page, "agent", { kind: "Done", frame_id: frameId });
+  await expect(reply.locator(".message-artifacts-label")).toHaveText("Generated · 65");
+  await expect(reply.locator('[data-artifact-name="output-0.csv"]')).toHaveCount(0);
+  await expect(reply.locator(".message-artifacts")).toHaveJSProperty("open", true);
+  await expect(results).toHaveJSProperty("open", true);
+  await expect(output).toBeVisible();
+  // The old reply remains independently collapsible after the update.
+  await results.locator(":scope > summary").click();
+  await expect(output).not.toBeVisible();
+  await results.locator(":scope > summary").focus();
+  await page.keyboard.press("Space");
+  await expect(output).toBeVisible();
+  const newReply = page.locator(".msg.assistant", { hasText: "Result updated." });
+  await expect(newReply.locator(".generated-artifact-tree")).not.toBeVisible();
+  await page.locator("#chat-scroller").evaluate(el => el.dispatchEvent(new WheelEvent("wheel", { deltaY: -100 })));
+  await reply.locator(".message-artifacts").screenshot({ path: test.info().outputPath("generated-folders-after-update.png") });
+});
+
+
+test("independent Workflow conversion selects source methods without creating Skill-bound nodes", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Workflows");
+  const studio=page.getByTestId("workflow-studio");
+  await page.getByTestId("workflow-new").click();
+  await page.getByTestId("portfolio-planner-open").click();
+  await page.getByTestId("portfolio-source-manual").click();
+  await page.locator('[data-testid="portfolio-source-skill"][value="analysis-workflow"]').check();
+  await page.getByTestId("portfolio-request").fill("Convert this method into independent roles and output contracts");
+  await page.getByTestId("portfolio-generate").click();
+  await expect(page.getByTestId("portfolio-plan-card")).toBeVisible();
+  await expect.poll(() => lastInvokeArgs(page,"plan_skill_portfolio")).toMatchObject({request:{source_skill_ids:["analysis-workflow"]}});
+  await page.getByTestId("portfolio-edit-studio").click();
+  await expect(studio.getByTestId("dynamic-task-skills")).toHaveCount(0);
+  await expect(studio.getByTestId("workflow-legacy-warning")).toHaveCount(0);
+  await studio.getByTestId("workflow-save").click();
+  await expect.poll(() => lastInvokeArgs(page,"save_workflow_template")).toMatchObject({conversionSourceSha256:"fixture-conversion-source"});
+  const args=await lastInvokeArgs(page,"save_workflow_template");
+  expect(args.template.proposal.tasks.every((task:any) => task.skill_ids.length===0)).toBe(true);
+  expect(args.template.proposal.approval_policy).toBe("review_all");
+});
+
+
+test("Workflow conversion reviews source provenance, real node contracts and multiple selected methods", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Workflows");
+  await page.getByTestId("workflow-new").click();
+  await page.getByTestId("portfolio-planner-open").click();
+  await expect(page.getByTestId("portfolio-source-auto")).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByTestId("portfolio-generate")).toBeDisabled();
+  await page.getByTestId("portfolio-request").fill("Produce an evidence-grounded analysis and report");
+  await page.getByTestId("portfolio-source-manual").click();
+  await expect(page.getByTestId("portfolio-source-manual")).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByTestId("portfolio-source-auto")).toHaveAttribute("aria-pressed", "false");
+  await expect(page.getByTestId("portfolio-generate")).toBeDisabled();
+  await page.getByTestId("portfolio-source-search").fill("analysis");
+  await page.getByTestId("portfolio-source-skill").check();
+  await page.getByTestId("portfolio-source-search").fill("literature");
+  await page.getByTestId("portfolio-source-skill").check();
+  await expect(page.getByTestId("portfolio-source-count")).toHaveText("2 / 8 sources selected");
+  await page.getByTestId("portfolio-generate").click();
+  await expect.poll(() => lastInvokeArgs(page, "plan_skill_portfolio")).toMatchObject({
+    request: { source_skill_ids: ["analysis-workflow", "literature-review"] },
+  });
+  const draft = page.getByTestId("portfolio-plan-card");
+  const nodes = draft.getByTestId("portfolio-review-node");
+  await expect(nodes).toHaveCount(3);
+  await expect(nodes.nth(1)).toContainText("Plan a reproducible analysis");
+  await expect(nodes.nth(1)).toContainText("code_run");
+  await expect(nodes.nth(2)).toContainText("After literature, analysis");
+  await expect(nodes.first()).toContainText("No structured output contract");
+  await expect(nodes.first()).not.toContainText("literature-review");
+  const contract = draft.getByTestId("portfolio-output-contract");
+  await contract.locator("summary").click();
+  await expect(contract.locator("pre")).toContainText('"required": [');
+  await expect(contract.locator("pre")).toContainText('"report"');
+  const sources = draft.getByTestId("portfolio-provenance");
+  await expect(sources.locator(".portfolio-tags code")).toHaveCount(2);
+  await sources.locator("summary").click();
+  await expect(sources).toContainText("fixture-conversion-source");
+  await expect.poll(() => invokeCount(page, "save_workflow_template")).toBe(0);
+  await page.getByTestId("portfolio-edit-studio").click();
+  await expect(page.getByTestId("workflow-conversion-notice")).toBeVisible();
+  await expect(page.getByTestId("workflow-name")).toHaveValue("Design an evidence-grounded oncology study");
+  await expect.poll(() => invokeCount(page, "save_workflow_template")).toBe(0);
+});
+
+test("Workflow conversion invalidates a draft when the request, model or source mode changes", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Workflows");
+  await page.getByTestId("workflow-new").click();
+  await page.getByTestId("portfolio-planner-open").click();
+  await page.getByTestId("portfolio-request").fill("Original research question");
+  for (const change of [
+    () => page.getByTestId("portfolio-request").fill("Updated research question"),
+    () => page.getByTestId("portfolio-model").selectOption("opus"),
+    () => page.getByTestId("portfolio-source-manual").click(),
+  ]) {
+    await page.getByTestId("portfolio-generate").click();
+    await expect(page.getByTestId("portfolio-edit-studio")).toBeVisible();
+    await change();
+    await expect(page.getByTestId("portfolio-plan-card")).toHaveCount(0);
+    await expect(page.getByTestId("portfolio-edit-studio")).toHaveCount(0);
+  }
+  await page.getByTestId("portfolio-source-skill").first().check();
+  await page.getByTestId("portfolio-generate").click();
+  await expect(page.getByTestId("portfolio-plan-card")).toBeVisible();
+  await page.getByTestId("portfolio-source-skill").nth(1).check();
+  await expect(page.getByTestId("portfolio-edit-studio")).toHaveCount(0);
+});
+
+test("Workflow conversion keeps errors inside the dialog and supports retry", async ({ page }) => {
+  await enterApp(page);
+  await page.evaluate(() => {
+    const core = (window as any).__TAURI__.core;
+    const original = core.invoke;
+    let failed = false;
+    core.invoke = async (cmd: string, args: any) => {
+      if (cmd === "plan_skill_portfolio" && !failed) {
+        failed = true;
+        throw new Error("Source contains unsupported packaged scripts");
+      }
+      return original(cmd, args);
+    };
+  });
+  await openSettingsSection(page, "Workflows");
+  await page.getByTestId("workflow-new").click();
+  await page.getByTestId("portfolio-planner-open").click();
+  await page.getByTestId("portfolio-request").fill("Convert the method");
+  await page.getByTestId("portfolio-generate").click();
+  await expect(page.getByTestId("portfolio-error")).toContainText("unsupported packaged scripts");
+  await expect(page.getByTestId("workflow-studio-error")).toHaveCount(0);
+  await expect(page.getByTestId("portfolio-edit-studio")).toHaveCount(0);
+  await page.getByTestId("portfolio-generate").click();
+  await expect(page.getByTestId("portfolio-plan-card")).toBeVisible();
+  await expect(page.getByTestId("portfolio-error")).toHaveCount(0);
+});
+
+test("Workflow conversion keeps running after closing and reopening", async ({ page }) => {
+  await enterApp(page);
+  await page.evaluate(() => {
+    const core = (window as any).__TAURI__.core;
+    const original = core.invoke;
+    let delayed = false;
+    core.invoke = async (cmd: string, args: any) => {
+      const result = await original(cmd, args);
+      if (cmd === "plan_skill_portfolio" && !delayed) {
+        delayed = true;
+        return new Promise(resolve => { (window as any).__finishConversion = () => resolve(result); });
+      }
+      return result;
+    };
+  });
+  await openSettingsSection(page, "Workflows");
+  await page.getByTestId("workflow-new").click();
+  await page.getByTestId("portfolio-planner-open").click();
+  await page.getByTestId("portfolio-request").fill("Old research question");
+  await page.getByTestId("portfolio-generate").click();
+  await expect(page.getByTestId("portfolio-loading")).toBeVisible();
+  await expect(page.getByTestId("portfolio-request")).toBeDisabled();
+  await expect(page.getByTestId("portfolio-model")).toBeDisabled();
+  await expect(page.getByTestId("portfolio-generate")).toBeDisabled();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("workflow-studio")).toBeVisible();
+  await page.getByTestId("workflow-new").click();
+  await page.getByTestId("portfolio-planner-open").click();
+  await page.evaluate(() => (window as any).__finishConversion());
+  await expect(page.getByTestId("portfolio-plan-card")).toBeVisible();
+  await expect(page.getByTestId("portfolio-request")).toHaveValue("Old research question");
+  await page.getByTestId("portfolio-request").fill("New research question");
+  await page.getByTestId("portfolio-generate").click();
+  await expect(page.getByTestId("portfolio-plan-card")).toBeVisible();
+});
+
+async function holdWorkflowConversion(page: Page) {
+  await page.evaluate(() => {
+    const core = (window as any).__TAURI__.core;
+    const original = core.invoke;
+    core.invoke = async (cmd: string, args: any) => {
+      const result = await original(cmd, args);
+      if (cmd !== "plan_skill_portfolio") return result;
+      return new Promise((resolve, reject) => {
+        (window as any).__finishConversion = () => resolve(result);
+        (window as any).__failConversion = () => reject(new Error("Conversion timed out"));
+      });
+    };
+  });
+}
+
+test("Workflow conversion reports real progress and retains its draft after leaving settings", async ({ page }) => {
+  await enterApp(page);
+  await holdWorkflowConversion(page);
+  await openSettingsSection(page, "Workflows");
+  await page.getByTestId("workflow-new").click();
+  await page.getByTestId("portfolio-planner-open").click();
+  await page.getByTestId("portfolio-request").fill("Background research question");
+  await page.getByTestId("portfolio-generate").click();
+  await expect(page.getByTestId("conversion-progress")).toContainText("Preparing conversion");
+  const { conversionId, expectedProjectId } = await lastInvokeArgs(page, "plan_skill_portfolio");
+  expect(expectedProjectId).toBe("default");
+  for (const [stage, text] of [
+    ["selecting_sources", "Matching source Skills"],
+    ["reading_sources", "Reading method documents"],
+    ["generating", "Generating node instructions"],
+    ["validating", "Checking dependencies"],
+    ["repairing", "Correcting nodes after validation"],
+  ]) {
+    await emitTauriEvent(page, "workflow-conversion-progress", { conversion_id: conversionId, stage });
+    await expect(page.getByTestId("conversion-progress")).toContainText(text);
+  }
+  await expect(page.getByTestId("conversion-progress").locator(".conversion-elapsed")).not.toHaveText("Elapsed 0:00");
+  await page.getByRole("dialog").screenshot({ path: test.info().outputPath("conversion-progress.png") });
+  await page.getByTestId("portfolio-background").click();
+  await expect(page.getByTestId("portfolio-planner-overlay")).toBeHidden();
+  await expect(page.getByTestId("workflow-studio")).toBeVisible();
+  await expect(page.getByTestId("conversion-notice")).toContainText("Correcting nodes");
+  await page.getByTestId("workflow-studio-back").click();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("workflow-studio")).toHaveCount(0);
+  await emitTauriEvent(page, "workflow-conversion-progress", { conversion_id: conversionId, stage: "saving" });
+  await expect(page.getByTestId("conversion-notice")).toContainText("Saving source provenance");
+  await page.evaluate(() => (window as any).__finishConversion());
+  await expect(page.getByTestId("conversion-notice")).toContainText("Workflow draft ready for review");
+  await page.screenshot({ path: test.info().outputPath("conversion-background-ready.png") });
+  await page.getByTestId("conversion-open").click();
+  await expect(page.getByTestId("portfolio-plan-card")).toBeVisible();
+  await expect(page.getByTestId("portfolio-request")).toHaveValue("Background research question");
+  await expect.poll(() => invokeCount(page, "plan_skill_portfolio")).toBe(1);
+  await page.getByTestId("portfolio-edit-studio").click();
+  await expect(page.getByTestId("conversion-notice")).toHaveCount(0);
+  await page.getByTestId("workflow-save").click();
+  await expect.poll(() => lastInvokeArgs(page, "save_workflow_template")).toMatchObject({ conversionSourceSha256: "fixture-conversion-source" });
+});
+
+test("Workflow background failure can retry and ignores another request's progress", async ({ page }) => {
+  await enterApp(page);
+  await holdWorkflowConversion(page);
+  await openSettingsSection(page, "Workflows");
+  await page.getByTestId("workflow-new").click();
+  await page.getByTestId("portfolio-planner-open").click();
+  await page.getByTestId("portfolio-request").fill("Retry conversion");
+  await page.getByTestId("portfolio-generate").click();
+  await expect(page.getByTestId("portfolio-loading")).toBeVisible();
+  const oldId = (await lastInvokeArgs(page, "plan_skill_portfolio")).conversionId;
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("workflow-studio")).toBeVisible();
+  await page.evaluate(() => (window as any).__failConversion());
+  await expect(page.getByTestId("conversion-notice")).toContainText("Workflow conversion failed");
+  await page.getByTestId("conversion-open").click();
+  await expect(page.getByTestId("portfolio-error")).toContainText("Conversion timed out");
+  await page.getByTestId("portfolio-generate").click();
+  await expect(page.getByTestId("portfolio-loading")).toBeVisible();
+  const newId = (await lastInvokeArgs(page, "plan_skill_portfolio")).conversionId;
+  expect(newId).not.toBe(oldId);
+  await emitTauriEvent(page, "workflow-conversion-progress", { conversion_id: newId, stage: "reading_sources" });
+  await emitTauriEvent(page, "workflow-conversion-progress", { conversion_id: oldId, stage: "repairing" });
+  await expect(page.getByTestId("conversion-progress")).toContainText("Reading method documents");
+  await expect(page.getByTestId("portfolio-error")).toHaveCount(0);
+  await page.evaluate(() => (window as any).__finishConversion());
+  await expect(page.getByTestId("portfolio-plan-card")).toBeVisible();
+});
+
+test("Workflow background draft returns to its source project", async ({ page }) => {
+  await enterApp(page);
+  await holdWorkflowConversion(page);
+  await openSettingsSection(page, "Workflows");
+  await page.getByTestId("workflow-new").click();
+  await page.getByTestId("portfolio-planner-open").click();
+  await page.getByTestId("portfolio-request").fill("Original project conversion");
+  await page.getByTestId("portfolio-generate").click();
+  await expect(page.getByTestId("portfolio-loading")).toBeVisible();
+  await page.getByTestId("portfolio-background").click();
+  await page.getByTestId("workflow-studio-back").click();
+  await page.keyboard.press("Escape");
+  await page.locator(".proj-switch").click();
+  await page.locator(".proj-menu").getByRole("button", { name: "Other project" }).click();
+  await expect(page.locator(".proj-name")).toHaveText("Other project");
+  await page.evaluate(() => (window as any).__finishConversion());
+  await expect(page.getByTestId("conversion-notice")).toContainText("Workflow draft ready");
+  await openSettingsSection(page, "Workflows");
+  await page.getByTestId("workflow-new").click();
+  await expect(page.getByTestId("portfolio-planner-open")).toBeDisabled();
+  await page.keyboard.press("Escape");
+  await page.getByTestId("conversion-open").click();
+  await expect(page.locator(".proj-name")).toHaveText("wisp-depmap");
+  await expect(page.getByTestId("portfolio-plan-card")).toBeVisible();
+  await expect(page.getByTestId("portfolio-request")).toHaveValue("Original project conversion");
+});
+
+for (const missing of ["Sources", "Models"]) {
+  test(`Workflow conversion explains missing ${missing.toLowerCase()} and disables generation`, async ({ page }) => {
+    await enterApp(page, `/?mockWorkflow${missing}=none`);
+    await openSettingsSection(page, "Workflows");
+    await page.getByTestId("workflow-new").click();
+    await page.getByTestId("portfolio-planner-open").click();
+    await page.getByTestId("portfolio-request").fill("Convert a method");
+    await expect(page.getByTestId(`portfolio-no-${missing.toLowerCase()}`)).toBeVisible();
+    await expect(page.getByTestId("portfolio-generate")).toBeDisabled();
+  });
+}
+
+test("Workflow conversion limits manual selection to eight methods", async ({ page }) => {
+  await enterApp(page, "/?mockWorkflowSources=many");
+  await openSettingsSection(page, "Workflows");
+  await page.getByTestId("workflow-new").click();
+  await page.getByTestId("portfolio-planner-open").click();
+  await page.getByTestId("portfolio-source-manual").click();
+  const sources = page.getByTestId("portfolio-source-skill");
+  for (let i = 0; i < 8; i++) await sources.nth(i).check();
+  await expect(sources.nth(8)).toBeDisabled();
+  await expect(sources.nth(9)).toBeDisabled();
+  await sources.first().uncheck();
+  await expect(sources.nth(8)).toBeEnabled();
+  await sources.nth(8).check();
+  await expect(page.getByTestId("portfolio-source-count")).toHaveText("8 / 8 sources selected");
+});
+
+test("Workflow conversion Escape closes the dialog before an underlying graph connection", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Workflows");
+  const studio = page.getByTestId("workflow-studio");
+  await studio.getByTestId("workflow-graph-connect").first().click();
+  await page.getByTestId("workflow-new").click();
+  await page.getByTestId("portfolio-planner-open").click();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("portfolio-planner-overlay")).toHaveCount(0);
+  await expect(studio.getByTestId("workflow-graph-connect-hint")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(studio.getByTestId("workflow-graph-connect-hint")).toHaveCount(0);
+  await expect(studio).toBeVisible();
+});
+
+for (const layout of [
+  { locale: "en", width: 1440, height: 900, theme: "light" },
+  { locale: "zh", width: 1100, height: 800, theme: "light" },
+  { locale: "zh", width: 640, height: 740, theme: "dark" },
+]) {
+  test(`Workflow conversion layout ${layout.locale} ${layout.width} ${layout.theme}`, async ({ page }) => {
+    await page.setViewportSize({ width: layout.width, height: layout.height });
+    await page.goto(`/?mockLocale=${layout.locale}`);
+    await page.locator(".proj-card-main").first().click();
+    const zh = layout.locale === "zh";
+    await page.getByRole("button", { name: zh ? "设置" : "Settings", exact: true }).click();
+    await page.getByRole("button", { name: zh ? "工作流" : "Workflows", exact: true }).click();
+    await page.evaluate(theme => document.documentElement.setAttribute("data-theme", theme), layout.theme);
+    await page.getByTestId("workflow-new").click();
+    await page.getByTestId("portfolio-planner-open").click();
+    await page.getByTestId("portfolio-request").fill(zh ? "核查开放获取论文是否获得更多引用，生成带引用的证据报告。" : "Check whether open access papers receive more citations and produce an evidence report.");
+    const modal = page.getByRole("dialog");
+    await expectInsideViewport(modal, layout.width, layout.height);
+    const model = page.getByTestId("portfolio-model");
+    const inputWidth = await model.evaluate(el => el.getBoundingClientRect().width);
+    expect(inputWidth).toBeGreaterThan(300);
+    await modal.screenshot({ path: test.info().outputPath("workflow-conversion-inputs.png") });
+    await page.getByTestId("portfolio-generate").click();
+    await expect(page.getByTestId("portfolio-plan-card")).toBeVisible();
+    if (layout.width <= 720) {
+      await expect.poll(() => modal.locator(".portfolio-workspace").evaluate(el => el.scrollTop)).toBeGreaterThan(0);
+      await expectInsideViewport(modal.locator(".portfolio-draft-head"), layout.width, layout.height);
+    }
+    await expectInsideViewport(page.getByTestId("portfolio-edit-studio"), layout.width, layout.height);
+    expect(await modal.evaluate(el => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
+    await modal.screenshot({ path: test.info().outputPath("workflow-conversion-review.png") });
+  });
+}
+
+test("legacy Skill-bound templates require explicit conversion and keep the parent Escape layer open", async ({ page }) => {
+  await enterApp(page,"/?mockLegacyWorkflow=1");
+  await openSettingsSection(page,"Workflows");
+  const studio=page.getByTestId("workflow-studio");
+  await studio.locator('[data-workflow-id="legacy-skill-workflow"]').click();
+  await expect(studio.getByTestId("workflow-legacy-warning")).toBeVisible();
+  await expect(studio.getByTestId("workflow-save")).toBeDisabled();
+  await expect(studio.getByTestId("dynamic-task-skills")).toHaveCount(0);
+  await studio.getByTestId("workflow-reconvert").click();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("portfolio-planner-overlay")).toBeHidden();
+  await expect(studio).toBeVisible();
+  await expect(studio.getByTestId("workflow-legacy-warning")).toBeVisible();
+  await studio.getByTestId("workflow-reconvert").click();
+  await page.getByTestId("portfolio-generate").click();
+  await expect(page.getByTestId("portfolio-plan-card")).toBeVisible();
+  await expect.poll(() => lastInvokeArgs(page,"plan_skill_portfolio")).toMatchObject({request:{legacy_template_id:"legacy-skill-workflow"}});
+  await page.getByTestId("portfolio-edit-studio").click();
+  await expect(studio.getByTestId("workflow-legacy-warning")).toHaveCount(0);
+  await expect(studio.getByTestId("workflow-name")).toHaveValue("Legacy Skill workflow");
+  await studio.getByTestId("workflow-save").click();
+  await expect.poll(() => lastInvokeArgs(page,"save_workflow_template")).toMatchObject({template:{id:"legacy-skill-workflow",proposal:{approval_policy:"review_all"}}});
+});
+
+test("historical Skill-bound Workflow cannot be approved and offers source conversion", async ({ page }) => {
+  await enterApp(page,"/?mockAgentWorkflow=legacy");
+  await page.getByRole("button",{name:"Toggle panel"}).click();
+  await page.locator(".rightpane").getByRole("button",{name:"Agents",exact:true}).click();
+  const panel=page.getByTestId("agent-workflows");
+  await expect(panel.getByTestId("agent-legacy-warning")).toBeVisible();
+  await expect(panel.getByTestId("agent-approve")).toBeDisabled();
+  await panel.getByTestId("agent-reconvert").click();
+  await expect(page.getByTestId("portfolio-planner-overlay")).toBeVisible();
+  await page.getByTestId("portfolio-generate").click();
+  await expect.poll(() => lastInvokeArgs(page,"plan_skill_portfolio")).toMatchObject({request:{legacy_workflow_id:"workflow-1"}});
+});
+
+test("Workflow child confirmation cleanup cannot dismiss a newer owner request", async ({ page }) => {
+  await enterApp(page,"/?mockSessionModels=1");
+  await page.locator('[data-session-id="s-model-a"]').click();
+  const show=async(id:string,label:string) => emitTauriEvent(page,"confirm-request",{
+    frame_id:"s-model-a",approval_id:id,message:`Workflow node ${label} requests confirmation`,tool:"run_in_context",preview:`echo ${label}`,
+  });
+  await show("child-1","first");
+  await expect(page.getByRole("button",{name:"Deny",exact:true})).toBeVisible();
+  await show("child-2","second");
+  await emitTauriEvent(page,"confirm-resolved",{frame_id:"s-model-a",approval_id:"child-1",tool:"run_in_context",preview:"",message:""});
+  await expect(page.getByTestId("workflow-approval-node")).toHaveText("Workflow node: second");
+  await expect(page.getByLabel("Approval scope")).toHaveCount(0);
+  await emitTauriEvent(page,"confirm-resolved",{frame_id:"s-model-a",approval_id:"child-2",tool:"run_in_context",preview:"",message:""});
+  await expect(page.getByRole("button",{name:"Deny",exact:true})).toHaveCount(0);
+});
+
+test("project star pins above examples, survives reload, and can be removed", async ({ page }) => {
+  await page.goto("/");
+  const other = page.locator(".proj-card:not(.proj-example)", { hasText: "Other project" });
+  const star = other.getByTestId("project-card-star");
+  await expect(star).toHaveAttribute("aria-pressed", "false");
+  await star.click();
+  await expect(star).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator(".projects-col").first().locator(".proj-card").first()).toContainText("Other project");
+  await expect.poll(() => lastInvokeArgs(page, "open_project")).toBeNull();
+  await page.reload();
+  await expect(star).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator(".projects-col").first().locator(".proj-card").first()).toContainText("Other project");
+  await star.click();
+  await expect(star).toHaveAttribute("aria-pressed", "false");
+  await expect(page.locator(".proj-card:not(.proj-example)").first()).not.toContainText("Other project");
+});
+
+test("project star save failure leaves ordering and state unchanged", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => { (window as any).__failProjectStar = true; });
+  const other = page.locator(".proj-card:not(.proj-example)", { hasText: "Other project" });
+  await other.getByTestId("project-card-star").click();
+  await expect(page.getByRole("alert")).toContainText("Could not save project star");
+  await expect(other.getByTestId("project-card-star")).toHaveAttribute("aria-pressed", "false");
+  await expect(page.locator(".proj-card:not(.proj-example)").first()).not.toContainText("Other project");
 });

@@ -4,10 +4,19 @@
 
 use crate::archive::{prune_dir, ArchiveRetention};
 use crate::context::{image_content, ContextManager};
+use crate::guardrail::{
+    evaluate_final_output, evaluate_handoff, evaluate_tool_input, DispatchPath, GuardrailChain,
+    GuardrailContext, GuardrailDecision, GuardrailSeverity,
+};
+use crate::observability::{
+    finish_turn_span, mcp_capability_id, plan_tool_spans, ErrorClass, SpanGuard, SpanKind,
+    SpanStatus, TurnIdentity,
+};
 use crate::output::{StreamSinkAdapter, ToolEnvAdapter};
 use crate::provenance;
 use crate::Output;
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +24,7 @@ use std::time::Duration;
 use wisp_llm::{
     is_retriable, Completion, Content, LlmError, Message, Part, Provider, ToolCall, ToolSchema,
 };
-use wisp_tools::{ImageData, Registry, ToolControl, ToolEnv};
+use wisp_tools::{ImageData, Registry, ToolControl, ToolEnv, ToolResult};
 
 const RETRY_DELAYS: [u64; 5] = [2_000, 10_000, 30_000, 60_000, 120_000];
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -27,14 +36,13 @@ const STREAM_CUT_MESSAGE: &str = "模型响应流在中途被断开（未收到�
 const EMPTY_RESPONSE_MESSAGE: &str = "模型完成了本轮推理，但没有返回可显示的文本或工具调用。对话上下文和已完成的工具结果均已保留；请点击“继续执行”重新生成最终回复。若长对话中反复出现，请先发送 /compact 压缩上下文。(model returned no visible response)";
 const ABNORMAL_FINISH_MESSAGE: &str = "模型服务没有正常完成本轮响应，已生成的部分内容不会作为最终答案提交。已完成的工具结果均已保留；请点击“继续执行”重试。(provider returned an unsuccessful finish reason)";
 const ITERATION_LIMIT_SUMMARY_FAILURE: &str = "已达到本轮 Agent 最大迭代次数，但模型未能生成无工具收尾总结。已完成的工具结果均已保留；请点击“继续执行”接着做。(failed to summarize after reaching max agent iterations)";
-/// How many byte-identical tool-call batches within the recent window count as
-/// "stuck". Windowed (not consecutive) so alternating A/B/A/B loops also trip it.
+/// How many consecutive repetitions of the same completed tool-call/result
+/// cycle count as "stuck".
 const STUCK_REPEAT_LIMIT: usize = 5;
-/// How many recent tool-call batches to scan for repeats. Wide enough to hold
-/// STUCK_REPEAT_LIMIT recurrences even when the model interleaves a couple of
-/// other calls between each repeat.
+/// How many completed tool-call/result observations to retain. Wide enough to
+/// detect five repetitions of cycles up to three batches long.
 const STUCK_WINDOW: usize = 16;
-const STUCK_LOOP_MESSAGE: &str = "检测到智能体连续多次发出完全相同的工具调用且没有进展，已中断以避免空转烧 token——通常是模型退化，建议换用更强的模型或换一种问法。(aborted: agent repeated an identical tool call with no progress)";
+const STUCK_LOOP_MESSAGE: &str = "检测到智能体连续重复相同的工具调用/结果循环且没有进展，已中断以避免空转烧 token——可能是模型退化，也可能需要缩小任务范围或换一种问法。(aborted: agent repeated an identical tool call/result cycle with no progress)";
 /// Tool output is an unbounded external payload, not durable conversation
 /// state. Budget every textual result at ingestion: the full text still
 /// reaches the user through the tool-result event emitted before truncation,
@@ -44,6 +52,31 @@ const STUCK_LOOP_MESSAGE: &str = "检测到智能体连续多次发出完全相�
 /// ~16 KiB ≈ 4K estimated tokens. Override with WISP_TOOL_RESULT_BUDGET
 /// (bytes; 0 disables).
 const DEFAULT_STREAM_RESULT_BUDGET: usize = 16 * 1024;
+
+fn resolve_guardrail_tool_input(
+    tools: &Registry,
+    name: &str,
+    requested_name: &str,
+    args: &serde_json::Value,
+) -> (Option<serde_json::Value>, serde_json::Value) {
+    if name == "use_mcp_tool" {
+        let nested = args
+            .get("tool_input")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let schema = tools
+            .get(requested_name)
+            .map(|tool| tool.schema().function.parameters);
+        (schema, nested)
+    } else {
+        (
+            tools
+                .get(name)
+                .map(|tool| tool.schema().function.parameters),
+            args.clone(),
+        )
+    }
+}
 
 fn context_archive(root: &Path) -> (PathBuf, String) {
     let id = uuid::Uuid::new_v4().simple().to_string();
@@ -57,10 +90,16 @@ fn context_archive(root: &Path) -> (PathBuf, String) {
 
 /// Head/tail-truncate a tool's text result to the ingestion budget. The full
 /// text is written under `.wisp/tool-output/` so the model can read/grep it back.
-fn budget_tool_result(root: &Path, tool_name: &str, content: Content) -> Content {
+fn budget_tool_result(
+    root: &Path,
+    tool_name: &str,
+    content: Content,
+    tool_budget: Option<usize>,
+) -> Content {
     let budget = std::env::var("WISP_TOOL_RESULT_BUDGET")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
+        .or(tool_budget)
         .unwrap_or(DEFAULT_STREAM_RESULT_BUDGET);
     budget_tool_result_with_limit(root, tool_name, content, budget)
 }
@@ -71,6 +110,36 @@ fn budget_tool_result_with_limit(
     content: Content,
     budget: usize,
 ) -> Content {
+    if let Content::Parts(parts) = &content {
+        // Mixed MCP output must obey the same text budget as text-only tools.
+        let text = parts
+            .iter()
+            .filter_map(|part| match part {
+                Part::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if budget == 0 || text.len() <= budget {
+            return content;
+        }
+        let Content::Text(bounded) =
+            budget_tool_result_with_limit(root, tool_name, Content::text(text), budget)
+        else {
+            unreachable!()
+        };
+        let mut bounded_parts = vec![Part::Text {
+            kind: "text".into(),
+            text: bounded,
+        }];
+        bounded_parts.extend(
+            parts
+                .iter()
+                .filter(|part| !matches!(part, Part::Text { .. }))
+                .cloned(),
+        );
+        return Content::Parts(bounded_parts);
+    }
     let Content::Text(text) = &content else {
         return content;
     };
@@ -103,11 +172,44 @@ fn budget_tool_result_with_limit(
     Content::text(ContextManager::truncate_middle(text, half, half, &marker))
 }
 
+/// Cap tool results restored from SQLite. Ingestion already budgets live
+/// results; leftover LM Studio / local transcripts can still be huge and
+/// must not blow the next send (#1070).
+pub fn bound_tool_results_in_history(root: &Path, messages: &mut [Message]) {
+    for message in messages {
+        if message.role != wisp_llm::Role::Tool {
+            continue;
+        }
+        let name = message.tool_name.clone().unwrap_or_else(|| "tool".into());
+        let content = std::mem::replace(&mut message.content, Content::text(""));
+        message.content = budget_tool_result(root, &name, content, None);
+    }
+}
+
 /// Mid-turn guidance queue: `(id, text)` pairs pushed by the host while a turn
 /// is running and drained into real user messages at the loop's next
 /// iteration. The id lets the queued sender detect whether the loop consumed
 /// its message or it still has to run a normal turn (see `send_message_inner`).
 pub type GuidanceQueue = std::sync::Mutex<Vec<(u64, String)>>;
+
+fn inject_pending_guidance(
+    ctx: &mut ContextManager,
+    output: &dyn Output,
+    guidance: Option<&GuidanceQueue>,
+) -> bool {
+    let Some(queue) = guidance else {
+        return false;
+    };
+    let drained = std::mem::take(&mut *queue.lock().unwrap());
+    let injected = !drained.is_empty();
+    for (id, text) in drained {
+        ctx.append_user(&text);
+        if let Some(message) = ctx.messages.last() {
+            output.on_guidance_message(id, message);
+        }
+    }
+    injected
+}
 
 /// Why an otherwise successful agent loop stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +270,10 @@ pub async fn agent_loop_with_images(
     cancel: Option<&AtomicBool>,
     guidance: Option<&GuidanceQueue>,
 ) -> Result<AgentLoopOutcome> {
+    // A host resume does not enter through this function. Resetting here
+    // therefore distinguishes a new user turn from continuation of a failed
+    // turn and keeps any route-installed policy active across Resume.
+    ctx.begin_user_turn();
     let observations = if images.is_empty() || provider_supports_vision {
         None
     } else {
@@ -286,9 +392,60 @@ async fn agent_loop_inner(
             None => adapter,
         }
     };
+    let turn_span = output.agent_trace().map(|trace| {
+        trace.start_turn(TurnIdentity {
+            session_id: output.frame_id().map(str::to_string),
+            turn_id: output.turn_id().map(str::to_string),
+            provider_id: Some(provider.name().to_string()),
+            model_id: Some(provider.model().to_string()),
+            parent: output.agent_trace().and_then(|trace| {
+                let ctx = trace.context();
+                if ctx.parent_span_id.is_some() && !ctx.trace_id.is_empty() {
+                    Some(ctx)
+                } else {
+                    None
+                }
+            }),
+            ..TurnIdentity::default()
+        })
+    });
+    let result = agent_loop_execute(
+        ctx,
+        provider,
+        vision_provider,
+        tools,
+        root,
+        output,
+        max_iter,
+        cancel,
+        guidance,
+        &env,
+        turn_span.as_ref(),
+    )
+    .await;
+    if let Some(span) = &turn_span {
+        finish_turn_span(span, &result);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn agent_loop_execute(
+    ctx: &mut ContextManager,
+    provider: &dyn Provider,
+    vision_provider: Option<&dyn Provider>,
+    tools: &Registry,
+    root: &Path,
+    output: &dyn Output,
+    max_iter: usize,
+    cancel: Option<&AtomicBool>,
+    guidance: Option<&GuidanceQueue>,
+    env: &ToolEnvAdapter<'_>,
+    turn_span: Option<&SpanGuard>,
+) -> Result<AgentLoopOutcome> {
     let mut iteration = 0usize;
     let mut auto_continues = 0usize;
-    let mut recent_sigs: VecDeque<String> = VecDeque::with_capacity(STUCK_WINDOW);
+    let mut recent_observations: VecDeque<[u8; 32]> = VecDeque::with_capacity(STUCK_WINDOW);
     loop {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             anyhow::bail!("stopped by user");
@@ -296,20 +453,10 @@ async fn agent_loop_inner(
         // Guide (#410): fold mid-turn user guidance into the context at the
         // iteration boundary, so this request already sees it. on_message
         // persists the row and emits the User event the UI promotes on.
-        if let Some(queue) = guidance {
-            let drained: Vec<(u64, String)> = std::mem::take(&mut *queue.lock().unwrap());
-            if !drained.is_empty() {
-                // User injection is new information. Re-issuing monitor_run
-                // after a wait_interrupted return is expected progress, not a
-                // stuck loop (#907).
-                recent_sigs.clear();
-            }
-            for (_, text) in drained {
-                ctx.append_user(&text);
-                if let Some(m) = ctx.messages.last() {
-                    output.on_message(m);
-                }
-            }
+        if inject_pending_guidance(ctx, output, guidance) {
+            // User injection is new information, including a progress check
+            // that interrupted monitor_run rather than a stuck loop (#907).
+            recent_observations.clear();
         }
         iteration += 1;
         let (schemas, schema_origins) = tools.schemas_with_origins();
@@ -323,6 +470,11 @@ async fn agent_loop_inner(
         if ctx.needs_auto_compact_with_reserve(fixed_request_tokens) {
             let (archive, archive_reference) = context_archive(root);
             output.compaction_started("auto");
+            let compact_span =
+                turn_span.map(|span| span.child(SpanKind::Compaction, "agent.compact"));
+            if let Some(span) = &compact_span {
+                span.set_str("compaction_strategy", "auto");
+            }
             match ctx
                 .compact_with_reserve_reference(
                     provider,
@@ -332,8 +484,19 @@ async fn agent_loop_inner(
                 )
                 .await
             {
-                Ok((before, after)) => output.compaction(before, after, "auto"),
+                Ok((before, after)) => {
+                    if let Some(span) = &compact_span {
+                        span.set_str("context_tokens_before", &before.to_string());
+                        span.set_str("context_tokens_after", &after.to_string());
+                        span.end(SpanStatus::Ok);
+                    }
+                    output.compaction(before, after, "auto");
+                }
                 Err(error) => {
+                    if let Some(span) = &compact_span {
+                        span.set_error_class(ErrorClass::Compaction);
+                        span.end(SpanStatus::Error);
+                    }
                     // Identical input fails identically: suppress automatic
                     // retries until the context has grown past this level.
                     ctx.note_auto_compact_failure(fixed_request_tokens);
@@ -350,14 +513,65 @@ async fn agent_loop_inner(
         };
         let mut overflow_recovery_used = false;
         let comp = loop {
+            // Automatic compaction/overflow recovery can await a provider
+            // after the loop-top drain. Include guidance received during that
+            // preparation in this request, not a later model iteration.
+            if inject_pending_guidance(ctx, output, guidance) {
+                recent_observations.clear();
+                ctx.note_request_boundary(fixed_request_tokens);
+            }
             let messages = ctx.prepare_for_api_with_tools(output, &schemas);
-            match stream_with_retry(provider, &messages, &schemas, &mut sink, cancel).await {
-                Ok(comp) => break comp,
-                Err(LlmError::Incomplete) => anyhow::bail!(STREAM_CUT_MESSAGE),
+            let model_span = turn_span.map(|span| {
+                let child = span.child(SpanKind::Model, "agent.model");
+                child.set_provider(provider.name());
+                child.set_model(provider.model());
+                child
+            });
+            match stream_with_retry(
+                provider,
+                &messages,
+                &schemas,
+                &mut sink,
+                cancel,
+                model_span.as_ref(),
+            )
+            .await
+            {
+                Ok(comp) => {
+                    if let Some(span) = &model_span {
+                        span.set_tokens(
+                            comp.usage.input_tokens,
+                            comp.usage.output_tokens,
+                            comp.usage.reasoning_tokens,
+                            comp.usage.cached_input_tokens,
+                        );
+                        if let Some(reason) = &comp.finish_reason {
+                            span.set_str("finish_reason", reason);
+                        }
+                        span.end(SpanStatus::Ok);
+                    }
+                    break comp;
+                }
+                Err(LlmError::Incomplete) => {
+                    if let Some(span) = &model_span {
+                        span.set_error_class(ErrorClass::Provider);
+                        span.end(SpanStatus::Error);
+                    }
+                    anyhow::bail!(STREAM_CUT_MESSAGE);
+                }
                 Err(error) if error.is_context_overflow() && !overflow_recovery_used => {
+                    if let Some(span) = &model_span {
+                        span.set_error_class(ErrorClass::Compaction);
+                        span.end(SpanStatus::Error);
+                    }
                     overflow_recovery_used = true;
                     let (archive, archive_reference) = context_archive(root);
                     output.compaction_started("overflow");
+                    let compact_span =
+                        turn_span.map(|span| span.child(SpanKind::Compaction, "agent.compact"));
+                    if let Some(span) = &compact_span {
+                        span.set_str("compaction_strategy", "overflow");
+                    }
                     match ctx
                         .compact_with_reserve_reference(
                             provider,
@@ -367,8 +581,19 @@ async fn agent_loop_inner(
                         )
                         .await
                     {
-                        Ok((before, after)) => output.compaction(before, after, "overflow"),
+                        Ok((before, after)) => {
+                            if let Some(span) = &compact_span {
+                                span.set_str("context_tokens_before", &before.to_string());
+                                span.set_str("context_tokens_after", &after.to_string());
+                                span.end(SpanStatus::Ok);
+                            }
+                            output.compaction(before, after, "overflow");
+                        }
                         Err(compact_error) => {
+                            if let Some(span) = &compact_span {
+                                span.set_error_class(ErrorClass::Compaction);
+                                span.end(SpanStatus::Error);
+                            }
                             anyhow::bail!(
                                 "context overflow recovery failed: {compact_error} (original: {error})"
                             );
@@ -376,7 +601,19 @@ async fn agent_loop_inner(
                     }
                     continue;
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    if let Some(span) = &model_span {
+                        let text = error.to_string();
+                        if text.contains(STOPPED_BY_USER) {
+                            span.set_error_class(ErrorClass::Cancelled);
+                            span.end(SpanStatus::Cancelled);
+                        } else {
+                            span.set_error_class(ErrorClass::Provider);
+                            span.end(SpanStatus::Error);
+                        }
+                    }
+                    return Err(error.into());
+                }
             }
         };
         if comp.usage.input_tokens > 0 {
@@ -437,6 +674,77 @@ async fn agent_loop_inner(
             anyhow::bail!(EMPTY_RESPONSE_MESSAGE);
         }
 
+        if comp.tool_calls.is_empty() && !env.guidance_pending() {
+            let completion_span =
+                turn_span.map(|span| span.child(SpanKind::Completion, "agent.completion"));
+            let parsed = serde_json::from_str(comp.content.trim()).ok();
+            let output_value = parsed.or_else(|| {
+                let text = comp.content.trim();
+                (!text.is_empty()).then(|| serde_json::Value::String(comp.content.clone()))
+            });
+            let outcome = evaluate_final_output(
+                &GuardrailChain::production(),
+                GuardrailContext {
+                    path: DispatchPath::Direct,
+                    tool: String::new(),
+                    arguments: serde_json::Value::Null,
+                    schema: None,
+                    allowed_tools: ctx.active_turn_allowed_tools().map(|tools| tools.to_vec()),
+                    approval_required: false,
+                    approval_granted: false,
+                    stale_approval: false,
+                    output: output_value.clone(),
+                    output_contract: ctx.output_contract().cloned(),
+                    claim_catalog: ctx.claim_catalog().cloned(),
+                },
+                completion_span.as_ref(),
+            );
+            match outcome.decision {
+                GuardrailDecision::Reject { reason, .. } => {
+                    sink.discard_assistant_text();
+                    if let Some(span) = completion_span {
+                        span.end(SpanStatus::Error);
+                    }
+                    anyhow::bail!(reason);
+                }
+                _ => {
+                    if let Some(output) = &output_value {
+                        if let Ok(claims) = crate::claim_record::claims_from_output(output) {
+                            if let Some(persist) = ctx.claim_persist() {
+                                persist(&claims);
+                            }
+                        }
+                    }
+                    sink.flush_assistant_text();
+                    ctx.append_assistant(
+                        comp.content.clone(),
+                        comp.tool_calls.clone(),
+                        comp.reasoning.clone(),
+                    );
+                    if let Some(m) = ctx.messages.last() {
+                        output.on_message(m);
+                    }
+                    if let Some(span) = completion_span {
+                        span.end(SpanStatus::Ok);
+                    }
+                    let context_usage = ctx.context_usage(&schemas, &schema_origins);
+                    let context_tokens = context_usage.total();
+                    output.usage(
+                        iteration,
+                        comp.usage.input_tokens,
+                        comp.usage.output_tokens,
+                        comp.usage.reasoning_tokens,
+                        comp.usage.cached_input_tokens,
+                        context_tokens,
+                        ctx.max_context,
+                        context_usage,
+                    );
+                    return Ok(AgentLoopOutcome::Completed);
+                }
+            }
+        }
+
+        sink.flush_assistant_text();
         ctx.append_assistant(
             comp.content.clone(),
             comp.tool_calls.clone(),
@@ -462,30 +770,54 @@ async fn agent_loop_inner(
             context_usage,
         );
 
-        if comp.tool_calls.is_empty() {
-            return Ok(AgentLoopOutcome::Completed);
-        }
-
-        // Stuck-loop guard: a degenerate model re-issues the exact same call
-        // (same name + args), each returning the same result, making no
-        // progress. max_iter only caps the waste; this cuts it off early.
-        // Scans a recent window rather than only consecutive turns, so an
-        // interspersed loop (A/B/A/B, or bouncing among a few calls) trips it
-        // too — not just a byte-for-byte repeat run.
-        let sig = tool_call_signature(&comp.tool_calls);
-        let repeats = recent_sigs.iter().filter(|s| *s == &sig).count() + 1;
-        recent_sigs.push_back(sig);
-        if recent_sigs.len() > STUCK_WINDOW {
-            recent_sigs.pop_front();
-        }
-        if repeats >= STUCK_REPEAT_LIMIT {
-            anyhow::bail!(STUCK_LOOP_MESSAGE);
-        }
-
         let mut batch_control = ToolControl::Continue;
+        let mut observation = Sha256::new();
+        hash_observation_part(
+            &mut observation,
+            tool_call_signature(&comp.tool_calls).as_bytes(),
+        );
         for (index, tc) in comp.tool_calls.iter().enumerate() {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                append_interrupted_tool_results(ctx, tools, output, &comp.tool_calls[index..]);
+                anyhow::bail!(STOPPED_BY_USER);
+            }
+            if env.guidance_pending() {
+                // The completed call is preserved, but the remaining calls
+                // were planned before the user's correction. Pair each one
+                // with a skipped result before requesting a revised plan.
+                append_synthetic_tool_results(
+                    ctx, tools, output, &comp.tool_calls[index..],
+                    "Skipped because new user guidance requires replanning before further tool calls.",
+                );
+                break;
+            }
             let name = tc.function.name.clone();
             let args = tc.args_value();
+            let requested_name = if name == "use_mcp_tool" {
+                args.get("tool_name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&name)
+            } else {
+                &name
+            };
+            let event_name = tools.event_name(&name, &args);
+            let (span_kind, is_mcp) = plan_tool_spans(&name, &event_name);
+            let tool_span = turn_span.map(|span| {
+                let child = span.child(span_kind, format!("agent.{}", span_kind.as_str()));
+                child.set_str("tool_id", requested_name);
+                child
+            });
+            env.set_span(tool_span.clone());
+            let mcp_span = if is_mcp {
+                tool_span.as_ref().map(|span| {
+                    let child = span.child(SpanKind::Mcp, "agent.mcp");
+                    child.set_str("tool_id", &mcp_capability_id(&event_name));
+                    child.set_str("capability_id", &mcp_capability_id(&event_name));
+                    child
+                })
+            } else {
+                None
+            };
             let producing = provenance::is_producing(&name);
             let root = producing.then(|| env.project_root().to_path_buf());
             let source = provenance::source_of(&name, &args);
@@ -514,11 +846,108 @@ async fn agent_loop_inner(
                 Default::default()
             };
             let t0 = std::time::Instant::now();
-            let result = tools.run(&name, &args, &env).await;
+            let (schema, guard_arguments) =
+                resolve_guardrail_tool_input(tools, &name, requested_name, &args);
+            let path = if name == "use_mcp_tool" {
+                DispatchPath::DeferredMcp
+            } else if name == "delegate_tasks" {
+                DispatchPath::Delegated
+            } else {
+                DispatchPath::Direct
+            };
+            let guard_ctx = GuardrailContext {
+                path: path.clone(),
+                tool: requested_name.to_string(),
+                arguments: guard_arguments,
+                schema,
+                allowed_tools: ctx.active_turn_allowed_tools().map(|tools| tools.to_vec()),
+                approval_required: false,
+                approval_granted: false,
+                stale_approval: false,
+                output: None,
+                output_contract: None,
+                claim_catalog: None,
+            };
+            let chain = GuardrailChain::production();
+            let mut outcome = evaluate_tool_input(&chain, guard_ctx, tool_span.as_ref());
+            if name == "delegate_tasks" {
+                let handoff = evaluate_handoff(
+                    &chain,
+                    GuardrailContext {
+                        path: DispatchPath::Delegated,
+                        tool: requested_name.to_string(),
+                        arguments: args.clone(),
+                        schema: None,
+                        allowed_tools: ctx.active_turn_allowed_tools().map(|tools| tools.to_vec()),
+                        approval_required: false,
+                        approval_granted: false,
+                        stale_approval: false,
+                        output: None,
+                        output_contract: None,
+                        claim_catalog: None,
+                    },
+                    tool_span.as_ref(),
+                );
+                if handoff.decision.rank_for_merge() > outcome.decision.rank_for_merge() {
+                    outcome = handoff;
+                }
+            }
+            let dispatch_args = match &outcome.decision {
+                GuardrailDecision::Transform { value, .. } => value.clone(),
+                _ => args.clone(),
+            };
+            let result = match &outcome.decision {
+                GuardrailDecision::Allow | GuardrailDecision::Transform { .. } => {
+                    tools
+                        .run_scoped(&name, &dispatch_args, env, ctx.active_turn_allowed_tools())
+                        .await
+                }
+                GuardrailDecision::RequestApproval { reason } => {
+                    wisp_tools::ToolResult::fail(reason.clone()).stop_batch()
+                }
+                GuardrailDecision::Reject {
+                    severity: GuardrailSeverity::Terminal,
+                    reason,
+                } => wisp_tools::ToolResult::fail(reason.clone()).stop_batch(),
+                GuardrailDecision::Reject { reason, .. } => {
+                    wisp_tools::ToolResult::fail(reason.clone())
+                }
+            };
+            let tool_status = if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                SpanStatus::Cancelled
+            } else if result.success {
+                SpanStatus::Ok
+            } else if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                SpanStatus::Cancelled
+            } else {
+                SpanStatus::Error
+            };
+            if let Some(span) = mcp_span {
+                if tool_status == SpanStatus::Cancelled {
+                    span.set_error_class(ErrorClass::Cancelled);
+                    span.end(SpanStatus::Uncertain);
+                } else if tool_status == SpanStatus::Error {
+                    span.set_error_class(ErrorClass::Unknown);
+                    span.end(SpanStatus::Error);
+                } else {
+                    span.end(SpanStatus::Ok);
+                }
+            }
+            if let Some(span) = &tool_span {
+                if tool_status == SpanStatus::Cancelled {
+                    span.set_error_class(ErrorClass::Cancelled);
+                }
+                span.end(tool_status);
+            }
+            env.set_span(None);
+            if let Some(next) = result.allowed_next_tools.clone() {
+                ctx.set_active_turn_allowed_tools(next);
+            }
             // Drain even for non-producing calls so a stale kernel report
             // cannot leak into the next call's provenance record.
             let reported = env.take_reported_writes();
             let control = result.control;
+            hash_tool_result(&mut observation, &result);
             let duration_ms = t0.elapsed().as_millis() as u64;
             if let Some(root) = &root {
                 let root2 = root.clone();
@@ -564,32 +993,21 @@ async fn agent_loop_inner(
                     });
                 }
             }
-            let (content, tool_text, ok) = if let Some(img) = &result.image {
-                match vision_provider {
-                    Some(vision) => match describe_image(vision, img, &name, &args).await {
-                        Ok(text) => (Content::text(text.clone()), text, true),
-                        Err(e) => {
-                            let text = format!("{name} error: vision model failed: {e}");
-                            (Content::text(text.clone()), text, false)
-                        }
-                    },
-                    None => {
-                        let text = format!("{name} error: no vision model is configured. Mark an API model as vision-capable in Settings -> Models and set it for image analysis.");
-                        (Content::text(text.clone()), text, false)
-                    }
-                }
-            } else {
-                (
-                    Content::text(result.content.clone()),
-                    result.content.clone(),
-                    result.success,
-                )
-            };
+            let (content, tool_text, ok) =
+                model_tool_result(&result, ctx.supports_vision, vision_provider, &name, &args)
+                    .await;
             output.tool_result(&tools.event_name(&name, &args), ok, &tool_text, duration_ms);
             ctx.append_tool(
                 &tc.id,
                 &name,
-                budget_tool_result(env.project_root(), &name, content),
+                budget_tool_result(
+                    env.project_root(),
+                    &name,
+                    content,
+                    tools
+                        .get(&name)
+                        .and_then(|tool| tool.context_result_budget()),
+                ),
             );
             if let Some(m) = ctx.messages.last() {
                 output.on_message(m);
@@ -613,7 +1031,28 @@ async fn agent_loop_inner(
             }
         }
         if batch_control == ToolControl::StopTurn {
+            if let Some(span) = turn_span {
+                span.child(SpanKind::Completion, "agent.completion")
+                    .end(SpanStatus::Ok);
+            }
             return Ok(AgentLoopOutcome::Completed);
+        }
+        // Stuck-loop guard: compare completed tool-call/result observations,
+        // then require a consecutively repeated suffix cycle. The result is
+        // part of the observation because stateful tools can legitimately use
+        // identical arguments against changed browser/runtime state (#1063).
+        // Checking after execution also guarantees every persisted assistant
+        // tool call has a matching result when the guard aborts (#979).
+        let observation = observation.finalize().into();
+        recent_observations.push_back(observation);
+        if recent_observations.len() > STUCK_WINDOW {
+            recent_observations.pop_front();
+        }
+        if has_repeated_suffix_cycle(&recent_observations, STUCK_REPEAT_LIMIT) {
+            if let Some(span) = turn_span {
+                span.set_str("repeated_call", "true");
+            }
+            anyhow::bail!(STUCK_LOOP_MESSAGE);
         }
         if iteration_limit_reached(iteration, max_iter) {
             summarize_at_iteration_limit(
@@ -635,6 +1074,28 @@ async fn agent_loop_inner(
     }
 }
 
+const INTERRUPTED_BY_USER: &str = "interrupted by user";
+
+fn append_synthetic_tool_results(
+    ctx: &mut ContextManager,
+    tools: &Registry,
+    output: &dyn Output,
+    calls: &[ToolCall],
+    reason: &str,
+) {
+    for tc in calls {
+        let name = &tc.function.name;
+        let args = tc.args_value();
+        let event_name = tools.event_name(name, &args);
+        output.tool_call(&event_name, reason);
+        output.tool_result(&event_name, false, reason, 0);
+        ctx.append_tool(&tc.id, name, Content::text(reason.to_string()));
+        if let Some(message) = ctx.messages.last() {
+            output.on_message(message);
+        }
+    }
+}
+
 fn append_skipped_tool_results(
     ctx: &mut ContextManager,
     tools: &Registry,
@@ -652,17 +1113,16 @@ fn append_skipped_tool_results(
         ),
         ToolControl::Continue => return,
     };
-    for tc in skipped {
-        let name = &tc.function.name;
-        let args = tc.args_value();
-        let event_name = tools.event_name(name, &args);
-        output.tool_call(&event_name, &reason);
-        output.tool_result(&event_name, false, &reason, 0);
-        ctx.append_tool(&tc.id, name, Content::text(reason.clone()));
-        if let Some(message) = ctx.messages.last() {
-            output.on_message(message);
-        }
-    }
+    append_synthetic_tool_results(ctx, tools, output, skipped, &reason);
+}
+
+fn append_interrupted_tool_results(
+    ctx: &mut ContextManager,
+    tools: &Registry,
+    output: &dyn Output,
+    remaining: &[ToolCall],
+) {
+    append_synthetic_tool_results(ctx, tools, output, remaining, INTERRUPTED_BY_USER);
 }
 
 fn iteration_limit_reached(iteration: usize, max_iter: usize) -> bool {
@@ -717,7 +1177,7 @@ async fn summarize_at_iteration_limit(
         let mut overflow_recovery_used = false;
         let comp = loop {
             let messages = ctx.prepare_for_api_with_tools(output, &[]);
-            match stream_with_retry(provider, &messages, &[], &mut sink, cancel).await {
+            match stream_with_retry(provider, &messages, &[], &mut sink, cancel, None).await {
                 Ok(comp) => break comp,
                 Err(LlmError::Incomplete) => anyhow::bail!(STREAM_CUT_MESSAGE),
                 Err(error) if error.is_context_overflow() && !overflow_recovery_used => {
@@ -757,9 +1217,11 @@ async fn summarize_at_iteration_limit(
             anyhow::bail!(ABNORMAL_FINISH_MESSAGE);
         }
         if comp.content.trim().is_empty() || !comp.tool_calls.is_empty() {
+            sink.discard_assistant_text();
             anyhow::bail!(ITERATION_LIMIT_SUMMARY_FAILURE);
         }
 
+        sink.flush_assistant_text();
         ctx.append_assistant(comp.content, vec![], comp.reasoning);
         if let Some(message) = ctx.messages.last() {
             output.on_message(message);
@@ -782,6 +1244,53 @@ async fn summarize_at_iteration_limit(
 
     ctx.runtime_injections.truncate(original_injection_count);
     result
+}
+
+/// Images supplement the result's text/structured facts, never replace them.
+/// A failed MCP result remains failed even when its attached images render.
+async fn model_tool_result(
+    result: &ToolResult,
+    supports_vision: bool,
+    vision_provider: Option<&dyn Provider>,
+    name: &str,
+    args: &serde_json::Value,
+) -> (Content, String, bool) {
+    if result.images.is_empty() {
+        return (
+            Content::text(result.content.clone()),
+            result.content.clone(),
+            result.success,
+        );
+    }
+    if supports_vision {
+        return (
+            native_image_content(&result.content, &result.images),
+            result.content.clone(),
+            result.success,
+        );
+    }
+    let mut text = result.content.clone();
+    let mut ok = result.success;
+    for image in &result.images {
+        match vision_provider {
+            Some(vision) => match describe_image(vision, image, name, args).await {
+                Ok(observation) => text.push_str(&format!(
+                    "\n\nVision-model observation for {} (not a tool assertion):\n{observation}",
+                    image.label,
+                )),
+                Err(error) => {
+                    ok = false;
+                    text.push_str(&format!("\n{name} error: vision model failed: {error}"));
+                }
+            },
+            None => {
+                ok = false;
+                text.push_str("\nImage content was not inspected: no vision model is configured. Mark an API model as vision-capable in Settings -> Models and set it for image analysis.");
+                break;
+            }
+        }
+    }
+    (Content::text(text.clone()), text, ok)
 }
 
 async fn describe_image(
@@ -837,28 +1346,78 @@ async fn stream_with_retry(
     schemas: &[ToolSchema],
     sink: &mut StreamSinkAdapter<'_>,
     cancel: Option<&AtomicBool>,
+    model_span: Option<&SpanGuard>,
 ) -> Result<Completion, LlmError> {
     let mut last = None;
     for attempt in 0..=RETRY_DELAYS.len() {
+        sink.clear_buffered_text();
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            if let Some(span) = model_span {
+                span.set_error_class(ErrorClass::Cancelled);
+            }
             return Err(cancelled_stream_error());
         }
         match stream_or_cancel(provider, messages, schemas, sink, cancel).await {
-            Ok(c) => return Ok(c),
+            Ok(c) => {
+                if let Some(span) = model_span {
+                    span.set_retry_count(attempt as u32);
+                }
+                return Ok(c);
+            }
             Err(e) => {
                 if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    if let Some(parent) = model_span {
+                        let retry = parent.child(SpanKind::Retry, "agent.model.retry");
+                        retry.set_retry_count(attempt as u32 + 1);
+                        retry.set_error_class(ErrorClass::Cancelled);
+                        retry.end(SpanStatus::Cancelled);
+                        parent.set_error_class(ErrorClass::Cancelled);
+                    }
                     return Err(cancelled_stream_error());
                 }
                 if !is_retriable(&e) || attempt == RETRY_DELAYS.len() {
+                    if let Some(parent) = model_span {
+                        if attempt > 0 {
+                            let retry = parent.child(SpanKind::Retry, "agent.model.retry");
+                            retry.set_retry_count(attempt as u32);
+                            retry.set_error_class(ErrorClass::RetryExhausted);
+                            retry.end(SpanStatus::Error);
+                            parent.set_retry_count(attempt as u32);
+                            parent.set_error_class(ErrorClass::RetryExhausted);
+                        } else {
+                            parent.set_error_class(ErrorClass::Provider);
+                        }
+                    }
                     return Err(e);
+                }
+                if let Some(parent) = model_span {
+                    let retry = parent.child(SpanKind::Retry, "agent.model.retry");
+                    retry.set_retry_count(attempt as u32 + 1);
+                    retry.set_error_class(ErrorClass::Provider);
+                    retry.end(SpanStatus::Error);
+                    parent.set_retry_count(attempt as u32 + 1);
                 }
                 tracing::warn!("LLM stream failed (attempt {}), retrying: {e}", attempt + 1);
                 last = Some(e);
-                retry_delay_or_cancel(Duration::from_millis(RETRY_DELAYS[attempt]), cancel).await?;
+                match retry_delay_or_cancel(Duration::from_millis(RETRY_DELAYS[attempt]), cancel)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(error) => {
+                        if let Some(parent) = model_span {
+                            let retry = parent.child(SpanKind::Retry, "agent.model.retry");
+                            retry.set_retry_count(attempt as u32 + 1);
+                            retry.set_error_class(ErrorClass::Cancelled);
+                            retry.end(SpanStatus::Cancelled);
+                            parent.set_error_class(ErrorClass::Cancelled);
+                        }
+                        return Err(error);
+                    }
+                }
             }
         }
     }
-    Err(last.expect("retry loop always returns or breaks"))
+    Err(last.unwrap_or_else(|| LlmError::Config("LLM stream retry exhausted".into())))
 }
 
 fn cancelled_stream_error() -> LlmError {
@@ -925,9 +1484,53 @@ fn tool_call_signature(tool_calls: &[ToolCall]) -> String {
         .join("\u{1}")
 }
 
+fn hash_observation_part(hasher: &mut Sha256, part: &[u8]) {
+    hasher.update((part.len() as u64).to_le_bytes());
+    hasher.update(part);
+}
+
+fn hash_tool_result(hasher: &mut Sha256, result: &ToolResult) {
+    hasher.update([u8::from(result.success)]);
+    hash_observation_part(hasher, result.content.as_bytes());
+    hasher.update((result.images.len() as u64).to_le_bytes());
+    for image in &result.images {
+        hash_observation_part(hasher, image.mime.as_bytes());
+        hash_observation_part(hasher, image.label.as_bytes());
+        hash_observation_part(hasher, image.data_url.as_bytes());
+    }
+    hasher.update([match result.control {
+        ToolControl::Continue => 0,
+        ToolControl::StopBatch => 1,
+        ToolControl::StopTurn => 2,
+    }]);
+}
+
+/// Whether the retained observations end in the same cycle repeated
+/// `repeat_limit` times. A cycle may contain multiple calls (for example A/B),
+/// but a recurring call interspersed with distinct progress does not match.
+fn has_repeated_suffix_cycle<T: Eq>(observations: &VecDeque<T>, repeat_limit: usize) -> bool {
+    if repeat_limit < 2 {
+        return !observations.is_empty();
+    }
+    let len = observations.len();
+    for cycle_len in 1..=len / repeat_limit {
+        let repeated_len = cycle_len * repeat_limit;
+        let start = len - repeated_len;
+        let pattern_start = len - cycle_len;
+        let matches = (0..repeated_len).all(|offset| {
+            observations[start + offset] == observations[pattern_start + (offset % cycle_len)]
+        });
+        if matches {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::repair_unpaired_tool_calls;
     use crate::output::NullOutput;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1008,6 +1611,48 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(std::fs::read_to_string(spill.path()).unwrap(), raw);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn loaded_history_bounds_leftover_tool_results_without_panicking() {
+        let root = std::env::temp_dir().join(format!(
+            "wisp-bound-history-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut asst = Message::assistant("");
+        asst.tool_calls = vec![
+            ToolCall {
+                id: "call-1".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "read".into(),
+                    arguments: "not-json".into(),
+                },
+            },
+            ToolCall {
+                id: String::new(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "shell".into(),
+                    arguments: String::new(),
+                },
+            },
+        ];
+        let mut messages = vec![
+            Message::user("hello"),
+            asst,
+            Message::tool("call-1", "read", "x".repeat(80_000)),
+            Message::assistant(""),
+        ];
+        assert_eq!(repair_unpaired_tool_calls(&mut messages), 1);
+        bound_tool_results_in_history(&root, &mut messages);
+        assert!(messages[2].content.as_text().len() < 80_000);
+        let mut ctx = ContextManager::new(128_000);
+        ctx.messages = messages;
+        let prepared = ctx.prepare_for_api(&NullOutput);
+        assert!(!prepared.is_empty());
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1327,7 +1972,7 @@ mod tests {
 
         let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
             tokio::join!(
-                stream_with_retry(&provider, &[], &[], &mut sink, Some(&cancel)),
+                stream_with_retry(&provider, &[], &[], &mut sink, Some(&cancel), None),
                 async {
                     provider.started.notified().await;
                     cancel.store(true, Ordering::SeqCst);
@@ -1355,7 +2000,7 @@ mod tests {
 
         let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
             tokio::join!(
-                stream_with_retry(&provider, &[], &[], &mut sink, Some(&cancel)),
+                stream_with_retry(&provider, &[], &[], &mut sink, Some(&cancel), None),
                 async {
                     provider.started.notified().await;
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1732,6 +2377,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_final_output_contract_rejects_unsupported_completion() {
+        let provider = SequenceProvider::new([Completion {
+            content: r#"{"status":"FOUND","secret":"row"}"#.into(),
+            finish_reason: Some("stop".into()),
+            ..Completion::default()
+        }]);
+        let tools = Registry::builtins().filtered(&[]);
+        let mut ctx = ContextManager::new(100_000);
+        ctx.set_output_contract(Some(serde_json::json!({
+            "type": "object",
+            "properties": {"status": {"type": "string"}},
+            "required": ["status"],
+            "additionalProperties": false
+        })));
+        let error = agent_loop(
+            &mut ctx,
+            &provider,
+            None,
+            &tools,
+            Path::new("."),
+            &NullOutput,
+            "summarize",
+            0,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("final output"), "{error}");
+        assert!(
+            ctx.messages
+                .iter()
+                .all(|message| message.role != wisp_llm::Role::Assistant),
+            "rejected completions must not persist assistant bytes"
+        );
+    }
+
+    #[tokio::test]
     async fn successful_propose_plan_skips_later_calls_and_ends_the_turn() {
         let later_runs = Arc::new(AtomicUsize::new(0));
         let provider = SequenceProvider::new([
@@ -2034,6 +2716,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rich_tool_result_preserves_text_all_images_and_failure() {
+        let mut result = ToolResult::fail("TERMINAL: true; planDigest: exact");
+        result.images = vec![test_image(), test_image()];
+        let fallback = RecordingProvider::new("fallback", "observation");
+        let (content, text, ok) = model_tool_result(
+            &result,
+            true,
+            Some(&fallback),
+            "preview",
+            &serde_json::json!({}),
+        )
+        .await;
+        assert!(!ok);
+        assert_eq!(text, result.content);
+        let Content::Parts(parts) = content else {
+            panic!("expected multimodal content")
+        };
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(&parts[0], Part::Text { text, .. } if text.contains("exact")));
+        assert_eq!(
+            parts
+                .iter()
+                .filter(|part| matches!(part, Part::Image { .. }))
+                .count(),
+            2
+        );
+        assert!(fallback.complete_messages.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rich_tool_result_no_vision_keeps_structured_facts_and_reports_omission() {
+        let mut result = ToolResult::ok("planDigest: exact");
+        result.images = vec![test_image()];
+        let (_, text, ok) =
+            model_tool_result(&result, false, None, "preview", &serde_json::json!({})).await;
+        assert!(!ok);
+        assert!(text.contains("planDigest: exact"));
+        assert!(text.contains("not inspected"));
+    }
+
+    #[test]
+    fn mixed_tool_text_is_budgeted_without_dropping_images() {
+        let root = std::env::temp_dir().join(format!("wisp-rich-budget-{}", uuid::Uuid::new_v4()));
+        let content = native_image_content(&"fact ".repeat(10_000), &[test_image(), test_image()]);
+        let bounded = budget_tool_result_with_limit(&root, "preview", content, 1024);
+        let Content::Parts(parts) = bounded else {
+            panic!("expected parts")
+        };
+        assert_eq!(parts.len(), 3);
+        assert!(
+            matches!(&parts[0], Part::Text { text, .. } if text.len() < 2000 && text.contains("full output at"))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rich_tool_result_fallback_supplements_text_and_does_not_clear_error() {
+        let mut result = ToolResult::fail("NEXT_ACTION: ask_user; planDigest: exact");
+        result.images = vec![test_image(), test_image()];
+        let fallback = RecordingProvider::new("fallback", "visible evidence");
+        let (_, text, ok) = model_tool_result(
+            &result,
+            false,
+            Some(&fallback),
+            "preview",
+            &serde_json::json!({}),
+        )
+        .await;
+        assert!(!ok);
+        assert!(text.contains("planDigest: exact"));
+        assert_eq!(text.matches("visible evidence").count(), 2);
+        assert_eq!(fallback.complete_messages.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn vision_capable_primary_receives_native_image_content() {
         let primary = RecordingProvider::new("vision-primary", "done");
         let fallback = RecordingProvider::new("fallback", "observation");
@@ -2065,6 +2822,78 @@ mod tests {
         assert!(matches!(parts[0], Part::Text { ref text, .. } if text == "What is shown?"));
         assert!(
             matches!(parts[1], Part::Image { ref image_url, .. } if image_url.url.starts_with("data:image/png"))
+        );
+    }
+
+    #[tokio::test]
+    async fn vision_primary_view_image_attaches_without_describer_round_trip() {
+        // A vision-capable primary must receive the view_image result as a
+        // native image part in the next request. The old path forwarded every
+        // image through the vision describer first — one extra LLM call per
+        // look (~18s median on a reasoning vision model).
+        // A real tiny PNG on disk: view_image is a real tool, not a stub.
+        let dir = std::env::temp_dir().join(format!("wisp-view-image-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("plot.png"),
+            include_bytes!("../tests/fixtures/1x1.png"),
+        )
+        .unwrap();
+
+        let script = format!(
+            r#"{{"tool_calls": [{{"name": "view_image", "arguments": {{"path": "{}"}}}}]}} "#,
+            dir.join("plot.png").to_string_lossy().replace('\\', "\\\\")
+        );
+        let steps: Vec<wisp_llm::scripted::ScriptedCompletion> = serde_json::from_str(&format!(
+            "[{}, {{\"content\": \"The plot shows a rising curve.\"}}]",
+            script.trim()
+        ))
+        .unwrap();
+        let primary = wisp_llm::scripted::ScriptedProvider::new("scripted-primary", steps);
+        let fallback = RecordingProvider::new("vision-fallback", "describer text");
+        let mut ctx = ContextManager::new(100_000);
+        ctx.supports_vision = true;
+        let tools = Registry::builtins();
+
+        let outcome = agent_loop(
+            &mut ctx,
+            &primary,
+            Some(&fallback),
+            &tools,
+            &dir,
+            &NullOutput,
+            "check the plot",
+            8,
+            None,
+        )
+        .await;
+        std::fs::remove_dir_all(&dir).ok();
+        outcome.unwrap();
+
+        // The describer must never run.
+        assert!(
+            fallback.complete_messages.lock().unwrap().is_empty(),
+            "vision-capable primary must not round-trip view_image through the describer"
+        );
+        // And the follow-up request carries the image part on the tool row.
+        let requests = primary.snapshot().requests;
+        let second = &requests[1].messages;
+        let tool_row = second
+            .iter()
+            .rev()
+            .find(|m| m.role == wisp_llm::Role::Tool)
+            .expect("tool result row in second request");
+        let has_image = match &tool_row.content {
+            wisp_llm::Content::Parts(parts) => parts.iter().any(|p| {
+                matches!(p, wisp_llm::Part::Image { image_url, .. }
+                    if image_url.url.starts_with("data:image"))
+            }),
+            _ => false,
+        };
+        assert!(
+            has_image,
+            "view_image result should be an image part, got {:?}",
+            tool_row.content
         );
     }
 
@@ -2137,6 +2966,27 @@ mod tests {
         ran: Arc<AtomicBool>,
     }
 
+    struct RoutePolicyTool;
+
+    #[async_trait]
+    impl Tool for RoutePolicyTool {
+        fn name(&self) -> &str {
+            "route_policy"
+        }
+
+        fn schema(&self) -> ToolSchema {
+            ToolSchema::new(
+                "route_policy",
+                "install a turn tool policy",
+                serde_json::json!({"type": "object"}),
+            )
+        }
+
+        async fn run(&self, _args: &serde_json::Value, _env: &dyn ToolEnv) -> ToolResult {
+            ToolResult::ok("routed").allow_next_tools(vec!["allowed_*".into()])
+        }
+    }
+
     #[async_trait]
     impl Tool for SpyTool {
         fn name(&self) -> &str {
@@ -2207,6 +3057,131 @@ mod tests {
         assert!(!spy_ran.load(Ordering::SeqCst), "truncated tool ran");
         assert_eq!(ctx.messages.len(), 1, "only the user message is persisted");
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn route_policy_blocks_disallowed_sibling_tool_execution() {
+        let spy_ran = Arc::new(AtomicBool::new(false));
+        let call = |id: &str, name: &str| ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: "{}".into(),
+            },
+        };
+        let provider = SequenceProvider::new([
+            Completion {
+                tool_calls: vec![call("route", "route_policy"), call("spy", "spy")],
+                finish_reason: Some("tool_calls".into()),
+                ..Completion::default()
+            },
+            Completion {
+                content: "blocked and reported".into(),
+                finish_reason: Some("stop".into()),
+                ..Completion::default()
+            },
+        ]);
+        let mut tools = Registry::builtins();
+        tools.add(Box::new(RoutePolicyTool));
+        tools.add(Box::new(SpyTool {
+            ran: spy_ran.clone(),
+        }));
+        let mut ctx = ContextManager::new(100_000);
+
+        agent_loop(
+            &mut ctx,
+            &provider,
+            None,
+            &tools,
+            Path::new("."),
+            &NullOutput,
+            "route then inspect",
+            2,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(!spy_ran.load(Ordering::SeqCst));
+        assert!(ctx.messages.iter().any(|message| {
+            message
+                .content
+                .as_text()
+                .contains("blocked by the active turn route")
+        }));
+    }
+
+    #[tokio::test]
+    async fn route_policy_survives_same_turn_resume() {
+        let spy_ran = Arc::new(AtomicBool::new(false));
+        let call = |id: &str, name: &str| ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: "{}".into(),
+            },
+        };
+        let provider = SequenceProvider::new([Completion {
+            tool_calls: vec![call("route", "route_policy")],
+            finish_reason: Some("tool_calls".into()),
+            ..Completion::default()
+        }]);
+        let mut tools = Registry::builtins();
+        tools.add(Box::new(RoutePolicyTool));
+        tools.add(Box::new(SpyTool {
+            ran: spy_ran.clone(),
+        }));
+        let mut ctx = ContextManager::new(100_000);
+
+        let first_error = agent_loop(
+            &mut ctx,
+            &provider,
+            None,
+            &tools,
+            Path::new("."),
+            &NullOutput,
+            "route then pause",
+            2,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(first_error.to_string().contains(STREAM_CUT_MESSAGE));
+
+        provider.completions.lock().unwrap().extend([
+            Completion {
+                tool_calls: vec![call("spy", "spy")],
+                finish_reason: Some("tool_calls".into()),
+                ..Completion::default()
+            },
+            Completion {
+                content: "blocked after resume".into(),
+                finish_reason: Some("stop".into()),
+                ..Completion::default()
+            },
+        ]);
+
+        agent_loop_continue(
+            &mut ctx,
+            &provider,
+            None,
+            &tools,
+            Path::new("."),
+            &NullOutput,
+            2,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(!spy_ran.load(Ordering::SeqCst));
+        assert!(ctx.messages.iter().any(|message| message
+            .content
+            .as_text()
+            .contains("blocked by the active turn route")));
     }
 
     #[tokio::test]
@@ -2298,6 +3273,30 @@ mod tests {
 
         async fn run(&self, _args: &serde_json::Value, _env: &dyn ToolEnv) -> ToolResult {
             ToolResult::ok("ok")
+        }
+    }
+
+    struct ProgressTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for ProgressTool {
+        fn name(&self) -> &str {
+            "progress_tool"
+        }
+
+        fn schema(&self) -> ToolSchema {
+            ToolSchema::new(
+                "progress_tool",
+                "returns a new observation on every call",
+                serde_json::json!({"type": "object"}),
+            )
+        }
+
+        async fn run(&self, _args: &serde_json::Value, _env: &dyn ToolEnv) -> ToolResult {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            ToolResult::ok(format!("progress {call}"))
         }
     }
 
@@ -2564,7 +3563,373 @@ mod tests {
             err.to_string().contains("identical tool call"),
             "unexpected error: {err}"
         );
+        assert!(
+            crate::unpaired_tool_call_ids(&ctx.messages).is_empty(),
+            "stuck abort must not leave unpaired tool_calls: {:?}",
+            crate::unpaired_tool_call_ids(&ctx.messages)
+        );
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn identical_tool_call_with_changing_results_makes_progress() {
+        let call_count = STUCK_REPEAT_LIMIT + 1;
+        let mut completions = Vec::new();
+        for n in 0..call_count {
+            completions.push(Completion {
+                tool_calls: vec![call(
+                    &format!("progress-{n}"),
+                    "progress_tool",
+                    serde_json::json!({}),
+                )],
+                finish_reason: Some("tool_calls".into()),
+                ..Completion::default()
+            });
+        }
+        completions.push(Completion {
+            content: "finished after observing progress".into(),
+            finish_reason: Some("stop".into()),
+            ..Completion::default()
+        });
+        let provider = SequenceProvider::new(completions);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut tools = Registry::builtins();
+        tools.add(Box::new(ProgressTool {
+            calls: calls.clone(),
+        }));
+        let mut ctx = ContextManager::new(100_000);
+        let root = std::env::temp_dir().join(format!(
+            "wisp-core-progress-loop-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let outcome = agent_loop(
+            &mut ctx,
+            &provider,
+            None,
+            &tools,
+            &root,
+            &NullOutput,
+            "keep checking while the result changes",
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, AgentLoopOutcome::Completed);
+        assert_eq!(calls.load(Ordering::SeqCst), call_count);
+        assert!(ctx
+            .messages
+            .last()
+            .is_some_and(|message| message.content.as_text().contains("finished")));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn distinct_state_changes_between_identical_reads_make_progress() {
+        let page_count = STUCK_REPEAT_LIMIT + 1;
+        let mut completions = Vec::new();
+        for page in 0..page_count {
+            completions.push(Completion {
+                tool_calls: vec![call(
+                    &format!("navigate-{page}"),
+                    "navigate",
+                    serde_json::json!({ "page": page }),
+                )],
+                finish_reason: Some("tool_calls".into()),
+                ..Completion::default()
+            });
+            completions.push(Completion {
+                tool_calls: vec![call(
+                    &format!("extract-{page}"),
+                    "extract",
+                    serde_json::json!({ "script": "document.body.innerText.slice(0, 700)" }),
+                )],
+                finish_reason: Some("tool_calls".into()),
+                ..Completion::default()
+            });
+        }
+        completions.push(Completion {
+            content: "finished all stateful reads".into(),
+            finish_reason: Some("stop".into()),
+            ..Completion::default()
+        });
+        let provider = SequenceProvider::new(completions);
+        let navigate_calls = Arc::new(AtomicUsize::new(0));
+        let extract_calls = Arc::new(AtomicUsize::new(0));
+        let mut tools = Registry::builtins();
+        tools.add(Box::new(CountingTool {
+            name: "navigate",
+            runs: navigate_calls.clone(),
+        }));
+        tools.add(Box::new(CountingTool {
+            name: "extract",
+            runs: extract_calls.clone(),
+        }));
+        let mut ctx = ContextManager::new(100_000);
+        let root = std::env::temp_dir().join(format!(
+            "wisp-core-stateful-loop-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let outcome = agent_loop(
+            &mut ctx,
+            &provider,
+            None,
+            &tools,
+            &root,
+            &NullOutput,
+            "navigate to each page and extract the same section",
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, AgentLoopOutcome::Completed);
+        assert_eq!(navigate_calls.load(Ordering::SeqCst), page_count);
+        assert_eq!(extract_calls.load(Ordering::SeqCst), page_count);
+        assert!(crate::unpaired_tool_call_ids(&ctx.messages).is_empty());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    struct GuidanceDuringResponseProvider {
+        queue: Arc<GuidanceQueue>,
+        requests: Mutex<Vec<Vec<Message>>>,
+        during_compaction: bool,
+    }
+
+    #[async_trait]
+    impl Provider for GuidanceDuringResponseProvider {
+        fn name(&self) -> &str {
+            "guidance-during-response"
+        }
+        fn model(&self) -> &str {
+            "scripted"
+        }
+        async fn complete(&self, _: &[Message], _: &[ToolSchema]) -> wisp_llm::Result<Completion> {
+            assert!(self.during_compaction);
+            self.queue
+                .lock()
+                .unwrap()
+                .push((1, "Use the revised question instead".into()));
+            Ok(Completion {
+                content: "Objective\nContinue the current conversation after compaction.".into(),
+                ..Completion::default()
+            })
+        }
+        async fn stream(
+            &self,
+            messages: &[Message],
+            _: &[ToolSchema],
+            _: &mut dyn wisp_llm::StreamSink,
+        ) -> wisp_llm::Result<Completion> {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(messages.to_vec());
+            if requests.len() == 1 && !self.during_compaction {
+                // The user clicks Guide now while the provider is replying.
+                self.queue
+                    .lock()
+                    .unwrap()
+                    .push((1, "Use the revised question instead".into()));
+            }
+            Ok(Completion {
+                content: if requests.len() == 1 {
+                    "Old answer"
+                } else {
+                    "Revised answer"
+                }
+                .into(),
+                finish_reason: Some("stop".into()),
+                ..Completion::default()
+            })
+        }
+    }
+
+    #[test]
+    fn guidance_injection_preserves_ids_even_for_identical_text() {
+        #[derive(Default)]
+        struct RecordedGuidance(Mutex<Vec<(u64, String)>>);
+        impl Output for RecordedGuidance {
+            fn on_guidance_message(&self, id: u64, message: &Message) {
+                self.0.lock().unwrap().push((id, message.content.as_text()));
+            }
+        }
+        let queue = GuidanceQueue::default();
+        queue
+            .lock()
+            .unwrap()
+            .extend([(7, "same".into()), (9, "same".into())]);
+        let output = RecordedGuidance::default();
+        let mut ctx = ContextManager::new(100_000);
+        assert!(inject_pending_guidance(&mut ctx, &output, Some(&queue)));
+        assert_eq!(
+            *output.0.lock().unwrap(),
+            vec![(7, "same".into()), (9, "same".into())]
+        );
+        assert!(!inject_pending_guidance(&mut ctx, &output, Some(&queue)));
+    }
+
+    #[tokio::test]
+    async fn guidance_arriving_during_a_final_response_runs_before_turn_completion() {
+        let queue = Arc::new(GuidanceQueue::default());
+        let provider = GuidanceDuringResponseProvider {
+            queue: queue.clone(),
+            requests: Mutex::new(vec![]),
+            during_compaction: false,
+        };
+        let mut ctx = ContextManager::new(100_000);
+        let outcome = agent_loop_with_images(
+            &mut ctx,
+            &provider,
+            None,
+            &Registry::builtins().filtered(&[]),
+            Path::new("."),
+            &NullOutput,
+            "Original question",
+            &[],
+            false,
+            8,
+            None,
+            Some(&queue),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, AgentLoopOutcome::Completed);
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "pending guidance must prevent an early Completed return"
+        );
+        let last = requests[1].last().unwrap();
+        assert_eq!(last.role, Role::User);
+        assert_eq!(last.content.as_text(), "Use the revised question instead");
+        assert!(queue.lock().unwrap().is_empty());
+        assert_eq!(
+            ctx.messages
+                .iter()
+                .filter(|m| m.role == Role::User
+                    && m.content.as_text() == "Use the revised question instead")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn guidance_arriving_during_compaction_precedes_the_first_model_request() {
+        let queue = Arc::new(GuidanceQueue::default());
+        let provider = GuidanceDuringResponseProvider {
+            queue: queue.clone(),
+            requests: Mutex::new(vec![]),
+            during_compaction: true,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "wisp-guidance-compaction-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut ctx = ContextManager::new(1_000);
+        for turn in 0..12 {
+            ctx.append_user(format!("question {turn} {}", "u".repeat(180)));
+            ctx.append_assistant(format!("answer {turn} {}", "a".repeat(180)), vec![], None);
+        }
+        let outcome = agent_loop_with_images(
+            &mut ctx,
+            &provider,
+            None,
+            &Registry::builtins().filtered(&[]),
+            &root,
+            &NullOutput,
+            "continue",
+            &[],
+            false,
+            8,
+            None,
+            Some(&queue),
+        )
+        .await
+        .unwrap();
+        let requests = provider.requests.lock().unwrap();
+        let last = requests[0].last().unwrap();
+        assert_eq!(last.role, Role::User);
+        assert_eq!(last.content.as_text(), "Use the revised question instead");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(outcome, AgentLoopOutcome::Completed);
+        assert!(queue.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn guidance_after_a_tool_skips_stale_batch_calls_and_precedes_the_next_request() {
+        let queue = Arc::new(GuidanceQueue::default());
+        let stale_runs = Arc::new(AtomicUsize::new(0));
+        let mut tools = Registry::builtins().filtered(&[]);
+        tools.add(Box::new(InterruptibleMonitorTool {
+            calls: Arc::new(AtomicUsize::new(0)),
+            queue: queue.clone(),
+            succeed_after: 2,
+        }));
+        tools.add(Box::new(CountingTool {
+            name: "stale_action",
+            runs: stale_runs.clone(),
+        }));
+        let provider = SequenceProvider::new([
+            Completion {
+                tool_calls: vec![
+                    call("wait", "monitor_run", serde_json::json!({})),
+                    call("stale", "stale_action", serde_json::json!({})),
+                ],
+                ..Completion::default()
+            },
+            Completion {
+                content: "Replanned after the progress check".into(),
+                finish_reason: Some("stop".into()),
+                ..Completion::default()
+            },
+        ]);
+        let mut ctx = ContextManager::new(100_000);
+        let outcome = agent_loop_with_images(
+            &mut ctx,
+            &provider,
+            None,
+            &tools,
+            Path::new("."),
+            &NullOutput,
+            "Wait then take an action",
+            &[],
+            false,
+            8,
+            None,
+            Some(&queue),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, AgentLoopOutcome::Completed);
+        assert_eq!(
+            stale_runs.load(Ordering::SeqCst),
+            0,
+            "do not execute a stale plan after receiving guidance"
+        );
+        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
+        let guidance_index = ctx
+            .messages
+            .iter()
+            .position(|m| m.role == Role::User && m.content.as_text() == "progress check 1")
+            .unwrap();
+        assert_eq!(
+            ctx.messages[guidance_index + 1].content.as_text(),
+            "Replanned after the progress check"
+        );
+        assert!(ctx.messages[..guidance_index]
+            .iter()
+            .any(|m| m.role == Role::Tool
+                && m.tool_call_id.as_deref() == Some("stale")
+                && m.content.as_text().contains("new user guidance")));
+        assert!(crate::unpaired_tool_call_ids(&ctx.messages).is_empty());
     }
 
     struct InterruptibleMonitorTool {
@@ -2832,7 +4197,168 @@ mod tests {
             err.to_string().contains("identical tool call"),
             "unexpected error: {err}"
         );
+        assert!(
+            crate::unpaired_tool_call_ids(&ctx.messages).is_empty(),
+            "stuck abort must not leave unpaired tool_calls: {:?}",
+            crate::unpaired_tool_call_ids(&ctx.messages)
+        );
         std::fs::remove_dir_all(root).ok();
+    }
+
+    struct CancelOnRunTool {
+        name: &'static str,
+        runs: Arc<AtomicUsize>,
+        cancel: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Tool for CancelOnRunTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn schema(&self) -> ToolSchema {
+            ToolSchema::new(
+                self.name,
+                "sets cancel after starting",
+                serde_json::json!({"type": "object"}),
+            )
+        }
+
+        async fn run(&self, _args: &serde_json::Value, _env: &dyn ToolEnv) -> ToolResult {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            self.cancel.store(true, Ordering::SeqCst);
+            ToolResult::ok("ran")
+        }
+    }
+
+    struct CancelOnAssistantTools<'a> {
+        cancel: &'a AtomicBool,
+    }
+
+    impl Output for CancelOnAssistantTools<'_> {
+        fn on_message(&self, message: &Message) {
+            if message.role == Role::Assistant && !message.tool_calls.is_empty() {
+                self.cancel.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_after_first_tool_starts_skips_the_rest_of_the_batch() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let first_runs = Arc::new(AtomicUsize::new(0));
+        let second_runs = Arc::new(AtomicUsize::new(0));
+        let provider = SequenceProvider::new([Completion {
+            tool_calls: vec![
+                call("first", "first", serde_json::json!({})),
+                call("second", "second", serde_json::json!({})),
+            ],
+            finish_reason: Some("tool_calls".into()),
+            ..Completion::default()
+        }]);
+        let mut tools = Registry::builtins().filtered(&[]);
+        tools.add(Box::new(CancelOnRunTool {
+            name: "first",
+            runs: first_runs.clone(),
+            cancel: cancel.clone(),
+        }));
+        tools.add(Box::new(CountingTool {
+            name: "second",
+            runs: second_runs.clone(),
+        }));
+        let mut ctx = ContextManager::new(100_000);
+        let root = std::env::temp_dir().join(format!(
+            "wisp-core-stop-mid-batch-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let err = agent_loop(
+            &mut ctx,
+            &provider,
+            None,
+            &tools,
+            &root,
+            &NullOutput,
+            "do both",
+            0,
+            Some(cancel.as_ref()),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains(STOPPED_BY_USER),
+            "unexpected error: {err}"
+        );
+        assert_eq!(first_runs.load(Ordering::SeqCst), 1);
+        assert_eq!(second_runs.load(Ordering::SeqCst), 0);
+        assert_eq!(tool_result_ids(&ctx), vec!["first", "second"]);
+        assert!(ctx
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("second"))
+            .unwrap()
+            .content
+            .as_text()
+            .contains(INTERRUPTED_BY_USER));
+        assert!(crate::unpaired_tool_call_ids(&ctx.messages).is_empty());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn stop_before_first_tool_runs_none_and_pairs_all_calls() {
+        let cancel = AtomicBool::new(false);
+        let first_runs = Arc::new(AtomicUsize::new(0));
+        let second_runs = Arc::new(AtomicUsize::new(0));
+        let provider = SequenceProvider::new([Completion {
+            tool_calls: vec![
+                call("first", "first", serde_json::json!({})),
+                call("second", "second", serde_json::json!({})),
+            ],
+            finish_reason: Some("tool_calls".into()),
+            ..Completion::default()
+        }]);
+        let mut tools = Registry::builtins().filtered(&[]);
+        tools.add(Box::new(CountingTool {
+            name: "first",
+            runs: first_runs.clone(),
+        }));
+        tools.add(Box::new(CountingTool {
+            name: "second",
+            runs: second_runs.clone(),
+        }));
+        let mut ctx = ContextManager::new(100_000);
+        let output = CancelOnAssistantTools { cancel: &cancel };
+
+        let err = agent_loop(
+            &mut ctx,
+            &provider,
+            None,
+            &tools,
+            Path::new("."),
+            &output,
+            "do both",
+            0,
+            Some(&cancel),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains(STOPPED_BY_USER),
+            "unexpected error: {err}"
+        );
+        assert_eq!(first_runs.load(Ordering::SeqCst), 0);
+        assert_eq!(second_runs.load(Ordering::SeqCst), 0);
+        assert_eq!(tool_result_ids(&ctx), vec!["first", "second"]);
+        assert!(ctx
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .all(|message| message.content.as_text().contains(INTERRUPTED_BY_USER)));
+        assert!(crate::unpaired_tool_call_ids(&ctx.messages).is_empty());
     }
 
     /// Streams like a real provider: each turn's content is pushed into the

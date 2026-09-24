@@ -3,42 +3,55 @@ mod agent_workflows;
 mod app_overlays;
 mod bindings;
 mod channels_view;
+mod chat_find;
 mod chat_render;
 mod context_menu;
 mod dto;
 mod i18n;
 mod library;
 mod mcp_app;
+mod network_settings;
 mod notebook;
 mod overlays;
 mod pet;
 mod project_landing;
 mod publication;
+mod publication_sources;
 mod research;
+mod research_archive;
+mod research_calendar;
+mod research_journey;
 mod runtime_views;
 mod session_modals;
 mod settings_view;
 mod sidebar;
+mod skill_detail;
+mod skill_store;
 mod text;
 mod trajectory;
 mod window_titlebar;
+mod workflow_conversion;
 
 use agent_workflows::{
     agent_workflows_panel, refresh_agent_resources, refresh_agent_workflows, AgentPanelState,
 };
 use app_overlays::{
-    ContextRecoveryOverlay, ContextRecoveryOverlayState, ExternalLinkConfirm, ProjectExportPrompt,
+    advance_browser_tab_cleanup, present_browser_needs_human, present_browser_tab_cleanup,
+    BrowserNeedsHumanOverlay, BrowserNeedsHumanOverlayState, BrowserTabCleanupOverlay,
+    BrowserTabCleanupOverlayState, CompactDialogMode, CompactIdlePromptOverlay,
+    CompactIdlePromptOverlayState, CompactOverlay, CompactOverlayState, ContextRecoveryOverlay,
+    ContextRecoveryOverlayState, ExternalLinkConfirm, ProjectExportPrompt,
     ProjectExportPromptState, ProjectTransferOverlay, ProjectTransferOverlayState,
     SshConnectivityOverlay, SshConnectivityOverlayState, TurnMemoryOverlay, TurnMemoryOverlayState,
     UpdateCheckOverlay, UpdateCheckOverlayState,
 };
 use bindings::{
-    attach_chat_autoscroll, cancel_saved_marks_apply, clear_selection, close_mcp_app,
-    force_chat_bottom, invoke, invoke_checked, is_mac, is_windows, jump_chat_to_item,
-    jump_chat_to_user, listen, listen_current_window, listen_native_file_drop,
-    native_drop_in_composer, open_external_url, pasted_image_count, preserve_chat_prepend_position,
-    preview_selection, restore_chat_session_scroll, schedule_chat_follow, set_saved_marks,
-    CHAT_SCROLLER_ID, CHAT_THREAD_ID,
+    add_workspace_file_to_motif, attach_chat_autoscroll, cancel_saved_marks_apply, clear_selection,
+    close_mcp_app, force_chat_bottom, invoke, invoke_checked, is_mac, is_windows,
+    jump_chat_to_item, jump_chat_to_user, listen, listen_current_window, listen_native_file_drop,
+    native_drop_in_composer, open_browser_extension_page, open_external_url, pasted_image_count,
+    preserve_chat_prepend_position, preview_selection, restore_chat_session_scroll,
+    schedule_chat_follow, set_saved_marks, set_window_title, CHAT_SCROLLER_ID, CHAT_THREAD_ID,
 };
 use context_menu::{ContextMenuPortal, CtxMenu};
 use dto::*;
@@ -55,8 +68,9 @@ use overlays::{
 };
 use pet::{PetDesktop, PetOverlay};
 use project_landing::{ProjectLanding, ProjectLandingState};
-use publication::{PublicationEvidenceSource, PublicationWorkspaceModal};
-use research::{refresh_research_graph, ResearchGraphModal};
+use publication::{PublicationEvidenceSource, PublicationWorkspacePage};
+use research::refresh_research_graph;
+use research_journey::ResearchJourneyView;
 use serde_wasm_bindgen::{from_value, to_value};
 use session_modals::{
     BranchMergeDetailOverlay, BranchMergeOverlay, BranchMergeOverlayState, EditConfirmOverlay,
@@ -74,14 +88,14 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use text::{
     dom_value, event_target_checked, event_target_value, file_kind, format_bytes,
-    group_artifact_indices, ime_composing, join_path, md_to_html, note_composition_end,
-    opens_in_system_browser, parent_path, provider_defaults, runtime_language,
-    user_message_presentation, DEEPSEEK_FLASH_MODEL, DEEPSEEK_PRO_MODEL,
+    group_artifact_indices, ime_composing, is_runtime_code_selection, join_path, md_to_html,
+    note_composition_end, opens_in_system_browser, parent_path, provider_defaults,
+    runtime_language, user_message_presentation, DEEPSEEK_FLASH_MODEL, DEEPSEEK_PRO_MODEL,
 };
 use trajectory::TrajectoryOverlay;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use window_titlebar::WindowTitlebar;
+use window_titlebar::{app_window_title, WindowTitlebar};
 
 /// Stable substring of the backend's missing-key error (`src-tauri` `send_message`),
 /// used to turn that failure into an actionable "open Settings" prompt.
@@ -102,6 +116,36 @@ const SIDEBAR_RESIZER_WIDTH: f64 = 10.0;
 const THEME_STORAGE_KEY: &str = "wisp-theme";
 const SIDE_CHAT_SCROLLER_ID: &str = "side-chat-scroller";
 const SIDE_CHAT_INPUT_ID: &str = "side-chat-input";
+
+fn service_tier_enabled(value: &str) -> bool {
+    matches!(value.trim(), "priority" | "fast")
+}
+
+fn supports_fast_service_tier(profile: &ModelProfile) -> bool {
+    profile.is_chat_model()
+        && matches!(
+            profile.provider.trim(),
+            "openai" | "openai_responses" | "openai-responses" | "responses"
+        )
+}
+
+fn selected_fast_profile(
+    models: &[ModelProfile],
+    session_models: &HashMap<String, String>,
+    session_id: Option<&str>,
+    acp_selected: bool,
+) -> Option<ModelProfile> {
+    if acp_selected
+        || session_id
+            .and_then(|id| session_models.get(id))
+            .is_some_and(|id| id.starts_with("acp:"))
+    {
+        return None;
+    }
+    session_profile(models, session_models, session_id)
+        .filter(|profile| supports_fast_service_tier(profile))
+        .cloned()
+}
 
 /// Let component-owned inner surfaces consume Escape before the app-level
 /// stack sees it. The listener is capture-phase and owner-scoped, so it does
@@ -300,6 +344,7 @@ fn App() -> impl IntoView {
     // instance. Content fingerprints intentionally remount changed rows while
     // streaming, so keeping this state here preserves explicit user choices.
     let step_disclosure_state = create_rw_signal::<HashMap<String, bool>>(HashMap::new());
+    let nested_link_disclosure = create_rw_signal::<HashMap<String, bool>>(HashMap::new());
     let empty_title_idx = create_rw_signal(
         (js_sys::Math::random() * EMPTY_TITLE_COUNT as f64).floor() as usize % EMPTY_TITLE_COUNT,
     );
@@ -321,6 +366,7 @@ fn App() -> impl IntoView {
     });
     let input = create_rw_signal(String::new());
     let attachments = create_rw_signal::<Vec<ComposerAttachment>>(vec![]);
+    let motif_selection = create_rw_signal(None::<MotifSelection>);
     let uploading = create_rw_signal(false);
     let remote_file_uploading = create_rw_signal(false);
     let files_drag_over = create_rw_signal(false);
@@ -336,9 +382,16 @@ fn App() -> impl IntoView {
     let pending_turns = create_rw_signal::<HashMap<String, usize>>(HashMap::new());
     let transcripts = create_rw_signal::<HashMap<String, Vec<ChatItem>>>(HashMap::new());
     let transcript_pages = create_rw_signal::<HashMap<String, TranscriptPageState>>(HashMap::new());
+    let transcript_request_sequence = store_value(0_u64);
+    let transcript_page_error = create_rw_signal::<Option<(String, String)>>(None);
+    let transcript_loading = create_rw_signal::<Option<String>>(None);
+    let transcript_load_epoch = create_rw_signal(0_u64);
+    let transcript_event_revisions = create_rw_signal::<HashMap<String, u64>>(HashMap::new());
+    let native_approval_ids = create_rw_signal::<HashMap<String, String>>(HashMap::new());
     let conversation_outlines =
         create_rw_signal::<HashMap<String, Vec<SessionOutlineItem>>>(HashMap::new());
     let conversation_outline_open = create_rw_signal(false);
+    let chat_find_open = create_rw_signal(false);
     let conversation_outline_mounted = create_rw_signal(false);
     let conversation_outline_selected = create_rw_signal::<Option<usize>>(None);
     create_effect(move |_| {
@@ -423,6 +476,14 @@ fn App() -> impl IntoView {
     // Configured model profiles + the composer's bottom-right picker state.
     let models = create_rw_signal::<Vec<ModelProfile>>(vec![]);
     let active_session = create_rw_signal::<Option<String>>(None);
+    let mcp_app_context = create_rw_signal::<Option<AppContextNotice>>(None);
+    create_effect(move |_| {
+        active_session.get();
+        chat_find_open.set(false);
+        // Context updates are scoped to the conversation that received them;
+        // never carry an attachment into another session or a new chat.
+        mcp_app_context.set(None);
+    });
     // The stopping banner belongs to the session where Stop was clicked, and
     // only while that session is still running. Switching conversations must
     // not carry it over; a missed or late Done must not leave it over Send.
@@ -475,6 +536,64 @@ fn App() -> impl IntoView {
         }
     });
     let active_branch_state = create_rw_signal::<Option<String>>(None);
+    let archive_frame = create_rw_signal::<Option<String>>(None);
+    let archive_busy = create_rw_signal(false);
+    let archived_sessions = create_rw_signal(HashSet::<String>::new());
+    {
+        let closed = store_value(false);
+        let unlisten = store_value(None::<js_sys::Function>);
+        let cb = Closure::<dyn FnMut(JsValue)>::new(move |event: JsValue| {
+            // bindings::listen already unwraps the Tauri event payload.
+            if let Ok(id) = js_sys::Reflect::get(&event, &JsValue::from_str("frame_id")) {
+                if let Some(id) = id.as_string() {
+                    archived_sessions.update(|s| {
+                        s.insert(id);
+                    });
+                }
+            }
+        });
+        let function: js_sys::Function = cb.as_ref().unchecked_ref::<js_sys::Function>().clone();
+        spawn_local(async move {
+            let result = listen("research-archived", &function).await;
+            if let Some(f) = result.dyn_ref::<js_sys::Function>() {
+                if closed.try_get_value().unwrap_or(true) {
+                    let _ = f.call0(&JsValue::NULL);
+                } else {
+                    unlisten.set_value(Some(f.clone()));
+                }
+            }
+        });
+        on_cleanup(move || {
+            closed.set_value(true);
+            if let Some(f) = unlisten.get_value() {
+                let _ = f.call0(&JsValue::NULL);
+            }
+            drop(cb);
+        });
+    }
+    let active_archived = create_memo(move |_| {
+        active_session
+            .get()
+            .is_some_and(|id| archived_sessions.with(|s| s.contains(&id)))
+    });
+    create_effect(move |_| {
+        if let Some(id) = active_session.get() {
+            spawn_local(async move {
+                if let Ok(Some(a)) = research_journey::call::<Option<ResearchArchive>>(
+                    "get_research_archive",
+                    serde_json::json!({"frameId":id}),
+                )
+                .await
+                {
+                    if a.frozen_at.is_some() {
+                        archived_sessions.update(|s| {
+                            s.insert(a.frame_id);
+                        });
+                    }
+                }
+            });
+        }
+    });
     create_effect(move |_| {
         let active = active_session.get();
         let state = active.and_then(|id| {
@@ -513,6 +632,9 @@ fn App() -> impl IntoView {
         })
     });
     let composer_scope_locked = create_memo(move |_| {
+        if active_archived.get() {
+            return true;
+        }
         active_session.get().is_some_and(|frame_id| {
             explorations.with(|rows| {
                 rows.iter()
@@ -600,8 +722,65 @@ fn App() -> impl IntoView {
         conversation_outline_selected.set(None);
     });
     let session_model_ids = create_rw_signal::<HashMap<String, String>>(HashMap::new());
+    // Map presence means the backend value has loaded; its nested None means
+    // this conversation inherits the selected model profile's Fast default.
+    let session_service_tiers = create_rw_signal::<HashMap<String, Option<String>>>(HashMap::new());
+    // A pre-send Fast override is held in memory until the first frame exists.
+    // None means the selected profile default needs no override.
+    let pending_service_tier = create_rw_signal::<Option<String>>(None);
+    let service_tier_busy = create_rw_signal(false);
     let acp_agents = create_rw_signal::<Vec<AcpAgentProfile>>(vec![]);
     let active_acp_agent_id = create_rw_signal::<Option<String>>(None);
+    let fast_profile = Signal::derive(move || {
+        selected_fast_profile(
+            &models.get(),
+            &session_model_ids.get(),
+            active_session.get().as_deref(),
+            active_acp_agent_id.get().is_some(),
+        )
+    });
+    let fast_enabled = create_memo(move |_| {
+        let profile_default = fast_profile
+            .get()
+            .as_ref()
+            .is_some_and(|profile| service_tier_enabled(&profile.service_tier));
+        match active_session.get() {
+            Some(session_id) => session_service_tiers
+                .with(|values| values.get(&session_id).cloned())
+                .flatten()
+                .map_or(profile_default, |value| service_tier_enabled(&value)),
+            None => pending_service_tier
+                .get()
+                .map_or(profile_default, |value| service_tier_enabled(&value)),
+        }
+    });
+    // A staged pre-send override belongs to the selected HTTP profile. If the
+    // user switches profile and the staged target now equals that profile's
+    // default (or selects ACP/unsupported), there is nothing to persist.
+    create_effect(move |_| {
+        if active_session.get().is_some() {
+            return;
+        }
+        match (fast_profile.get(), pending_service_tier.get()) {
+            (None, Some(_)) => pending_service_tier.set(None),
+            (Some(profile), Some(value))
+                if service_tier_enabled(&profile.service_tier) == service_tier_enabled(&value) =>
+            {
+                pending_service_tier.set(None)
+            }
+            _ => {}
+        }
+    });
+    let fast_is_session_override = create_memo(move |_| match active_session.get() {
+        Some(session_id) => session_service_tiers
+            .with(|values| values.get(&session_id).is_some_and(Option::is_some)),
+        None => pending_service_tier.get().is_some(),
+    });
+    let fast_loaded = create_memo(move |_| {
+        active_session.get().is_none_or(|session_id| {
+            session_service_tiers.with(|values| values.contains_key(&session_id))
+        })
+    });
     let settings_busy = create_rw_signal(false);
     let settings_message = create_rw_signal::<Option<(bool, String)>>(None);
     // Model & specialist settings domain: form signals + save/validate/test
@@ -636,6 +815,119 @@ fn App() -> impl IntoView {
     let context_usage_suppress_click = context_usage.suppress_click;
     let context_usage_details = context_usage.details;
     let context_usage_detail_open = context_usage.detail_open;
+    let model_view = create_rw_signal(false);
+    let context_view_items = create_rw_signal::<Vec<ChatItem>>(Vec::new());
+    let context_view_live_from = create_rw_signal::<Option<usize>>(None);
+    let context_view_loading = create_rw_signal(false);
+    let context_view_error = create_rw_signal::<Option<String>>(None);
+    let in_context_from_user_index = create_rw_signal::<Option<usize>>(None);
+    let head_epoch = create_rw_signal(0u64);
+    let context_epochs = create_rw_signal::<Vec<ContextEpochDto>>(Vec::new());
+    let context_refresh_generation = create_rw_signal(0u64);
+    let refresh_context_state = Callback::new(move |id: String| {
+        if active_session.get_untracked().as_deref() != Some(id.as_str()) {
+            return;
+        }
+        context_refresh_generation.update(|generation| *generation = generation.wrapping_add(1));
+        let generation = context_refresh_generation.get_untracked();
+        if model_view.get_untracked() {
+            context_view_loading.set(true);
+            context_view_error.set(None);
+        }
+        spawn_local(async move {
+            for _ in 0..3 {
+                let revision =
+                    transcript_event_revisions.with_untracked(|all| all.get(&id).copied());
+                // Include optimistic turns inserted while the read is pending
+                // in the live suffix rather than swallowing them into a
+                // snapshot that was requested before they existed.
+                let user_offset = transcript_pages
+                    .with_untracked(|pages| pages.get(&id).map_or(0, |page| page.user_offset));
+                let next_user = user_offset
+                    + items.with_untracked(|rows| {
+                        rows.iter()
+                            .filter(|row| matches!(row, ChatItem::User(_)))
+                            .count()
+                    });
+                let args = to_value(&serde_json::json!({ "sessionId": id })).unwrap();
+                let result = async {
+                    let value = invoke_checked("load_session_context_state", args)
+                        .await
+                        .map_err(js_error_text)?;
+                    let snapshot = serde_wasm_bindgen::from_value::<SessionContextState>(value)
+                        .map_err(|error| error.to_string())?;
+                    let rows = if model_view.get_untracked() {
+                        let args = to_value(&tauri_args::load_session_context_view(&id)).unwrap();
+                        let value = invoke_checked("load_session_context_view", args)
+                            .await
+                            .map_err(js_error_text)?;
+                        Some(
+                            serde_wasm_bindgen::from_value::<Vec<LoadedItem>>(value)
+                                .map_err(|error| error.to_string())?,
+                        )
+                    } else {
+                        None
+                    };
+                    Ok::<_, String>((snapshot, rows))
+                }
+                .await;
+                if active_session.get_untracked().as_deref() != Some(id.as_str())
+                    || context_refresh_generation.get_untracked() != generation
+                {
+                    return;
+                }
+                let Ok((snapshot, context_rows)) = result else {
+                    context_view_loading.set(false);
+                    context_view_error.set(result.err());
+                    return;
+                };
+                // Validate the whole read, including the model rows. Publishing
+                // the epoch before the second await let a superseding Done
+                // refresh skip the missing model snapshot as "unchanged".
+                if transcript_event_revisions.with_untracked(|all| all.get(&id).copied())
+                    != revision
+                {
+                    continue;
+                }
+                let previous_epoch = head_epoch.get_untracked();
+                context_epochs.set(snapshot.context_epochs.clone());
+                head_epoch.set(snapshot.head_epoch);
+                in_context_from_user_index.set(snapshot.in_context_from_user_index);
+                items.update(|rows| {
+                    apply_context_state(rows, &snapshot, snapshot.head_epoch > previous_epoch)
+                });
+                if let Some(rows) = context_rows.filter(|_| model_view.get_untracked()) {
+                    context_view_live_from.set(Some(next_user));
+                    context_view_items.set(rows.into_iter().map(LoadedItem::into_chat).collect());
+                }
+                context_view_loading.set(false);
+                return;
+            }
+            context_view_loading.set(false);
+            context_view_error.set(Some(
+                t(locale.get_untracked(), "chat.context_view_changed").into(),
+            ));
+        });
+    });
+    let thread_items = Signal::derive(move || {
+        if model_view.get() {
+            let user_offset = active_session.get().map_or(0, |id| {
+                transcript_pages.with(|pages| pages.get(&id).map_or(0, |page| page.user_offset))
+            });
+            context_view_items.with(|snapshot| {
+                items.with(|live| {
+                    model_context_with_live_turns(
+                        snapshot,
+                        live,
+                        user_offset,
+                        context_view_live_from.get(),
+                    )
+                })
+            })
+        } else {
+            items.get()
+        }
+    });
     let active_context_usage = create_memo(move |_| {
         let session_id = active_session.get()?;
         if active_acp_agent_id.get().is_some() {
@@ -682,9 +974,18 @@ fn App() -> impl IntoView {
     }
     create_effect(move |_| {
         let _ = active_session.get();
+        context_refresh_generation.update(|generation| *generation = generation.wrapping_add(1));
         context_usage_open.set(false);
         context_usage_details.set(None);
         context_usage_detail_open.set(None);
+        model_view.set(false);
+        context_view_items.set(Vec::new());
+        context_view_live_from.set(None);
+        context_view_loading.set(false);
+        context_view_error.set(None);
+        in_context_from_user_index.set(None);
+        head_epoch.set(0);
+        context_epochs.set(Vec::new());
     });
     create_effect(move |_| {
         let open = context_usage_open.get();
@@ -767,11 +1068,60 @@ fn App() -> impl IntoView {
     });
     let model_switch_confirm = create_rw_signal::<Option<(String, String, bool)>>(None);
     let status = create_rw_signal(String::new());
-    let compaction_active = create_rw_signal(false);
+    let toggle_fast = Callback::new(move |_: ()| {
+        if service_tier_busy.get_untracked() || busy.get_untracked() {
+            return;
+        }
+        let Some(profile) = fast_profile.get_untracked() else {
+            return;
+        };
+        let target_enabled = !fast_enabled.get_untracked();
+        let profile_default = service_tier_enabled(&profile.service_tier);
+        let override_value = if target_enabled == profile_default {
+            None
+        } else if target_enabled {
+            Some("priority".to_string())
+        } else {
+            Some(String::new())
+        };
+        let Some(session_id) = active_session.get_untracked() else {
+            pending_service_tier.set(override_value);
+            return;
+        };
+        service_tier_busy.set(true);
+        spawn_local(async move {
+            let args = to_value(&serde_json::json!({
+                "sessionId": session_id.clone(),
+                "serviceTier": override_value.clone(),
+            }))
+            .unwrap();
+            match invoke_checked("set_session_service_tier", args).await {
+                Ok(_) => {
+                    session_service_tiers.update(|values| {
+                        values.insert(session_id, override_value);
+                    });
+                }
+                Err(error) => show_warning_toast(&localize_backend(
+                    locale.get_untracked(),
+                    &js_error_text(error),
+                )),
+            }
+            service_tier_busy.set(false);
+        });
+    });
+    let compacting_sessions = create_rw_signal(HashSet::<String>::new());
+    let compaction_active = create_memo(move |_| {
+        active_session
+            .get()
+            .is_some_and(|id| compacting_sessions.with(|sessions| sessions.contains(&id)))
+    });
+    let semantic_compact_after_model = create_rw_signal::<Option<String>>(None);
     let switch_http_model = Callback::new(move |(id, dont_ask_again): (String, bool)| {
         provisional_acp_selection.set(None);
         active_acp_agent_id.set(None);
         let session_id = active_session.get_untracked();
+        let auto_semantic = settings.get_untracked().semantic_compact_on_model_switch
+            && items.with_untracked(|rows| !rows.is_empty());
         spawn_local(async move {
             let arg = to_value(&serde_json::json!({
                 "id": id.clone(),
@@ -785,8 +1135,11 @@ fn App() -> impl IntoView {
                     }
                     if let Some(session_id) = session_id {
                         session_model_ids.update(|models| {
-                            models.insert(session_id, id);
+                            models.insert(session_id.clone(), id);
                         });
+                        if auto_semantic {
+                            semantic_compact_after_model.set(Some(session_id));
+                        }
                     }
                     if dont_ask_again {
                         disable_model_switch_warning();
@@ -801,7 +1154,16 @@ fn App() -> impl IntoView {
     let send_mode_menu_open = create_rw_signal(false);
     // Queue (#433): monotonic key for optimistic queued follow-ups, shared with the
     // backend queue item so edit/cancel/cut-in target the same row.
-    let queue_seq = create_rw_signal(0u64);
+    // A window-scoped seed prevents queue ID collisions across session windows.
+    let queue_seq = create_rw_signal((js_sys::Math::random() * 4_503_599_627_370_496.0) as u64);
+    // Live backend lifecycle for queued rows. The row text is deliberately
+    // excluded from reconciliation because equal bodies can carry different
+    // attachments and still be separate intents.
+    let queue_states = create_rw_signal::<HashMap<(String, u64), String>>(HashMap::new());
+    // Native ask_user option clicks stage an editable answer here. The tuple
+    // stores the last generated draft so selecting another option can replace
+    // it without overwriting text the user has already edited.
+    let native_question_draft = create_rw_signal::<Option<(String, usize, String)>>(None);
     let side_chat_input = create_rw_signal(String::new());
     let side_chat_quotes = create_rw_signal::<Vec<ComposerQuote>>(vec![]);
     let side_chat_items = create_rw_signal::<Vec<SideChatItem>>(vec![]);
@@ -829,6 +1191,95 @@ fn App() -> impl IntoView {
     // Live web retrieval failed because the Chrome extension is disconnected.
     // Root-owned so Escape can dismiss it without first focusing the banner.
     let browser_offline_notice = create_rw_signal::<Option<BrowserOfflineNotice>>(None);
+    // A connected extension can still be too old for this build. Keep this
+    // separate from the offline verdict: live retrieval may work while newer
+    // capabilities fail, and the remediation is an extension update.
+    let browser_extension_status = create_rw_signal::<Option<BrowserExtensionStatus>>(None);
+    let browser_extension_update_busy = create_rw_signal(false);
+    let browser_extension_update_outcome = create_rw_signal::<Option<String>>(None);
+    let browser_extension_update_error = create_rw_signal::<Option<String>>(None);
+    let browser_extension_dismissed_version = create_rw_signal::<Option<String>>(None);
+    let refresh_browser_extension_status = Callback::new(move |()| {
+        spawn_local(async move {
+            let value = invoke("browser_extension_status", JsValue::UNDEFINED).await;
+            let Ok(status) = from_value::<BrowserExtensionStatus>(value) else {
+                return;
+            };
+            if status.update_required {
+                let target = status.bundled_version.clone().unwrap_or_default();
+                if browser_extension_dismissed_version
+                    .get_untracked()
+                    .as_deref()
+                    != Some(target.as_str())
+                    // Polled every 2s: an unchanged verdict must not rebuild the banner.
+                    && browser_extension_status
+                        .with_untracked(|current| current.as_ref() != Some(&status))
+                {
+                    browser_extension_status.set(Some(status));
+                }
+            } else {
+                browser_extension_status.set(None);
+                browser_extension_update_outcome.set(None);
+                browser_extension_update_error.set(None);
+            }
+        });
+    });
+    refresh_browser_extension_status.call(());
+    {
+        // A manual Reload tears down and recreates the service worker without a
+        // Tauri event. Poll while the app is alive so successful reloads are
+        // detected and the compatibility banner clears automatically.
+        let ticks = Cell::new(0_u8);
+        let startup_ticks = Cell::new(0_u8);
+        let refresh = Closure::wrap(Box::new(move || {
+            let tick = (ticks.get() + 1) % 5;
+            ticks.set(tick);
+            let startup_tick = startup_ticks.get();
+            if startup_tick < 5 {
+                startup_ticks.set(startup_tick + 1);
+            }
+            if startup_tick < 5 || browser_extension_status.get_untracked().is_some() || tick == 0 {
+                refresh_browser_extension_status.call(());
+            }
+        }) as Box<dyn FnMut()>);
+        let poll_window = web_sys::window();
+        let interval = poll_window.as_ref().and_then(|window| {
+            window
+                .set_interval_with_callback_and_timeout_and_arguments_0(
+                    refresh.as_ref().unchecked_ref(),
+                    2_000,
+                )
+                .ok()
+        });
+        on_cleanup(move || {
+            if let (Some(window), Some(interval)) = (poll_window, interval) {
+                window.clear_interval_with_handle(interval);
+            }
+            drop(refresh);
+        });
+    }
+    // A transcript records the connection state at tool-call time. Recheck the
+    // live bridge once whenever a notice appears so a reconnect does not leave
+    // a stale banner on screen or revive one after a session reload.
+    create_effect(move |_| {
+        let Some(notice) = browser_offline_notice.get() else {
+            return;
+        };
+        spawn_local(async move {
+            let value = invoke("extension_connected", JsValue::UNDEFINED).await;
+            if value.as_bool().unwrap_or(false) {
+                set_browser_offline_notice(browser_offline_notice, &notice.frame_id, None);
+            }
+        });
+    });
+    let browser_tab_cleanup = create_rw_signal(None::<BrowserTabCleanupPrompt>);
+    let browser_tab_cleanup_queue = create_rw_signal(Vec::<BrowserTabCleanupPrompt>::new());
+    let browser_tab_cleanup_selected = create_rw_signal(HashSet::<(String, i64)>::new());
+    let browser_tab_cleanup_busy = create_rw_signal(false);
+    let browser_tab_cleanup_error = create_rw_signal(None::<String>);
+    let browser_needs_human = create_rw_signal(None::<BrowserNeedsHumanPrompt>);
+    let browser_needs_human_busy = create_rw_signal(false);
+    let browser_needs_human_error = create_rw_signal(None::<String>);
     // "不再提醒更新" opt-out; loaded on startup, mirrored by the settings toggle.
     let update_check_enabled = create_rw_signal(true);
     // Set when a send fails because no API key is configured, so the status bar
@@ -840,6 +1291,120 @@ fn App() -> impl IntoView {
     let context_recovery_dialog = create_rw_signal::<Option<String>>(None);
     let context_recovery_busy = create_rw_signal(false);
     let context_recovery_error = create_rw_signal::<Option<String>>(None);
+    // Manual compaction is a two-step flow: choose regular prune vs semantic
+    // checkpoint (optional instruction only for semantic), then keep the modal
+    // locked until the archive and new context epoch are durable.
+    let compact_dialog = create_rw_signal::<Option<String>>(None);
+    let compact_mode = create_rw_signal(CompactDialogMode::Regular);
+    let compact_instruction = create_rw_signal(String::new());
+    let compact_busy = create_rw_signal(false);
+    let compact_error = create_rw_signal::<Option<String>>(None);
+    let compact_idle_prompt = create_rw_signal::<Option<(String, u64)>>(None);
+    let compact_idle_dismissed = create_rw_signal::<HashSet<String>>(HashSet::new());
+    // Set only when the dialog was opened from the context-limit recovery
+    // offer: that flow promises "compact and continue", so the interrupted
+    // turn still has to resume once the new epoch is durable. Cancelling the
+    // dialog clears it.
+    let compact_resume = create_rw_signal::<Option<String>>(None);
+    let open_compact_dialog = Callback::new(
+        move |(id, instruction, mode): (String, String, CompactDialogMode)| {
+            if id.trim().is_empty() || compact_busy.get_untracked() {
+                return;
+            }
+            compact_idle_prompt.set(None);
+            compact_mode.set(mode);
+            compact_instruction.set(instruction);
+            compact_error.set(None);
+            compact_dialog.set(Some(id));
+        },
+    );
+    let close_compact_dialog = Callback::new(move |_: ()| {
+        if !compact_busy.get_untracked() {
+            compact_dialog.set(None);
+            compact_mode.set(CompactDialogMode::Regular);
+            compact_instruction.set(String::new());
+            compact_error.set(None);
+            compact_resume.set(None);
+        }
+    });
+    let start_compact_dialog = Callback::new(move |(id, instruction): (String, String)| {
+        if compact_busy.get_untracked() {
+            return;
+        }
+        compact_busy.set(true);
+        compact_error.set(None);
+        let semantic = compact_mode.get_untracked() == CompactDialogMode::Semantic;
+        let message = if semantic {
+            if instruction.trim().is_empty() {
+                "/compact --semantic".to_string()
+            } else {
+                format!("/compact --semantic {}", instruction.trim())
+            }
+        } else {
+            "/compact".to_string()
+        };
+        let locale = locale;
+        spawn_local(async move {
+            let args = to_value(&SendMessageArgs {
+                session_id: Some(id),
+                message,
+                attachments: vec![],
+                references: vec![],
+                resume: false,
+                acp_agent_id: None,
+                guide: None,
+                replace: None,
+            })
+            .unwrap();
+            if let Err(error) = invoke_checked("send_message", args).await {
+                compact_error.set(Some(localize_backend(
+                    locale.get_untracked(),
+                    &js_error_text(error),
+                )));
+                compact_busy.set(false);
+            }
+        });
+    });
+    create_effect(move |_| {
+        let Some(id) = semantic_compact_after_model.get() else {
+            return;
+        };
+        semantic_compact_after_model.set(None);
+        if compact_busy.get_untracked() || id.trim().is_empty() {
+            return;
+        }
+        open_compact_dialog.call((id.clone(), String::new(), CompactDialogMode::Semantic));
+        start_compact_dialog.call((id, String::new()));
+    });
+    create_effect(move |_| {
+        let session_id = active_session.get();
+        let on_projects = show_projects.get();
+        if on_projects || session_id.is_none() {
+            return;
+        }
+        let id = session_id.as_ref().unwrap().clone();
+        if compact_dialog.get_untracked().is_some()
+            || compact_busy.get_untracked()
+            || active_acp_agent_id.get_untracked().is_some()
+            || compact_idle_dismissed.with_untracked(|set| set.contains(&id))
+            || items.with_untracked(|rows| rows.iter().all(|row| !matches!(row, ChatItem::User(_))))
+        {
+            return;
+        }
+        let hours = settings.with_untracked(|cfg| cfg.semantic_compact_idle_hours);
+        let last_activity = sessions.with_untracked(|list| {
+            list.iter()
+                .find(|session| session.id == id)
+                .map(|session| session.ts)
+                .unwrap_or(0)
+        });
+        let now = js_sys::Date::now() as i64;
+        if should_prompt_semantic_compact_idle(hours, last_activity, now, true)
+            && compact_idle_prompt.get_untracked().is_none()
+        {
+            compact_idle_prompt.set(Some((id, hours)));
+        }
+    });
     let refresh_models = move || model_settings.refresh_models();
     // Tauri's native drag/drop event contains absolute paths (including
     // directories). Drops on a remote Files panel upload via scp; drops on
@@ -944,6 +1509,7 @@ fn App() -> impl IntoView {
     let drop_target = create_rw_signal::<Option<String>>(None);
     let session_execution_contexts = create_rw_signal::<HashSet<String>>(HashSet::new());
     let default_execution_context = create_rw_signal::<Option<String>>(None);
+    let session_default_execution_context = create_rw_signal::<Option<String>>(None);
     create_effect(move |_| {
         let Some(session_id) = active_session.get() else {
             return;
@@ -963,11 +1529,51 @@ fn App() -> impl IntoView {
     });
     create_effect(move |_| {
         let Some(session_id) = active_session.get() else {
-            session_execution_contexts.set(HashSet::new());
             return;
         };
-        session_execution_contexts.set(HashSet::new());
-        refresh_session_execution_contexts(session_execution_contexts, active_session, session_id);
+        spawn_local(async move {
+            let args = to_value(&serde_json::json!({ "sessionId": session_id.clone() })).unwrap();
+            match invoke_checked("get_session_service_tier", args).await {
+                Ok(value) => {
+                    let tier = value.as_string();
+                    session_service_tiers.update(|values| {
+                        values.insert(session_id, tier);
+                    });
+                }
+                Err(error) => {
+                    session_service_tiers.update(|values| {
+                        values.insert(session_id, None);
+                    });
+                    web_sys::console::warn_1(
+                        &format!("get_session_service_tier failed: {:?}", error).into(),
+                    );
+                }
+            }
+        });
+    });
+    create_effect(move |_| {
+        let Some(session_id) = active_session.get() else {
+            if !session_execution_contexts.get_untracked().is_empty() {
+                session_execution_contexts.set(HashSet::new());
+            }
+            if session_default_execution_context.get_untracked().is_some() {
+                session_default_execution_context.set(None);
+            }
+            return;
+        };
+        if !session_execution_contexts.get_untracked().is_empty() {
+            session_execution_contexts.set(HashSet::new());
+        }
+        refresh_session_execution_contexts(
+            session_execution_contexts,
+            active_session,
+            session_id.clone(),
+        );
+        refresh_session_default_execution_context(
+            session_default_execution_context,
+            active_session,
+            session_id,
+        );
     });
     create_effect(move |_| {
         let Some(session_id) = active_session.get() else {
@@ -1022,7 +1628,9 @@ fn App() -> impl IntoView {
         let Some(session_id) = active_session.get() else {
             return;
         };
-        if acp_session_modes.with_untracked(|all| all.contains_key(&session_id)) {
+        if acp_session_modes.with_untracked(|all| all.contains_key(&session_id))
+            && acp_session_configs.with_untracked(|all| all.contains_key(&session_id))
+        {
             return;
         }
         spawn_local(async move {
@@ -1030,14 +1638,20 @@ fn App() -> impl IntoView {
             let Ok(value) = invoke_checked("get_acp_session_state", args).await else {
                 return;
             };
-            let Ok(Some(modes)) =
-                serde_wasm_bindgen::from_value::<Option<serde_json::Value>>(value)
+            let Ok(Some(state)) = serde_wasm_bindgen::from_value::<Option<AcpSessionState>>(value)
             else {
                 return;
             };
-            acp_session_modes.update(|all| {
-                all.entry(session_id).or_insert(modes);
-            });
+            if let Some(modes) = state.modes {
+                acp_session_modes.update(|all| {
+                    all.entry(session_id.clone()).or_insert(modes);
+                });
+            }
+            if let Some(options) = state.config_options {
+                acp_session_configs.update(|all| {
+                    all.entry(session_id).or_insert(options);
+                });
+            }
         });
     });
 
@@ -1149,6 +1763,8 @@ fn App() -> impl IntoView {
     // renamed or overwritten still lingers and 404s on click (#41). Ask the
     // backend which referenced files are gone and drop them from the list.
     let missing_paths = create_rw_signal(std::collections::HashSet::<String>::new());
+    let workspace_path_liveness = create_rw_signal(WorkspacePathLiveness::default());
+    provide_context(workspace_path_liveness.read_only());
     let artifact_file_paths = create_memo(move |_| {
         artifacts_all.with(|artifacts| {
             artifacts
@@ -1160,17 +1776,61 @@ fn App() -> impl IntoView {
                 .collect::<Vec<_>>()
         })
     });
+    let workspace_path_candidates = create_memo(move |_| {
+        let _ = active_session.get();
+        let _ = transcript_projection_epoch.get();
+        let _ = busy.get();
+        let root = project_info
+            .get()
+            .map(|project| project.root)
+            .unwrap_or_default();
+        let mut paths = artifact_file_paths.get();
+        if root.is_empty() {
+            return paths;
+        }
+        let mut seen = paths.iter().cloned().collect::<HashSet<_>>();
+        items.with_untracked(|list| {
+            for path in collect_chat_workspace_paths(list, &root) {
+                if seen.insert(path.clone()) {
+                    paths.push(path);
+                }
+            }
+        });
+        paths
+    });
+    let path_check_gen = Rc::new(Cell::new(0u64));
     create_effect(move |_| {
-        let paths = artifact_file_paths.get();
+        let paths = workspace_path_candidates.get();
+        let gen = path_check_gen.get().wrapping_add(1);
+        path_check_gen.set(gen);
         if paths.is_empty() {
-            missing_paths.set(std::collections::HashSet::new());
+            if !missing_paths.get_untracked().is_empty() {
+                missing_paths.set(HashSet::new());
+            }
+            if workspace_path_liveness.get_untracked() != WorkspacePathLiveness::default() {
+                workspace_path_liveness.set(WorkspacePathLiveness::default());
+            }
             return;
         }
+        let path_check_gen = Rc::clone(&path_check_gen);
         spawn_local(async move {
-            let arg = to_value(&serde_json::json!({ "paths": paths })).unwrap();
+            let arg = to_value(&serde_json::json!({ "paths": paths.clone() })).unwrap();
             let v = invoke("missing_files", arg).await;
+            if gen != path_check_gen.get() {
+                return;
+            }
             if let Ok(m) = serde_wasm_bindgen::from_value::<Vec<String>>(v) {
-                missing_paths.set(m.into_iter().collect());
+                let missing = m.into_iter().collect::<HashSet<_>>();
+                let next = WorkspacePathLiveness {
+                    checked: paths.into_iter().collect(),
+                    missing: missing.clone(),
+                };
+                if missing_paths.get_untracked() != missing {
+                    missing_paths.set(missing);
+                }
+                if workspace_path_liveness.get_untracked() != next {
+                    workspace_path_liveness.set(next);
+                }
             }
         });
     });
@@ -1220,8 +1880,6 @@ fn App() -> impl IntoView {
         })
     });
     let artifact_count = create_memo(move |_| artifacts.with(Vec::len));
-    let artifact_render_fingerprint =
-        create_memo(move |_| artifacts.with(|artifacts| artifacts_fingerprint(artifacts)));
     let notebook_count = create_memo(move |_| notebook_cells.with(Vec::len));
     let provenance_count = create_memo(move |_| provenance_rows.with(Vec::len));
     let highlight_count = create_memo(move |_| {
@@ -1242,16 +1900,27 @@ fn App() -> impl IntoView {
                 .collect::<HashSet<_>>()
         })
     });
+    let completed_run_owners = create_memo(move |_| {
+        let Some(frame_id) = active_session.get() else {
+            return HashMap::new();
+        };
+        let _ = transcript_projection_epoch.get();
+        run_records.with(|runs| {
+            items.with_untracked(|rows| chat_render::completed_run_owners(rows, runs, &frame_id))
+        })
+    });
     let automatic_session_runs = create_memo(move |_| {
         let Some(frame_id) = active_session.get() else {
             return Vec::new();
         };
         let monitored = monitored_run_ids.get();
+        let completed = completed_run_owners.get();
         let now = js_sys::Date::now() as i64 / 1000;
         let mut runs = run_records.with(|runs| {
             runs.iter()
                 .filter(|run| run.frame_id.as_deref() == Some(frame_id.as_str()))
                 .filter(|run| !monitored.contains(&run.id))
+                .filter(|run| !completed.contains_key(&run.id))
                 .filter(|run| {
                     matches!(run.status.as_str(), "submitted" | "running" | "cancelling")
                         || run
@@ -1279,8 +1948,34 @@ fn App() -> impl IntoView {
     // sidebar modal is opened rather than kept live.
     let research_graph = create_rw_signal(ResearchGraph::default());
     let show_research_graph = create_rw_signal(false);
+    let home_calendar_open = create_rw_signal(false);
+    let home_dialog_open = create_rw_signal(false);
+    let calendar_journey_request = create_rw_signal(None::<(String, i64)>);
+    let journey_initial_day = create_rw_signal(None::<i64>);
+    // Every home navigation path must dispose the project journey. Also watch
+    // its open flag while at home: a delayed calendar drill-down can set it
+    // after the user has already left the project.
+    create_effect(move |_| {
+        if show_projects.get() {
+            if show_research_graph.get() {
+                show_research_graph.set(false);
+            }
+            journey_initial_day.set(None);
+        }
+    });
     let show_publication_workspace = create_rw_signal(false);
     let publication_binding_source = create_rw_signal::<Option<PublicationEvidenceSource>>(None);
+    create_effect(move |previous: Option<Option<String>>| {
+        let project = project_info.get().map(|project| project.id);
+        if previous
+            .as_ref()
+            .is_some_and(|previous| previous != &project)
+        {
+            show_publication_workspace.set(false);
+            publication_binding_source.set(None);
+        }
+        project
+    });
     create_effect(move |_| {
         side_chat_items.with(|items| items.len());
         if !show_right.get() || right_tab.get() != RightTab::SideChat {
@@ -1306,10 +2001,23 @@ fn App() -> impl IntoView {
     });
     let agent_panel = AgentPanelState::new(active_session);
     let workflow_studio_state = AgentPanelState::new(active_session);
-    refresh_agent_resources(workflow_studio_state, specialists);
+    let workflow_conversion = workflow_conversion::ConversionState::new(project_info);
+    provide_context(workflow_conversion);
+    create_effect(move |_| {
+        if project_info.get().is_none() {
+            return;
+        }
+        refresh_agent_resources(workflow_studio_state, specialists);
+    });
     let file_source = create_rw_signal("local".to_string());
     let file_query = create_rw_signal(String::new());
     let file_cwd = create_rw_signal(".".to_string());
+    let file_sort = create_rw_signal(load_view_pref(
+        FILE_SORT_PREF,
+        FILE_SORT_NAME,
+        &[FILE_SORT_NAME, FILE_SORT_SIZE, FILE_SORT_MODIFIED],
+    ));
+    let file_sort_menu_open = create_rw_signal(false);
     let file_entries = create_rw_signal::<Vec<DirEntry>>(vec![]);
     let file_search_hits = create_rw_signal::<Vec<FileSearchHit>>(vec![]);
     let selecting_workspace_entries = create_rw_signal(false);
@@ -1334,6 +2042,17 @@ fn App() -> impl IntoView {
     });
     let center_files = create_rw_signal::<Vec<CenterFileTab>>(vec![]);
     let center_file = create_rw_signal::<Option<String>>(None);
+    let snapshot_workspace_path = create_memo(move |_| {
+        let path = center_file.get()?;
+        snapshot_workspace_source(
+            &path,
+            &items.get(),
+            project_info
+                .get()
+                .as_ref()
+                .map(|project| project.root.as_str()),
+        )
+    });
     // Live MCP Apps use the same center-tab surface as files, but their HTML,
     // tool input, and result stay in a separate instance map so in-memory tab
     // snapshots do not repeatedly clone multi-megabyte payloads. The backend
@@ -1355,8 +2074,19 @@ fn App() -> impl IntoView {
     // outlived one would point at a process that no longer exists.
     let center_runtime_binding = create_rw_signal::<HashMap<String, String>>(HashMap::new());
     let center_console = create_rw_signal::<RuntimeConsoles>(RuntimeConsoles::new());
+    let center_plots = create_rw_signal::<RuntimePlots>(RuntimePlots::new());
     let center_run_busy = create_rw_signal::<Option<String>>(None);
     let center_runtime_panel = create_rw_signal(false);
+    // Unsaved editor drafts per file path. Kept outside the editor component so
+    // a preview remount (agent FileChanged bumps the revision) cannot drop what
+    // the user typed.
+    let center_editor_drafts = create_rw_signal::<HashMap<String, String>>(HashMap::new());
+    // RStudio-quadrant geometry: right column width and bottom row height as
+    // percentages of the workbench, adjusted by dragging the pane dividers.
+    let center_runtime_right_w = create_rw_signal(34.0_f64);
+    let center_runtime_bottom_h = create_rw_signal(32.0_f64);
+    let center_runtime_col_dragging = create_rw_signal(false);
+    let center_runtime_row_dragging = create_rw_signal(false);
     // Runtime inspection belongs to the active source tab, so a newly selected
     // file starts with its full preview until the user asks for the panel.
     create_effect(move |_| {
@@ -1465,6 +2195,9 @@ fn App() -> impl IntoView {
     // model and one chip list. Uploads remain separate because they have async
     // progress/error state; selected catalog items are already durable records.
     let composer_references = create_rw_signal::<Vec<ComposerReferenceChip>>(vec![]);
+    // The latest MCP App context is a pending composer attachment, not a
+    // transcript message. The user can remove it before sending the next
+    // ordinary turn, just like a file attachment.
     // Quoted selections retain their source path. The persisted message still
     // carries ordinary text, but the agent now knows which workspace file a
     // "change this" request must edit.
@@ -1703,6 +2436,12 @@ fn App() -> impl IntoView {
     // Declared up here (not with the other context-view signals) so the
     // composer @ menu can offer servers and runtimes alongside artifacts.
     let execution_contexts = create_rw_signal::<Vec<ExecutionContext>>(vec![]);
+    // Also up here: the agent event handler below refreshes runtime status and
+    // the open memory environment after each finished python/r tool call.
+    let runtime_infos = create_rw_signal::<Vec<RuntimeInfo>>(vec![]);
+    let runtime_environment = create_rw_signal(None::<RuntimeSlot>);
+    let runtime_object_states =
+        create_rw_signal::<HashMap<String, RuntimeObjectState>>(HashMap::new());
     create_effect(move |_| {
         let Some(mode) = picker_mode.get() else {
             return;
@@ -1826,6 +2565,7 @@ fn App() -> impl IntoView {
                 let branchable =
                     active_branch_state.get().is_none() && !active_is_exploration.get();
                 let available = |name: &str| match name {
+                    "archive" => has_items && !active_is_exploration.get(),
                     "compact" => !acp,
                     "rewind" => !acp && has_items,
                     "fork" => !acp && branchable,
@@ -2070,7 +2810,7 @@ fn App() -> impl IntoView {
         }
     });
 
-    // The native shell publishes the result of its one-time Python setup after
+    // The native shell publishes optional local executable discovery after
     // the UI is already interactive. Keep the capabilities view in sync without
     // polling or delaying the first window.
     {
@@ -2095,8 +2835,10 @@ fn App() -> impl IntoView {
         attach_chat_autoscroll();
     });
 
-    // Wire the agent event stream once. Every event carries the session frame
-    // id; route transcript mutations to `items` (active session) or the
+    // Wire the agent event stream once, on this native window only. Process-level
+    // listen() still receives emit_to aimed at another project window, so two
+    // workspaces would share one live stream. Every event carries the session
+    // frame id; route transcript mutations to `items` (active session) or the
     // `transcripts` cache (background session) so parallel conversations don't
     // interleave in the view.
     let items_cb = items;
@@ -2140,7 +2882,12 @@ fn App() -> impl IntoView {
     };
     let pet_activity_cb = pet_activity;
     let status_cb = status;
-    let compaction_active_cb = compaction_active;
+    let compacting_sessions_cb = compacting_sessions;
+    let compact_dialog_cb = compact_dialog;
+    let compact_busy_cb = compact_busy;
+    let compact_error_cb = compact_error;
+    let model_view_cb = model_view;
+    let context_view_items_cb = context_view_items;
     let locale_cb = locale;
     let models_cb = models;
     let session_models_cb = session_model_ids;
@@ -2151,30 +2898,25 @@ fn App() -> impl IntoView {
     let show_right_cb = show_right;
     let mcp_apps_cb = mcp_apps;
     let show_mcp_app = Callback::new(
-        move |(frame_id, presentation_id, payload, replace): (
-            String,
-            String,
-            serde_json::Value,
-            bool,
-        )| {
-            let instance_id = mcp_app_instance_id(&frame_id, &presentation_id, &payload);
+        move |(frame_id, payload, replace): (String, serde_json::Value, bool)| {
+            let instance_id = mcp_app_instance_id(&frame_id, &payload);
             if !replace && mcp_apps_cb.with_untracked(|apps| apps.contains_key(&instance_id)) {
                 return;
             }
             let Ok(payload_json) = serde_json::to_string(&payload) else {
                 return;
             };
-            let tab = CenterFileTab::new(
-                instance_id.clone(),
-                mcp_app_title(&payload),
-                "mcp_app".into(),
-            );
+            let title = mcp_app_title(&payload);
             mcp_apps_cb.update(|apps| {
                 apps.insert(instance_id.clone(), payload_json);
             });
             center_files_cb.update(|files| {
                 if !files.iter().any(|file| file.path == instance_id) {
-                    files.push(tab);
+                    files.push(CenterFileTab::new(
+                        instance_id.clone(),
+                        title,
+                        "mcp_app".into(),
+                    ));
                 }
             });
             center_file_cb.set(Some(instance_id));
@@ -2225,6 +2967,11 @@ fn App() -> impl IntoView {
                             branches.insert(id.clone(), page.branches.clone());
                         });
                         active_branch_state.set(page.branch_state.clone());
+                        if page.archived {
+                            archived_sessions.update(|s| {
+                                s.insert(id.clone());
+                            });
+                        }
                         let mut chats = page
                             .items
                             .into_iter()
@@ -2232,6 +2979,11 @@ fn App() -> impl IntoView {
                             .collect::<Vec<_>>();
                         settle_question_cards(&mut chats);
                         items.set(chats);
+                        context_epochs.set(page.context_epochs);
+                        head_epoch.set(page.head_epoch);
+                        in_context_from_user_index.set(page.in_context_from_user_index);
+                        model_view.set(false);
+                        context_view_items.set(Vec::new());
                     }
                     refresh_session_history();
                 }
@@ -2245,6 +2997,7 @@ fn App() -> impl IntoView {
     let cb_buf = delta_buf.clone();
     let cb_scheduled = flush_scheduled.clone();
     let cb = Closure::wrap(Box::new(move |payload: JsValue| {
+        note_transcript_event(&payload, transcript_event_revisions);
         let ev: AgentEvent = match serde_wasm_bindgen::from_value(payload) {
             Ok(e) => e,
             Err(err) => {
@@ -2285,9 +3038,9 @@ fn App() -> impl IntoView {
             }
         };
         let finish_compaction = |frame_id: &str| {
-            if active_cb.get_untracked().as_deref() == Some(frame_id) {
-                compaction_active_cb.set(false);
-            }
+            compacting_sessions_cb.update(|sessions| {
+                sessions.remove(frame_id);
+            });
         };
         let refresh_transcript_projections = |frame_id: &str| {
             if active_cb.get_untracked().as_deref() == Some(frame_id) {
@@ -2314,11 +3067,15 @@ fn App() -> impl IntoView {
         };
         match ev {
             AgentEvent::CompactionStarted { frame_id, .. } => {
-                if active_cb.get_untracked().as_deref() == Some(frame_id.as_str()) {
-                    compaction_active_cb.set(true);
-                }
+                compacting_sessions_cb.update(|sessions| {
+                    sessions.insert(frame_id);
+                });
             }
-            AgentEvent::User { frame_id, text } => {
+            AgentEvent::User {
+                frame_id,
+                text,
+                queue_id,
+            } => {
                 dismiss_follow_up_questions(follow_up_questions, follow_up_generation, &frame_id);
                 // The banner judges the answer on screen; a new turn has none yet.
                 set_browser_offline_notice(browser_offline_cb, &frame_id, None);
@@ -2337,8 +3094,13 @@ fn App() -> impl IntoView {
                     &session_models_cb.get_untracked(),
                     Some(&frame_id),
                 );
+                if let Some(id) = queue_id {
+                    queue_states.update(|states| {
+                        states.remove(&(frame_id.clone(), id));
+                    });
+                }
                 route_items(active_cb, items_cb, transcripts_cb, &frame_id, |v| {
-                    start_user_turn(v, text, model.clone());
+                    start_user_turn(v, text, model.clone(), queue_id);
                 });
                 conversation_outlines_cb.update(|outlines| {
                     let outline = outlines.entry(frame_id.clone()).or_default();
@@ -2591,14 +3353,40 @@ fn App() -> impl IntoView {
                         }
                     });
                 }
+                // A delegated batch continues after the parent tool call returns,
+                // while a registered Workflow launch leaves an approval draft in
+                // the same conversation. Surface either state immediately instead
+                // of making the user discover the Agents panel manually.
+                if matches!(name.as_str(), "delegate_tasks" | "start_workflow")
+                    && ok
+                    && active_cb.get_untracked().as_deref() == Some(frame_id.as_str())
+                {
+                    ensure_right_tab(RightTab::Agents, show_right, open_right_tabs, right_tab);
+                    refresh_agent_workflows(agent_panel);
+                }
                 refresh_transcript_projections(&frame_id);
                 if active_cb.get_untracked().as_deref() == Some(frame_id.as_str()) {
                     schedule_chat_follow();
                 }
+                // A finished python/r cell changed interpreter state. Refresh
+                // the runtime status chips and, when the memory environment
+                // for that language is open, re-inspect it so the variable
+                // table follows the agent without a manual sync click.
+                if matches!(name.as_str(), "python" | "r")
+                    && active_cb.get_untracked().as_deref() == Some(frame_id.as_str())
+                {
+                    refresh_runtime_environment_after_tool(
+                        name.clone(),
+                        runtime_environment,
+                        runtime_object_states,
+                        runtime_infos,
+                        locale,
+                    );
+                }
             }
             AgentEvent::ToolPresentation {
                 frame_id,
-                presentation_id,
+                presentation_id: _,
                 presentation_kind,
                 payload,
             } => {
@@ -2621,7 +3409,31 @@ fn App() -> impl IntoView {
                 } else if presentation_kind == "mcp_app"
                     && active_cb.get_untracked().as_deref() == Some(frame_id.as_str())
                 {
-                    show_mcp_app.call((frame_id, presentation_id, payload, true));
+                    show_mcp_app.call((frame_id, payload, true));
+                }
+            }
+            AgentEvent::AppContextUpdate {
+                frame_id,
+                context_id,
+                app_name,
+                state,
+                summary,
+                structured_preview,
+                ..
+            } => {
+                if active_cb.get_untracked().as_deref() != Some(frame_id.as_str()) {
+                    return;
+                }
+                if state == "cleared" {
+                    mcp_app_context.set(None);
+                } else {
+                    mcp_app_context.set(Some(AppContextNotice {
+                        context_id,
+                        app_name,
+                        state,
+                        summary,
+                        structured_preview,
+                    }));
                 }
             }
             AgentEvent::Usage {
@@ -2658,33 +3470,53 @@ fn App() -> impl IntoView {
                 before,
                 after,
                 strategy,
+                epoch,
             } => {
                 finish_compaction(&frame_id);
                 let auto_continue = strategy == "auto_continue";
+                let manual_compaction = strategy == "manual";
                 route_items(active_cb, items_cb, transcripts_cb, &frame_id, |items| {
-                    items.push(ChatItem::Compaction {
-                        before,
-                        after,
-                        strategy,
-                    });
+                    items.push(ChatItem::compaction(before, after, strategy, epoch));
                 });
+                refresh_transcript_projections(&frame_id);
+                if !auto_continue && epoch.is_some() {
+                    let reveal_manual_context = manual_compaction
+                        && compact_dialog_cb.get_untracked().as_deref() == Some(frame_id.as_str())
+                        && active_cb.get_untracked().as_deref() == Some(frame_id.as_str());
+                    if reveal_manual_context {
+                        // A completed manual compaction should immediately
+                        // reveal the exact model context that will be used.
+                        // The epoch refresh below reloads the checkpoint and
+                        // retained tail before the user continues typing.
+                        model_view_cb.set(true);
+                        context_view_items_cb.set(Vec::new());
+                        context_view_live_from.set(None);
+                    }
+                    refresh_context_state.call(frame_id.clone());
+                }
+                if manual_compaction
+                    && compact_dialog_cb.get_untracked().as_deref() == Some(frame_id.as_str())
+                {
+                    compact_busy_cb.set(true);
+                    compact_error_cb.set(None);
+                }
                 if active_cb.get().as_deref() == Some(&frame_id) {
                     let before = before.to_string();
                     let after = after.to_string();
-                    status_cb.set(if auto_continue {
-                        tf(
+                    if auto_continue {
+                        status_cb.set(tf(
                             locale_cb.get(),
                             "chat.auto_continued",
                             &[("count", before.as_str()), ("limit", after.as_str())],
-                        )
-                    } else {
-                        tf(
-                            locale_cb.get(),
-                            "status.compact",
-                            &[("before", before.as_str()), ("after", after.as_str())],
-                        )
-                    });
+                        ));
+                    }
                 }
+            }
+            AgentEvent::CompactionUndone { frame_id, epoch } => {
+                route_items(active_cb, items_cb, transcripts_cb, &frame_id, |items| {
+                    apply_compaction_undone(items, epoch);
+                });
+                refresh_context_state.call(frame_id);
             }
             AgentEvent::ContextWarning {
                 frame_id,
@@ -2713,7 +3545,15 @@ fn App() -> impl IntoView {
                 stop_reason,
             } => {
                 finish_compaction(&frame_id);
+                if stop_reason.as_deref() == Some("compact")
+                    && compact_dialog_cb.get_untracked().as_deref() == Some(frame_id.as_str())
+                {
+                    compact_dialog_cb.set(None);
+                    compact_busy_cb.set(false);
+                    compact_error_cb.set(None);
+                }
                 flush_now();
+                refresh_context_state.call(frame_id.clone());
                 conversation_outlines_cb.update(|outlines| {
                     if let Some(entry) = outlines
                         .get_mut(&frame_id)
@@ -2751,7 +3591,7 @@ fn App() -> impl IntoView {
                     items.drain(..first_item);
                     page.next_before_seq = Some(before_seq);
                     page.user_offset = user_offset;
-                    page.loading = false;
+                    page.loading_request = None;
                     page.window_user_start = usize::MAX;
                     trimmed = true;
                 });
@@ -2833,6 +3673,7 @@ fn App() -> impl IntoView {
             AgentEvent::Error { frame_id, message } => {
                 finish_compaction(&frame_id);
                 flush_now();
+                refresh_context_state.call(frame_id.clone());
                 conversation_outlines_cb.update(|outlines| {
                     if let Some(entry) = outlines
                         .get_mut(&frame_id)
@@ -2868,6 +3709,13 @@ fn App() -> impl IntoView {
                     // /compact + resume path. Do not offer an action that
                     // cannot preserve its opaque session state.
                     && active_acp_agent_id.get_untracked().is_none();
+                if compact_dialog_cb.get_untracked().as_deref() == Some(frame_id.as_str())
+                    && compact_busy_cb.get_untracked()
+                {
+                    compact_busy_cb.set(false);
+                    compact_error_cb
+                        .set(Some(localize_backend(locale_cb.get_untracked(), &message)));
+                }
                 if !rolled_back {
                     let model = session_model_label(
                         &models_cb.get_untracked(),
@@ -3053,9 +3901,53 @@ fn App() -> impl IntoView {
     let agent_js = cb.as_ref().unchecked_ref::<js_sys::Function>().clone();
     std::mem::forget(cb);
     // wasm-bindgen only runs an async extern's JS body when the returned
-    // future is polled, so we must await `listen` (not fire-and-forget it).
+    // future is polled, so we must await `listen_current_window`.
     spawn_local(async move {
-        let _ = listen("agent", &agent_js).await;
+        let _ = listen_current_window("agent", &agent_js).await;
+    });
+
+    // Queue lifecycle is keyed by the backend id. This closes the gap where
+    // the optimistic row and the real User event have the same text but are
+    // different messages (for example, different attachments).
+    let queue_state_cb = Closure::wrap(Box::new(move |payload: JsValue| {
+        let Ok(event) = serde_wasm_bindgen::from_value::<QueuedTurnStateEvent>(payload) else {
+            return;
+        };
+        queue_states.update(|states| match event.state.as_str() {
+            "queued" | "cutin_pending" => {
+                states.insert((event.session_id.clone(), event.id), event.state.clone());
+            }
+            _ => {
+                states.remove(&(event.session_id.clone(), event.id));
+            }
+        });
+        if matches!(
+            event.state.as_str(),
+            "started" | "cancelled" | "superseded" | "failed"
+        ) {
+            route_items(
+                active_session,
+                items,
+                transcripts,
+                &event.session_id,
+                |rows| {
+                    rows.retain(
+                        |row| !matches!(row, ChatItem::QueuedUser { id, .. } if *id == event.id),
+                    );
+                },
+            );
+            transcript_projection_epoch.update(|revision| {
+                *revision = revision.wrapping_add(1);
+            });
+        }
+    }) as Box<dyn FnMut(JsValue)>);
+    let queue_state_js = queue_state_cb
+        .as_ref()
+        .unchecked_ref::<js_sys::Function>()
+        .clone();
+    queue_state_cb.forget();
+    spawn_local(async move {
+        let _ = listen_current_window("queued-turn-state", &queue_state_js).await;
     });
 
     // Confirm handler: render an inline approval card in the session thread
@@ -3065,6 +3957,7 @@ fn App() -> impl IntoView {
     let confirm_transcripts = transcripts;
     let confirm_pending = approval_pending;
     let confirm_cb = Closure::wrap(Box::new(move |payload: JsValue| {
+        note_transcript_event(&payload, transcript_event_revisions);
         if let Ok(v) = serde_wasm_bindgen::from_value::<serde_json::Value>(payload) {
             let msg = v
                 .get("message")
@@ -3078,6 +3971,11 @@ fn App() -> impl IntoView {
                 .to_string();
             if msg.is_empty() || fid.is_empty() {
                 return;
+            }
+            if let Some(id) = v.get("approval_id").and_then(|value| value.as_str()) {
+                native_approval_ids.update(|all| {
+                    all.insert(fid.clone(), id.to_string());
+                });
             }
             let mut tool = v
                 .get("tool")
@@ -3128,12 +4026,132 @@ fn App() -> impl IntoView {
         .clone();
     std::mem::forget(confirm_cb);
     spawn_local(async move {
-        let _ = listen("confirm-request", &confirm_js).await;
+        let _ = listen_current_window("confirm-request", &confirm_js).await;
+    });
+
+    let confirm_resolved = Closure::wrap(Box::new(move |payload: JsValue| {
+        note_transcript_event(&payload, transcript_event_revisions);
+        let Ok(request) = serde_wasm_bindgen::from_value::<PendingToolApproval>(payload) else {
+            return;
+        };
+        if native_approval_ids
+            .with_untracked(|all| all.get(&request.frame_id) == Some(&request.approval_id))
+        {
+            native_approval_ids.update(|all| {
+                all.remove(&request.frame_id);
+            });
+            approval_pending.update(|all| {
+                all.remove(&request.frame_id);
+            });
+            route_items(
+                active_session,
+                items,
+                transcripts,
+                &request.frame_id,
+                |rows| {
+                    rows.retain(|row| !matches!(row, ChatItem::ApprovalPending { .. }));
+                },
+            );
+        }
+    }) as Box<dyn FnMut(JsValue)>);
+    let confirm_resolved_js = confirm_resolved
+        .as_ref()
+        .unchecked_ref::<js_sys::Function>()
+        .clone();
+    confirm_resolved.forget();
+    spawn_local(async move {
+        let _ = listen_current_window("confirm-resolved", &confirm_resolved_js).await;
+    });
+
+    let browser_cleanup_pending = browser_tab_cleanup;
+    let browser_cleanup_queue = browser_tab_cleanup_queue;
+    let browser_cleanup_selected = browser_tab_cleanup_selected;
+    let browser_cleanup_error = browser_tab_cleanup_error;
+    let browser_cleanup_cb = Closure::wrap(Box::new(move |payload: JsValue| {
+        if let Ok(prompt) = serde_wasm_bindgen::from_value::<BrowserTabCleanupPrompt>(payload) {
+            present_browser_tab_cleanup(
+                browser_cleanup_pending,
+                browser_cleanup_queue,
+                browser_cleanup_selected,
+                browser_cleanup_error,
+                prompt,
+            );
+        }
+    }) as Box<dyn FnMut(JsValue)>);
+    let browser_cleanup_js = browser_cleanup_cb
+        .as_ref()
+        .unchecked_ref::<js_sys::Function>()
+        .clone();
+    std::mem::forget(browser_cleanup_cb);
+    spawn_local(async move {
+        let _ = listen_current_window("browser-tab-cleanup", &browser_cleanup_js).await;
+    });
+    let browser_human_pending = browser_needs_human;
+    let browser_human_error = browser_needs_human_error;
+    let browser_human_cb = Closure::wrap(Box::new(move |payload: JsValue| {
+        if let Ok(prompt) = serde_wasm_bindgen::from_value::<BrowserNeedsHumanPrompt>(payload) {
+            present_browser_needs_human(browser_human_pending, browser_human_error, prompt);
+        }
+    }) as Box<dyn FnMut(JsValue)>);
+    let browser_human_js = browser_human_cb
+        .as_ref()
+        .unchecked_ref::<js_sys::Function>()
+        .clone();
+    std::mem::forget(browser_human_cb);
+    spawn_local(async move {
+        let _ = listen_current_window("browser-needs-human", &browser_human_js).await;
+    });
+    let browser_project = create_memo(move |_| project_info.get().map(|project| project.id));
+    create_effect(move |_| {
+        let project_id = browser_project.get();
+        browser_tab_cleanup.set(None);
+        browser_tab_cleanup_queue.set(Vec::new());
+        browser_tab_cleanup_selected.set(HashSet::new());
+        browser_tab_cleanup_error.set(None);
+        browser_tab_cleanup_busy.set(false);
+        browser_needs_human.set(None);
+        browser_needs_human_error.set(None);
+        browser_needs_human_busy.set(false);
+        let Some(project_id) = project_id else { return };
+        spawn_local(async move {
+            if let Ok(value) =
+                invoke_checked("list_pending_browser_tab_cleanups", JsValue::UNDEFINED).await
+            {
+                if browser_project.get_untracked().as_ref() != Some(&project_id) {
+                    return;
+                }
+                if let Ok(prompts) =
+                    serde_wasm_bindgen::from_value::<Vec<BrowserTabCleanupPrompt>>(value)
+                {
+                    for prompt in prompts {
+                        present_browser_tab_cleanup(
+                            browser_cleanup_pending,
+                            browser_cleanup_queue,
+                            browser_cleanup_selected,
+                            browser_cleanup_error,
+                            prompt,
+                        );
+                    }
+                }
+            }
+            if let Ok(value) =
+                invoke_checked("list_pending_browser_needs_human", JsValue::UNDEFINED).await
+            {
+                if browser_project.get_untracked().as_ref() != Some(&project_id) {
+                    return;
+                }
+                if let Ok(prompt) = serde_wasm_bindgen::from_value::<BrowserNeedsHumanPrompt>(value)
+                {
+                    present_browser_needs_human(browser_human_pending, browser_human_error, prompt);
+                }
+            }
+        });
     });
     let acp_permission_items = items;
     let acp_permission_active = active_session;
     let acp_permission_transcripts = transcripts;
     let acp_permission_cb = Closure::wrap(Box::new(move |payload: JsValue| {
+        note_transcript_event(&payload, transcript_event_revisions);
         let Ok(request) = serde_wasm_bindgen::from_value::<AcpPermissionRequest>(payload) else {
             return;
         };
@@ -3173,11 +4191,12 @@ fn App() -> impl IntoView {
         .clone();
     acp_permission_cb.forget();
     spawn_local(async move {
-        let _ = listen("permission-request", &acp_permission_js).await;
+        let _ = listen_current_window("permission-request", &acp_permission_js).await;
     });
 
     let acp_update_buf = delta_buf.clone();
     let acp_update_cb = Closure::wrap(Box::new(move |payload: JsValue| {
+        note_transcript_event(&payload, transcript_event_revisions);
         let Ok(update) = serde_wasm_bindgen::from_value::<AcpSessionUpdate>(payload) else {
             return;
         };
@@ -3280,7 +4299,7 @@ fn App() -> impl IntoView {
         .clone();
     acp_update_cb.forget();
     spawn_local(async move {
-        let _ = listen("acp-session-update", &acp_update_js).await;
+        let _ = listen_current_window("acp-session-update", &acp_update_js).await;
     });
 
     let project_transfer_cb = Closure::wrap(Box::new(move |payload: JsValue| {
@@ -3320,10 +4339,11 @@ fn App() -> impl IntoView {
         .clone();
     acp_state_cb.forget();
     spawn_local(async move {
-        let _ = listen("acp-session-state", &acp_state_js).await;
+        let _ = listen_current_window("acp-session-state", &acp_state_js).await;
     });
 
     let acp_resolved_cb = Closure::wrap(Box::new(move |payload: JsValue| {
+        note_transcript_event(&payload, transcript_event_revisions);
         let Ok(resolved) = serde_wasm_bindgen::from_value::<AcpPermissionResolved>(payload) else {
             return;
         };
@@ -3346,13 +4366,14 @@ fn App() -> impl IntoView {
         .clone();
     acp_resolved_cb.forget();
     spawn_local(async move {
-        let _ = listen("permission-resolved", &acp_resolved_js).await;
+        let _ = listen_current_window("permission-resolved", &acp_resolved_js).await;
     });
 
     // ACP `ask_user`: the bridge parks the agent's question until the user
     // answers, so the card mirrors the permission flow — request event inserts
     // it, resolved event settles it.
     let ask_user_cb = Closure::wrap(Box::new(move |payload: JsValue| {
+        note_transcript_event(&payload, transcript_event_revisions);
         let Ok(request) = serde_wasm_bindgen::from_value::<AskUserRequest>(payload) else {
             return;
         };
@@ -3378,10 +4399,11 @@ fn App() -> impl IntoView {
         .clone();
     ask_user_cb.forget();
     spawn_local(async move {
-        let _ = listen("ask-user-request", &ask_user_js).await;
+        let _ = listen_current_window("ask-user-request", &ask_user_js).await;
     });
 
     let ask_resolved_cb = Closure::wrap(Box::new(move |payload: JsValue| {
+        note_transcript_event(&payload, transcript_event_revisions);
         let Ok(resolved) = serde_wasm_bindgen::from_value::<AskUserResolved>(payload) else {
             return;
         };
@@ -3411,10 +4433,10 @@ fn App() -> impl IntoView {
         .clone();
     ask_resolved_cb.forget();
     spawn_local(async move {
-        let _ = listen("ask-user-resolved", &ask_resolved_js).await;
+        let _ = listen_current_window("ask-user-resolved", &ask_resolved_js).await;
     });
 
-    let stop = move |_| {
+    let stop = Callback::new(move |(): ()| {
         if stopping_session.get().is_some() {
             return;
         }
@@ -3438,7 +4460,7 @@ fn App() -> impl IntoView {
                 }
             }
         });
-    };
+    });
 
     let send = Callback::new(move |action: ComposerSendAction| {
         if demo_mode.get_untracked() {
@@ -3455,6 +4477,7 @@ fn App() -> impl IntoView {
         }
         let message = input.get();
         let saved_attachments = attachments.get();
+        let saved_mcp_app_context = mcp_app_context.get();
         let refs = composer_references.get();
         let quotes = composer_quotes.get();
         let paths = attachment_paths(&saved_attachments);
@@ -3471,7 +4494,7 @@ fn App() -> impl IntoView {
         );
         let reference_args = refs
             .iter()
-            .map(ComposerReferenceChip::arg)
+            .filter_map(ComposerReferenceChip::arg)
             .collect::<Vec<_>>();
         // An @-referenced server turns itself on for the session backend-side;
         // re-read the enabled set afterwards so the sidebar toggles agree.
@@ -3483,12 +4506,35 @@ fn App() -> impl IntoView {
         });
         if message.trim().is_empty()
             && paths.is_empty()
-            && reference_args.is_empty()
+            && refs.is_empty()
             && quotes.is_empty()
+            && saved_mcp_app_context.is_none()
         {
             return;
         }
         let active = active_session.get();
+        let creates_session = active.is_none();
+        if action == ComposerSendAction::Normal {
+            if let Some((question_session, question_index, _)) =
+                native_question_draft.get_untracked()
+            {
+                if active.as_deref() == Some(question_session.as_str()) {
+                    route_items(
+                        active_session,
+                        items,
+                        transcripts,
+                        &question_session,
+                        |rows| {
+                            if let Some(ChatItem::Question(card)) = rows.get_mut(question_index) {
+                                card.state = QuestionState::Answered;
+                            }
+                        },
+                    );
+                    native_question_draft.set(None);
+                }
+            }
+        }
+        let pending_fast = pending_service_tier.get();
         // Any prior send-failed hint (e.g. the max_tokens truncation notice) is
         // stale once a new turn is committed; the Ok path never cleared it, so it
         // lingered forever. Clear it here so continuing the conversation dismisses it.
@@ -3531,6 +4577,8 @@ fn App() -> impl IntoView {
             queue_seq.set(qid);
             input.set(String::new());
             attachments.set(vec![]);
+            mcp_app_context.set(None);
+            motif_selection.set(None);
             composer_references.set(vec![]);
             composer_quotes.set(vec![]);
             picker_mode.set(None);
@@ -3539,6 +4587,9 @@ fn App() -> impl IntoView {
                     id: qid,
                     text: display_message.clone(),
                 });
+            });
+            queue_states.update(|states| {
+                states.insert((session.clone(), qid), "queued".into());
             });
             transcript_projection_epoch.update(|revision| {
                 *revision = revision.wrapping_add(1);
@@ -3555,8 +4606,14 @@ fn App() -> impl IntoView {
                 })
                 .unwrap();
                 if let Err(error) = invoke_checked("enqueue_turn", args).await {
+                    mcp_app_context.set(saved_mcp_app_context.clone());
+                    queue_states.update(|states| {
+                        states.remove(&(session.clone(), qid));
+                    });
                     route_items(active_session, items, transcripts, &session, |rows| {
-                        remove_optimistic_send_rows(rows, &enqueue_msg);
+                        rows.retain(
+                            |row| !matches!(row, ChatItem::QueuedUser { id, .. } if *id == qid),
+                        );
                     });
                     transcript_projection_epoch.update(|revision| {
                         *revision = revision.wrapping_add(1);
@@ -3579,6 +4636,8 @@ fn App() -> impl IntoView {
         };
         input.set(String::new());
         attachments.set(vec![]);
+        mcp_app_context.set(None);
+        motif_selection.set(None);
         composer_references.set(vec![]);
         composer_quotes.set(vec![]);
         picker_mode.set(None);
@@ -3597,6 +4656,7 @@ fn App() -> impl IntoView {
                     Err(error) => {
                         input.set(message);
                         attachments.set(saved_attachments);
+                        mcp_app_context.set(saved_mcp_app_context.clone());
                         composer_references.set(refs);
                         composer_quotes.set(quotes);
                         feedback_context.set(attached_feedback.clone());
@@ -3612,6 +4672,7 @@ fn App() -> impl IntoView {
                     Err(error) => {
                         input.set(message);
                         attachments.set(saved_attachments);
+                        mcp_app_context.set(saved_mcp_app_context.clone());
                         composer_references.set(refs);
                         composer_quotes.set(quotes);
                         feedback_context.set(attached_feedback.clone());
@@ -3620,6 +4681,35 @@ fn App() -> impl IntoView {
                     }
                 }
             };
+            if creates_session && agent_id.is_none() {
+                if let Some(service_tier) = pending_fast.clone() {
+                    let args = to_value(&serde_json::json!({
+                        "sessionId": id.clone(),
+                        "serviceTier": service_tier.clone(),
+                    }))
+                    .unwrap();
+                    if let Err(error) = invoke_checked("set_session_service_tier", args).await {
+                        active_session.set(Some(id.clone()));
+                        input.set(message);
+                        attachments.set(saved_attachments);
+                        composer_references.set(refs);
+                        composer_quotes.set(quotes);
+                        feedback_context.set(attached_feedback.clone());
+                        status.set(send_failed(locale.get(), &js_error_text(error)));
+                        refresh_session_history();
+                        return;
+                    }
+                    session_service_tiers.update(|values| {
+                        values.insert(id.clone(), Some(service_tier));
+                    });
+                }
+                pending_service_tier.set(None);
+            }
+            // Keep the selection even if ACP startup fails before its binding
+            // exists. The new frame id was not available in the model picker.
+            if let Some(agent_id) = &agent_id {
+                provisional_acp_selection.set(Some((id.clone(), agent_id.clone())));
+            }
             // Mark the turn pending before touching active_session so the
             // session→ACP lookup effect does not clear a just-selected agent
             // while send_message is still binding a newly activated session.
@@ -3659,14 +4749,7 @@ fn App() -> impl IntoView {
                 *revision = revision.wrapping_add(1);
             });
             force_chat_bottom();
-            // Await the stop before send_message so the running turn is already
-            // flagged for cancellation; send_message then blocks on the session's
-            // workflow lock and starts as soon as the old turn aborts. Firing the
-            // stop concurrently could cancel the new turn instead.
-            if action == ComposerSendAction::InterruptReplace {
-                let arg = to_value(&tauri_args::stop_agent(&Some(id.clone()))).unwrap();
-                let _ = invoke("stop_agent", arg).await;
-            }
+            // The backend reserves replacement priority before cancelling.
             // Persist/emit the same display text the optimistic bubble uses
             // (including "Uploaded files: …"). Sending the bare composer body
             // makes AgentEvent::User mismatch the optimistic row and append a
@@ -3842,6 +4925,25 @@ fn App() -> impl IntoView {
     };
 
     let on_send = move |ev: web_sys::KeyboardEvent| {
+        if (ev.ctrl_key() || ev.meta_key())
+            && !ev.alt_key()
+            && !ev.shift_key()
+            && ev.key().eq_ignore_ascii_case("v")
+            && !ev.repeat()
+            && !uploading.get_untracked()
+        {
+            let session = active_session.get_untracked();
+            spawn_local(async move {
+                match bindings::clipboard_file_paths(JsValue::NULL).await {
+                    Ok(value) if active_session.get_untracked() == session => {
+                        attach_clipboard_paths(composer_references, value);
+                    }
+                    Err(error) => status.set(js_error_text(error)),
+                    _ => {}
+                }
+            });
+        }
+
         // While an IME is composing (e.g. Chinese pinyin), Enter confirms the
         // candidate, so let the IME handle every key and never send/navigate
         // mid-composition (#108; keyCode-229 quirk in ime_composing).
@@ -4121,7 +5223,7 @@ fn App() -> impl IntoView {
                                 Some(TranscriptPageState {
                                     next_before_seq: page.next_before_seq,
                                     user_offset: page.user_offset,
-                                    loading: false,
+                                    loading_request: None,
                                     window_user_start: usize::MAX,
                                 }),
                             )
@@ -4160,9 +5262,11 @@ fn App() -> impl IntoView {
         if sid.is_empty() {
             return;
         }
-        let restore = matches!(op, QueueOp::Edit(_));
+        status.set(String::new());
+        let to_side_chat = matches!(op, QueueOp::SideChat(_));
+        let restore = matches!(op, QueueOp::Edit(_)) || to_side_chat;
         let (id, action, message): (u64, &'static str, Option<String>) = match op {
-            QueueOp::Cancel(id) | QueueOp::Edit(id) => {
+            QueueOp::Cancel(id) | QueueOp::Edit(id) | QueueOp::SideChat(id) => {
                 let mut draft = String::new();
                 route_items(active_session, items, transcripts, &sid, |rows| {
                     if restore {
@@ -4176,10 +5280,15 @@ fn App() -> impl IntoView {
                         |it| !matches!(it, ChatItem::QueuedUser { id: qid, .. } if *qid == id),
                     );
                 });
-                if restore {
+                if to_side_chat {
+                    send_side_chat((draft, vec![], false));
+                } else if restore {
                     input.set(draft);
                     focus_composer();
                 }
+                queue_states.update(|states| {
+                    states.remove(&(sid.clone(), id));
+                });
                 (id, "cancel", None)
             }
             // The bubble stays; it promotes to a User row when the running turn
@@ -4209,6 +5318,27 @@ fn App() -> impl IntoView {
                 });
                 (id, if up { "move_up" } else { "move_down" }, None)
             }
+            // Interrupt & replace, from the row: jump the queue locally and
+            // server-side, then stop the running turn so the driver picks this
+            // one up next.
+            QueueOp::InterruptReplace(id) => {
+                route_items(active_session, items, transcripts, &sid, |rows| {
+                    let Some(i) = rows.iter().position(
+                        |it| matches!(it, ChatItem::QueuedUser { id: qid, .. } if *qid == id),
+                    ) else {
+                        return;
+                    };
+                    // Queued rows sit contiguously at the tail, so the first one
+                    // is the front of the queue.
+                    let front = rows
+                        .iter()
+                        .position(|it| matches!(it, ChatItem::QueuedUser { .. }))
+                        .unwrap_or(i);
+                    let item = rows.remove(i);
+                    rows.insert(front, item);
+                });
+                (id, "move_front", None)
+            }
         };
         if action != "cutin" {
             transcript_projection_epoch.update(|revision| {
@@ -4217,13 +5347,30 @@ fn App() -> impl IntoView {
         }
         spawn_local(async move {
             let args = to_value(&QueuedTurnActionArgs {
-                session_id: sid,
+                session_id: sid.clone(),
                 id,
                 action,
                 message,
             })
             .unwrap();
-            let _ = invoke("queued_turn_action", args).await;
+            match invoke_checked("queued_turn_action", args).await {
+                // The stop follows the reorder: the freed session must find this
+                // item already at the front of the queue.
+                Ok(_) => {
+                    if action == "move_front" {
+                        stop.call(());
+                    }
+                }
+                Err(error) => {
+                    if active_session.get_untracked().as_deref() == Some(sid.as_str()) {
+                        status.set(tf(
+                            locale.get(),
+                            "queue.action_failed",
+                            &[("error", &js_error_text(error))],
+                        ));
+                    }
+                }
+            }
         });
     });
     let composer_queue_offset = Signal::derive(move || {
@@ -4322,7 +5469,7 @@ fn App() -> impl IntoView {
                                         TranscriptPageState {
                                             next_before_seq: page.next_before_seq,
                                             user_offset: page.user_offset,
-                                            loading: false,
+                                            loading_request: None,
                                             window_user_start: usize::MAX,
                                         },
                                     );
@@ -4361,77 +5508,33 @@ fn App() -> impl IntoView {
     };
 
     let compact_context_recovery = Callback::new(move |id: String| {
-        if context_recovery_busy.get_untracked() {
+        if context_recovery_busy.get_untracked() || compact_busy.get_untracked() {
             return;
         }
-        context_recovery_busy.set(true);
+        context_recovery_dialog.set(None);
         context_recovery_error.set(None);
-        spawn_local(async move {
-            let compact = to_value(&SendMessageArgs {
-                session_id: Some(id.clone()),
-                message: "/compact".into(),
-                attachments: vec![],
-                references: vec![],
-                resume: false,
-                acp_agent_id: None,
-                guide: None,
-                replace: None,
-            })
-            .unwrap();
-            if let Err(error) = invoke_checked("send_message", compact).await {
-                let message = localize_backend(locale.get_untracked(), &js_error_text(error));
-                context_recovery_error.set(Some(message));
-                context_recovery_busy.set(false);
-                return;
-            }
+        compact_resume.set(Some(id.clone()));
+        open_compact_dialog.call((id, String::new(), CompactDialogMode::Semantic));
+    });
 
-            // /compact rewrites only the model context. The existing error row
-            // stays in the visual transcript until we remove it here; the
-            // completed tool rows remain and Resume continues after them.
-            if active_session.get_untracked().as_deref() == Some(id.as_str()) {
-                let model = session_model_label(
-                    &models.get_untracked(),
-                    &session_model_ids.get_untracked(),
-                    Some(&id),
-                );
-                items.update(|rows| {
-                    if let Some(index) = rows.iter().rposition(is_error_assistant) {
-                        rows.remove(index);
-                    }
-                    ensure_streaming_assistant(rows, model);
-                });
-            }
-            context_recovery_dialog.set(None);
-            context_recovery_error.set(None);
-            begin_pending_turn(pending_turns, running, &id);
-            force_chat_bottom();
-
-            let resume = to_value(&SendMessageArgs {
-                session_id: Some(id.clone()),
-                message: String::new(),
-                attachments: vec![],
-                references: vec![],
-                resume: true,
-                acp_agent_id: None,
-                guide: None,
-                replace: None,
-            })
-            .unwrap();
-            if let Err(error) = invoke_checked("send_message", resume).await {
-                let raw = js_error_text(error);
-                if raw.contains(NO_API_KEY_MARK) {
-                    needs_api_key.set(true);
-                }
-                status.set(tf(
-                    locale.get_untracked(),
-                    "status.send_failed",
-                    &[("msg", &localize_backend(locale.get_untracked(), &raw))],
-                ));
-            }
-            finish_pending_turn(pending_turns, running, &id);
-            context_recovery_busy.set(false);
-            refresh_session_history();
-        });
+    // The guided dialog only rewrites the model context. A compaction that
+    // started from the recovery offer closes the dialog on its Done event with
+    // the flag still set, and continues the interrupted turn from there.
+    create_effect(move |_| {
+        if compact_dialog.get().is_some() {
+            return;
+        }
+        let Some(id) = compact_resume.get() else {
+            return;
+        };
+        compact_resume.set(None);
+        if active_session.get_untracked().as_deref() != Some(id.as_str()) {
+            return;
+        }
+        if let Some(index) = items.with_untracked(|rows| rows.iter().rposition(is_error_assistant))
+        {
+            resume_turn(index);
+        }
     });
 
     let new_session_context_recovery = Callback::new(move |source_id: String| {
@@ -4535,24 +5638,56 @@ fn App() -> impl IntoView {
     };
 
     let on_drag_over = move |ev: web_sys::DragEvent| {
+        let Some(dt) = ev.data_transfer() else {
+            return;
+        };
+        if !has_drag_type(&dt, WORKSPACE_PATH_DRAG_TYPE) && !has_drag_type(&dt, "Files") {
+            return;
+        }
         ev.prevent_default();
-        if !uploading.get() {
+        ev.stop_propagation();
+        if !demo_mode.get() && !composer_scope_locked.get() && !uploading.get() {
+            dt.set_drop_effect("copy");
             drag_over.set(true);
         }
     };
 
     let on_drag_leave = move |ev: web_sys::DragEvent| {
-        ev.prevent_default();
+        if let (Some(target), Some(related)) = (ev.current_target(), ev.related_target()) {
+            if let (Some(target), Some(related)) = (
+                target.dyn_ref::<web_sys::Node>(),
+                related.dyn_ref::<web_sys::Node>(),
+            ) {
+                if target.contains(Some(related)) {
+                    return;
+                }
+            }
+        }
         drag_over.set(false);
     };
 
     let on_drop = move |ev: web_sys::DragEvent| {
         ev.prevent_default();
+        ev.stop_propagation();
         drag_over.set(false);
-        if uploading.get() {
+        if demo_mode.get() || composer_scope_locked.get() || uploading.get() {
             return;
         }
         if let Some(dt) = ev.data_transfer() {
+            if has_drag_type(&dt, WORKSPACE_PATH_DRAG_TYPE) {
+                if let Ok(path) = dt.get_data(WORKSPACE_PATH_DRAG_TYPE) {
+                    if !path.trim().is_empty() {
+                        composer_references.update(|items| {
+                            let chip = ComposerReferenceChip::FilePath { path };
+                            if !items.iter().any(|item| item.key() == chip.key()) {
+                                items.push(chip);
+                            }
+                        });
+                        focus_composer();
+                    }
+                }
+                return;
+            }
             if let Some(files) = dt.files() {
                 queue_uploads(attachments, uploading, files.into());
             }
@@ -4564,13 +5699,52 @@ fn App() -> impl IntoView {
         if uploading.get() {
             return;
         }
-        let event: JsValue = ev.clone().into();
+        let event = bindings::clipboard_paste_snapshot(ev.clone().into());
         let count = pasted_image_count(event.clone());
-        if count == 0 {
+        if count == 0 && !bindings::paste_has_files(event.clone()) {
             return;
         }
         ev.prevent_default();
-        upload_from_paste(attachments, uploading, event, count);
+        let session = active_session.get_untracked();
+        uploading.set(true);
+        spawn_local(async move {
+            let result = bindings::clipboard_file_paths(event.clone()).await;
+            uploading.set(false);
+            if active_session.get_untracked() != session {
+                return;
+            }
+            match result {
+                Ok(value) => {
+                    let paths: Vec<String> =
+                        serde_wasm_bindgen::from_value(value).unwrap_or_default();
+                    if paths.is_empty() {
+                        if count > 0 {
+                            upload_from_paste(attachments, uploading, event, count);
+                        }
+                    } else {
+                        composer_references.update(|items| {
+                            for path in paths {
+                                let chip = ComposerReferenceChip::FilePath { path };
+                                if !items.iter().any(|item| item.key() == chip.key()) {
+                                    items.push(chip);
+                                }
+                            }
+                        });
+                    }
+                }
+                Err(error) => status.set(js_error_text(error)),
+            }
+        });
+    };
+
+    // The send slot holds one button: while a turn runs it is Stop, and it
+    // becomes Queue… only once there is something to queue.
+    let composer_has_draft = move || {
+        !input.get().trim().is_empty()
+            || !attachments.get().is_empty()
+            || !composer_references.get().is_empty()
+            || !composer_quotes.get().is_empty()
+            || mcp_app_context.get().is_some()
     };
 
     let composer_blocked = move || {
@@ -4653,7 +5827,7 @@ fn App() -> impl IntoView {
                             modal.set(Some(UpdateCheckModal::Failed {
                                 message: text,
                                 release_url: Some(
-                                    "https://github.com/xuzhougeng/wisp-science/releases".into(),
+                                    "https://github.com/Yu-Qiao-sjtu/wisp-science-depmap/releases".into(),
                                 ),
                             }));
                         }
@@ -4667,7 +5841,7 @@ fn App() -> impl IntoView {
                         modal.set(Some(UpdateCheckModal::Failed {
                             message: text,
                             release_url: Some(
-                                "https://github.com/xuzhougeng/wisp-science/releases".into(),
+                                "https://github.com/Yu-Qiao-sjtu/wisp-science-depmap/releases".into(),
                             ),
                         }));
                     }
@@ -4841,10 +6015,23 @@ fn App() -> impl IntoView {
             "plugins" => refresh_plugins(),
             "connections" => refresh_conns(),
             "credentials" => refresh_credentials(),
-            "permissions" => refresh_approval_grants(),
+            "permissions" => {
+                refresh_conns();
+                refresh_approval_grants();
+            }
             _ => {}
         }
     };
+    create_effect(move |_| {
+        if workflow_conversion.open_requested.get()
+            && workflow_conversion.belongs_to_current_project()
+        {
+            workflow_conversion.open_requested.set(false);
+            go_settings_section("workflows");
+            show_settings.set(true);
+            workflow_conversion.open.set(true);
+        }
+    });
 
     let open_settings_fn = move |section: Option<String>| {
         show_settings.set(true);
@@ -4949,6 +6136,8 @@ fn App() -> impl IntoView {
     let remove_specialist_fn = move |id: String| model_settings.remove_specialist(id);
 
     let start_new_session = Callback::new(move |_: ()| {
+        show_publication_workspace.set(false);
+        publication_binding_source.set(None);
         if demo_mode.get_untracked() {
             return;
         }
@@ -4984,24 +6173,11 @@ fn App() -> impl IntoView {
         let Some(id) = active_session.get_untracked() else {
             return;
         };
-        if busy.get_untracked() {
+        if busy.get_untracked() || active_acp_agent_id.get_untracked().is_some() {
             return;
         }
         context_usage_open.set(false);
-        spawn_local(async move {
-            let args = to_value(&SendMessageArgs {
-                session_id: Some(id),
-                message: "/compact".into(),
-                attachments: vec![],
-                references: vec![],
-                resume: false,
-                acp_agent_id: None,
-                guide: None,
-                replace: None,
-            })
-            .unwrap();
-            let _ = invoke_checked("send_message", args).await;
-        });
+        open_compact_dialog.call((id, String::new(), CompactDialogMode::Regular));
     });
     let new_session_from_usage = Callback::new(move |_: ()| {
         context_usage_open.set(false);
@@ -5252,6 +6428,10 @@ fn App() -> impl IntoView {
     );
 
     let load_session = Callback::new(move |id: String| {
+        transcript_page_error.set(None);
+        show_publication_workspace.set(false);
+        publication_binding_source.set(None);
+        show_research_graph.set(false);
         attachments.set(vec![]);
         sel_artifact.set(0);
         right_tab.set(RightTab::Artifacts);
@@ -5271,100 +6451,176 @@ fn App() -> impl IntoView {
             transcripts,
             running,
         );
-        let is_running = running.get().contains(&id);
         active_session.set(Some(id.clone()));
         active_branch_state.set(sessions.with_untracked(|rows| {
             rows.iter()
                 .find(|session| session.id == id)
                 .and_then(|session| session.branch_state.clone())
         }));
-        if is_running {
-            // Mid-stream: render the cached transcript immediately, but still
-            // reconcile the separately persisted Plan claim/status. This keeps
-            // session switching and restart semantics identical.
-            transcript_pages.update(|pages| {
-                pages.entry(id.clone()).or_default().window_user_start = usize::MAX;
-            });
-            restore_chat_session_scroll(&id);
-            // Still retarget the backend's viewed-session marker so uploads
-            // attach here (#194). Not `load_session`: that would overwrite the
-            // running turn's persisted seq with the DB snapshot.
-            spawn_local(async move {
-                let _ = invoke(
-                    "set_viewed_session",
-                    to_value(&serde_json::json!({ "id": id })).unwrap(),
-                )
-                .await;
-            });
-            return;
-        }
-        // Idle session: load from DB and overwrite any stale cache entry.
+        let epoch = transcript_load_epoch.get_untracked().wrapping_add(1);
+        transcript_load_epoch.set(epoch);
+        transcript_loading.set(Some(id.clone()));
+        // A running flag says nothing about this window's cache. Always hydrate;
+        // the backend drains its writer without touching execution state.
+        let hydration_buf = delta_buf.clone();
         spawn_local(async move {
-            let v = invoke(
-                "load_session",
-                to_value(&serde_json::json!({ "id": id.clone() })).unwrap(),
-            )
-            .await;
-            if let Ok(page) = serde_wasm_bindgen::from_value::<LoadedSessionPage>(v) {
-                let presentations = page.presentations.clone();
-                conversation_branches.update(|branches| {
-                    branches.insert(id.clone(), page.branches.clone());
+            let current = || {
+                transcript_load_epoch.get_untracked() == epoch
+                    && active_session.get_untracked().as_deref() == Some(id.as_str())
+            };
+            loop {
+                if !current() {
+                    return;
+                }
+                let revision = transcript_event_revisions
+                    .with_untracked(|all| all.get(&id).copied().unwrap_or_default());
+                let result = invoke_checked(
+                    "load_session",
+                    to_value(&serde_json::json!({ "id": id.clone() })).unwrap(),
+                )
+                .await
+                .map_err(js_error_text)
+                .and_then(|value| {
+                    serde_wasm_bindgen::from_value::<LoadedSessionPage>(value)
+                        .map_err(|error| error.to_string())
                 });
-                active_branch_state.set(page.branch_state.clone());
-                conversation_outlines.update(|outlines| {
-                    outlines.insert(id.clone(), page.outline.clone());
-                });
+                if !current() {
+                    return;
+                }
+                if transcript_event_revisions
+                    .with_untracked(|all| all.get(&id).copied().unwrap_or_default())
+                    != revision
+                {
+                    // Keep live rows, then retry against a snapshot that includes
+                    // the intervening events. Never replay a delta twice.
+                    wait_for_transcript_retry().await;
+                    continue;
+                }
+                let page = match result {
+                    Ok(page) => page,
+                    Err(error) => {
+                        transcript_loading.set(None);
+                        transcript_page_error.set(Some((
+                            id.clone(),
+                            tf(
+                                locale.get(),
+                                "transcript.open_failed",
+                                &[("msg", &localize_backend(locale.get(), &error))],
+                            ),
+                        )));
+                        return;
+                    }
+                };
                 let mut chats: Vec<ChatItem> =
                     page.items.into_iter().map(LoadedItem::into_chat).collect();
                 settle_question_cards(&mut chats);
-                // The session may have started a turn while this idle-page
-                // request was in flight. Its live cache/items are newer than
-                // the page snapshot, so never replace them with the stale load.
-                if running.get_untracked().contains(&id) {
-                    return;
+                // A just-submitted optimistic turn may not have reached storage
+                // yet. An empty snapshot cannot erase its visible live rows.
+                if chats.is_empty() && running.get_untracked().contains(&id) {
+                    chats = items.get_untracked();
+                } else {
+                    // Those pre-request deltas were flushed into the snapshot.
+                    hydration_buf.borrow_mut().remove(&id);
+                    // Queued sends and ACP permission cards are transient UI
+                    // rows, not part of the native persisted transcript.
+                    items.with_untracked(|rows| {
+                        chats.extend(
+                            rows.iter()
+                                .filter(|row| {
+                                    matches!(
+                                        row,
+                                        ChatItem::QueuedUser { .. }
+                                            | ChatItem::AcpPermission { .. }
+                                    )
+                                })
+                                .cloned(),
+                        );
+                    });
                 }
+                chats.retain(|row| !matches!(row, ChatItem::ApprovalPending { .. }));
+                native_approval_ids.update(|all| {
+                    all.remove(&id);
+                });
+                approval_pending.update(|all| {
+                    if chats
+                        .iter()
+                        .any(|row| matches!(row, ChatItem::AcpPermission { .. }))
+                    {
+                        all.insert(id.clone());
+                    } else {
+                        all.remove(&id);
+                    }
+                });
+                for request in page.pending_approvals {
+                    native_approval_ids.update(|all| {
+                        all.insert(id.clone(), request.approval_id);
+                    });
+                    approval_pending.update(|all| {
+                        all.insert(id.clone());
+                    });
+                    chats.push(ChatItem::ApprovalPending {
+                        tool: request.tool,
+                        preview: request.preview,
+                        message: request.message,
+                    });
+                }
+                conversation_branches.update(|all| {
+                    all.insert(id.clone(), page.branches);
+                });
+                active_branch_state.set(page.branch_state);
+                if page.archived {
+                    archived_sessions.update(|s| {
+                        s.insert(id.clone());
+                    });
+                }
+                conversation_outlines.update(|all| {
+                    all.insert(id.clone(), page.outline);
+                });
+                context_epochs.set(page.context_epochs);
+                head_epoch.set(page.head_epoch);
+                in_context_from_user_index.set(page.in_context_from_user_index);
+                model_view.set(false);
+                context_view_items.set(Vec::new());
                 transcript_pages.update(|pages| {
                     pages.insert(
                         id.clone(),
                         TranscriptPageState {
                             next_before_seq: page.next_before_seq,
                             user_offset: page.user_offset,
-                            loading: false,
+                            loading_request: None,
                             window_user_start: usize::MAX,
                         },
                     );
                 });
-                // Only repaint the view if we're still on this session — a rapid
-                // switch could have moved on while the load was in flight, and an
-                // unguarded set would clobber the newer view with stale rows (#53).
-                if active_session.get().as_deref() == Some(&id) {
-                    items.set(chats.clone());
-                    // The latest turn's tool rows are the whole verdict, so a
-                    // reload cannot revive an offline banner the turn's own
-                    // successful retrieval already answered (#887).
-                    set_browser_offline_notice(
-                        browser_offline_notice,
-                        &id,
-                        browser_offline_notice_from_items(&id, &chats),
-                    );
-                    for presentation in presentations {
-                        if presentation.presentation_kind == "mcp_app" {
-                            show_mcp_app.call((
-                                id.clone(),
-                                presentation.presentation_id,
-                                presentation.payload,
-                                false,
-                            ));
-                        }
+                set_browser_offline_notice(
+                    browser_offline_notice,
+                    &id,
+                    browser_offline_notice_from_items(&id, &chats),
+                );
+                items.set(chats);
+                transcript_loading.set(None);
+                for presentation in page.presentations {
+                    if presentation.presentation_kind == "mcp_app" {
+                        show_mcp_app.call((id.clone(), presentation.payload, false));
                     }
-                    restore_chat_session_scroll(&id);
-                } else {
-                    transcripts.update(|m| {
-                        m.insert(id.clone(), chats);
-                    });
                 }
+                restore_chat_session_scroll(&id);
+                return;
             }
         });
+    });
+    let toggle_model_view = Callback::new(move |_| {
+        if model_view.get() {
+            model_view.set(false);
+            return;
+        }
+        let Some(id) = active_session.get() else {
+            return;
+        };
+        model_view.set(true);
+        context_view_items.set(Vec::new());
+        context_view_live_from.set(None);
+        refresh_context_state.call(id);
     });
     let open_exploration = {
         let load_session = load_session.clone();
@@ -5406,7 +6662,7 @@ fn App() -> impl IntoView {
             exploration_busy.set(false);
         });
     });
-    let start_exploration_from_head = Callback::new(move |turn_index: usize| {
+    let start_exploration_from_turn = Callback::new(move |turn_index: usize| {
         let Some(source_frame_id) = active_session.get_untracked() else {
             return;
         };
@@ -5643,23 +6899,28 @@ fn App() -> impl IntoView {
         let Some(id) = active_session.get_untracked() else {
             return;
         };
-        if running.with_untracked(|sessions| sessions.contains(&id)) {
-            return;
-        }
         let Some(cursor) = transcript_pages.with_untracked(|pages| {
-            pages
-                .get(&id)
-                .and_then(|page| (!page.loading).then_some(page.next_before_seq).flatten())
+            pages.get(&id).and_then(|page| {
+                page.loading_request
+                    .is_none()
+                    .then_some(page.next_before_seq)
+                    .flatten()
+            })
         }) else {
             return;
         };
+        transcript_page_error.set(None);
+        transcript_request_sequence.update_value(|sequence| *sequence += 1);
+        let request_id = transcript_request_sequence.get_value();
         transcript_pages.update(|pages| {
             if let Some(page) = pages.get_mut(&id) {
-                page.loading = true;
+                page.loading_request = Some(request_id);
             }
         });
         spawn_local(async move {
-            let value = invoke(
+            // Older pages are read-only, including while a turn is running.
+            // Keep command failures visible and leave the cursor retryable.
+            let result = invoke_checked(
                 "load_session",
                 to_value(&serde_json::json!({
                     "id": id.clone(),
@@ -5667,14 +6928,40 @@ fn App() -> impl IntoView {
                 }))
                 .unwrap(),
             )
-            .await;
-            let Ok(page) = serde_wasm_bindgen::from_value::<LoadedSessionPage>(value) else {
-                transcript_pages.update(|pages| {
-                    if let Some(page) = pages.get_mut(&id) {
-                        page.loading = false;
-                    }
-                });
+            .await
+            .map_err(js_error_text)
+            .and_then(|value| {
+                serde_wasm_bindgen::from_value::<LoadedSessionPage>(value)
+                    .map_err(|error| error.to_string())
+            });
+            // A reload/outline jump may have replaced this page while the
+            // request was in flight and started another request with the same
+            // cursor. Only the owning request can change rows or loading/errors.
+            if !transcript_pages.with_untracked(|pages| {
+                pages.get(&id).is_some_and(|page| {
+                    page.loading_request == Some(request_id) && page.next_before_seq == Some(cursor)
+                })
+            }) {
                 return;
+            }
+            let page = match result {
+                Ok(page) => page,
+                Err(error) => {
+                    transcript_pages.update(|pages| {
+                        if let Some(page) = pages.get_mut(&id) {
+                            page.loading_request = None;
+                        }
+                    });
+                    transcript_page_error.set(Some((
+                        id.clone(),
+                        tf(
+                            locale.get_untracked(),
+                            "transcript.load_failed",
+                            &[("msg", &error)],
+                        ),
+                    )));
+                    return;
+                }
             };
             let older = page
                 .items
@@ -5703,7 +6990,7 @@ fn App() -> impl IntoView {
                     TranscriptPageState {
                         next_before_seq: page.next_before_seq,
                         user_offset: page.user_offset,
-                        loading: false,
+                        loading_request: None,
                         window_user_start: 0,
                     },
                 );
@@ -5809,7 +7096,33 @@ fn App() -> impl IntoView {
             return false;
         };
         match name {
-            "compact" => return false,
+            "archive" => {
+                input.set(String::new());
+                archive_frame.set(active_session.get_untracked());
+                return true;
+            }
+            "compact" => {
+                input.set(String::new());
+                if active_acp_agent_id.get_untracked().is_some() {
+                    status.set(localize_backend(
+                        locale.get_untracked(),
+                        "ACP conversations cannot be compacted from this desktop view.",
+                    ));
+                } else if let Some(id) = active_session.get_untracked() {
+                    let mode = if payload.trim().is_empty() {
+                        CompactDialogMode::Regular
+                    } else {
+                        CompactDialogMode::Semantic
+                    };
+                    open_compact_dialog.call((id, payload.to_string(), mode));
+                } else {
+                    status.set(localize_backend(
+                        locale.get_untracked(),
+                        "Open a conversation before compacting its context.",
+                    ));
+                }
+                return true;
+            }
             "fork" => {
                 if active_branch_state.get_untracked().is_some()
                     || active_is_exploration.get_untracked()
@@ -5955,11 +7268,18 @@ fn App() -> impl IntoView {
         true
     })));
 
+    let outline_jump_request = store_value(0_u64);
     let jump_to_conversation_outline =
         Callback::new(move |(target, before_seq): (usize, Option<i64>)| {
+            outline_jump_request.update_value(|request| *request += 1);
+            let request = outline_jump_request.get_value();
+            let load_epoch = transcript_load_epoch.get_untracked();
             let Some(id) = active_session.get_untracked() else {
                 return;
             };
+            let event_revision =
+                transcript_event_revisions.with_untracked(|all| all.get(&id).copied());
+            transcript_page_error.set(None);
             let user_offset = transcript_pages
                 .with_untracked(|pages| pages.get(&id).copied())
                 .map_or(0, |page| page.user_offset);
@@ -5976,34 +7296,78 @@ fn App() -> impl IntoView {
                 return;
             }
             conversation_outline_selected.set(Some(target));
+            transcript_page_error.set(None);
             spawn_local(async move {
-                let value = invoke(
-                    "load_session",
-                    to_value(&serde_json::json!({
-                        "id": id.clone(),
-                        "beforeSeq": before_seq,
-                    }))
-                    .unwrap(),
-                )
-                .await;
-                let Ok(page) = serde_wasm_bindgen::from_value::<LoadedSessionPage>(value) else {
-                    return;
+                let mut cursor = before_seq;
+                let mut visited = HashSet::new();
+                let result = loop {
+                    if !visited.insert(cursor) {
+                        break Err("History pagination did not advance".to_string());
+                    }
+                    let result = invoke_checked(
+                        "load_session",
+                        to_value(&serde_json::json!({ "id": id.clone(), "beforeSeq": cursor }))
+                            .unwrap(),
+                    )
+                    .await
+                    .map_err(js_error_text)
+                    .and_then(|value| {
+                        serde_wasm_bindgen::from_value::<LoadedSessionPage>(value)
+                            .map_err(|error| error.to_string())
+                    });
+                    // A newer jump, reload, or session switch owns the view.
+                    if outline_jump_request.get_value() != request
+                        || transcript_load_epoch.get_untracked() != load_epoch
+                        || transcript_event_revisions.with_untracked(|all| all.get(&id).copied())
+                            != event_revision
+                        || active_session.get_untracked().as_deref() != Some(id.as_str())
+                    {
+                        return;
+                    }
+                    let page = match result {
+                        Ok(page) => page,
+                        Err(error) => break Err(error),
+                    };
+                    let mut chats = page
+                        .items
+                        .iter()
+                        .cloned()
+                        .map(LoadedItem::into_chat)
+                        .collect::<Vec<_>>();
+                    settle_question_cards(&mut chats);
+                    if conversation_outline_target_is_loaded(&chats, page.user_offset, target) {
+                        let target_local = target - page.user_offset;
+                        break Ok((page, chats, target_local));
+                    }
+                    if target < page.user_offset {
+                        if let Some(next) = page.next_before_seq {
+                            cursor = Some(next);
+                            continue;
+                        }
+                    }
+                    // An obsolete supplied cursor may land before the target.
+                    // Restart at the latest page once, then follow only the
+                    // cursors returned by the backend.
+                    if !visited.contains(&None) {
+                        cursor = None;
+                        continue;
+                    }
+                    break Err("The selected question is unavailable in saved history".to_string());
                 };
-                let target_local = target.saturating_sub(page.user_offset);
-                let mut chats = page
-                    .items
-                    .into_iter()
-                    .map(LoadedItem::into_chat)
-                    .collect::<Vec<_>>();
-                settle_question_cards(&mut chats);
-                let chats = chats;
-                let loaded_turns = chats
-                    .iter()
-                    .filter(|item| matches!(item, ChatItem::User(_) | ChatItem::QueuedUser { .. }))
-                    .count();
-                if target < page.user_offset || target_local >= loaded_turns {
-                    return;
-                }
+                let (page, chats, target_local) = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        transcript_page_error.set(Some((
+                            id.clone(),
+                            tf(
+                                locale.get_untracked(),
+                                "transcript.load_failed",
+                                &[("msg", &error)],
+                            ),
+                        )));
+                        return;
+                    }
+                };
                 if !page.outline.is_empty() {
                     conversation_outlines.update(|outlines| {
                         outlines.insert(id.clone(), page.outline);
@@ -6015,7 +7379,7 @@ fn App() -> impl IntoView {
                         TranscriptPageState {
                             next_before_seq: page.next_before_seq,
                             user_offset: page.user_offset,
-                            loading: false,
+                            loading_request: None,
                             window_user_start: target_local,
                         },
                     );
@@ -6086,6 +7450,22 @@ fn App() -> impl IntoView {
         let approval_pending = approval_pending;
         Callback::new(
             move |(sid, approved, feedback, scope): (String, bool, Option<String>, String)| {
+                let approving_delegation = approved
+                    && if active_session.get_untracked().as_deref() == Some(sid.as_str()) {
+                        items.with_untracked(|rows| {
+                            rows.iter().any(|item| {
+                                matches!(item, ChatItem::ApprovalPending { tool, .. } if tool == "delegate_tasks")
+                            })
+                        })
+                    } else {
+                        transcripts.with_untracked(|cache| {
+                            cache.get(&sid).is_some_and(|rows| {
+                                rows.iter().any(|item| {
+                                    matches!(item, ChatItem::ApprovalPending { tool, .. } if tool == "delegate_tasks")
+                                })
+                            })
+                        })
+                    };
                 route_items(
                     active_session,
                     items,
@@ -6106,6 +7486,15 @@ fn App() -> impl IntoView {
                 spawn_local(async move {
                     let _ = invoke("confirm_response", arg).await;
                 });
+                if approving_delegation {
+                    ensure_right_tab(
+                        RightTab::Agents,
+                        show_right,
+                        open_right_tabs,
+                        right_tab,
+                    );
+                    refresh_agent_workflows(agent_panel);
+                }
             },
         )
     };
@@ -6166,9 +7555,37 @@ fn App() -> impl IntoView {
     // source: resolve the bridge's pending request; the answer returns inside
     // the agent's still-running turn.
     let on_question_answer = Callback::new(
-        move |(ui_index, request_id, answer): (usize, Option<String>, String)| {
+        move |(ui_index, request_id, answer, fill_only): (usize, Option<String>, String, bool)| {
             let answer = answer.trim().to_string();
             if answer.is_empty() {
+                return;
+            }
+            // Native option clicks stage an editable composer draft. The card
+            // remains pending until the user submits the resulting message.
+            // ACP responses still resolve immediately because they are a
+            // protocol reply to a live bridge request, not a new turn.
+            if fill_only && request_id.is_none() {
+                let Some(session_id) = active_session.get_untracked() else {
+                    return;
+                };
+                let previous = native_question_draft.get_untracked();
+                let current_input = input.get_untracked();
+                let draft = if previous.as_ref().is_some_and(
+                    |(previous_session, previous_index, previous_text)| {
+                        *previous_session == session_id
+                            && *previous_index == ui_index
+                            && current_input == *previous_text
+                    },
+                ) {
+                    answer.clone()
+                } else if current_input.trim().is_empty() {
+                    answer.clone()
+                } else {
+                    format!("{}\n\n{}", current_input.trim_end(), answer)
+                };
+                input.set(draft.clone());
+                native_question_draft.set(Some((session_id, ui_index, draft)));
+                focus_composer();
                 return;
             }
             // Settle the card before sending: the send appends rows, so the
@@ -6190,6 +7607,7 @@ fn App() -> impl IntoView {
                 None => {
                     // The send callback reads the composer synchronously, so
                     // swap the answer in and restore any draft right after.
+                    native_question_draft.set(None);
                     let draft = input.get_untracked();
                     input.set(answer);
                     send.call(ComposerSendAction::Normal);
@@ -6305,6 +7723,41 @@ fn App() -> impl IntoView {
         });
     });
 
+    let start_specialist_session = Callback::new(move |specialist_id: String| {
+        if demo_mode.get_untracked() {
+            return;
+        }
+        show_settings.set(false);
+        spawn_local(async move {
+            let id = match invoke_new_session().await {
+                Ok(id) => id,
+                Err(error) => {
+                    status.set(send_failed(locale.get_untracked(), &error));
+                    return;
+                }
+            };
+            let arg = to_value(&serde_json::json!({
+                "frameId": id.clone(),
+                "id": specialist_id.clone()
+            }))
+            .unwrap();
+            if let Err(error) = invoke_checked("set_session_specialist", arg).await {
+                status.set(send_failed(locale.get_untracked(), &js_error_text(error)));
+                return;
+            }
+            active_session.set(Some(id));
+            items.set(vec![]);
+            session_specialist.set(
+                specialists
+                    .get_untracked()
+                    .into_iter()
+                    .find(|specialist| specialist.id == specialist_id),
+            );
+            refresh_session_history();
+            focus_composer();
+        });
+    });
+
     let save_skill_tags =
         Callback::new(move |(name, raw): (String, String)| extensions.save_skill_tags(name, raw));
 
@@ -6319,7 +7772,7 @@ fn App() -> impl IntoView {
     });
     let dismiss_onboard = move |_| dismiss_onboarding.call(());
 
-    // Onboarding step 0: save the entered key as DeepSeek models (flash as
+    // Onboarding model step: save the entered key as DeepSeek models (flash as
     // the default, pro for heavier work), reusing the same `save_model`
     // command as Settings. Blank key = skip.
     // ponytail: onboarding is DeepSeek-only; other providers go through Settings › Models.
@@ -6533,6 +7986,7 @@ fn App() -> impl IntoView {
         // Reset before the fetch: otherwise the previous session's flag shows
         // on the new one for as long as the round trip takes.
         local_plan_mode.set(Some(false));
+        auto_review_enabled.set(false);
         agent_completion.set(AgentCompletionSettings::default());
         agent_completion_busy.set(false);
         let Some(session_id) = active_session.get() else {
@@ -6552,17 +8006,22 @@ fn App() -> impl IntoView {
                 .await
                 .ok()
                 .and_then(|value| value.as_bool());
-            let completion = invoke_checked("get_session_agent_completion", args)
+            let completion = invoke_checked("get_session_agent_completion", args.clone())
                 .await
                 .ok()
                 .and_then(|value| {
                     serde_wasm_bindgen::from_value::<AgentCompletionSettings>(value).ok()
                 });
+            let auto_review = invoke_checked("get_auto_review_enabled", args)
+                .await
+                .ok()
+                .and_then(|value| value.as_bool());
             if active_session.get_untracked().as_deref() == Some(session_id.as_str()) {
                 delegation_enabled.set(enabled.unwrap_or(false));
                 full_permission_enabled.set(full_permission.unwrap_or(false));
                 local_plan_mode.set(plan.unwrap_or(None));
                 agent_completion.set(completion.unwrap_or_default());
+                auto_review_enabled.set(auto_review.unwrap_or(false));
             }
         });
     });
@@ -6697,12 +8156,6 @@ fn App() -> impl IntoView {
         });
     });
     spawn_local(async move {
-        let value = invoke("get_auto_review_enabled", JsValue::UNDEFINED).await;
-        if let Some(enabled) = value.as_bool() {
-            auto_review_enabled.set(enabled);
-        }
-    });
-    spawn_local(async move {
         let value = invoke("get_auto_failure_analysis_settings", JsValue::UNDEFINED).await;
         if let Ok(settings) = from_value::<AutoFailureAnalysisSettings>(value) {
             auto_failure_analysis.set(settings);
@@ -6789,13 +8242,80 @@ fn App() -> impl IntoView {
         }
         current
     });
-    let runtime_environment = create_rw_signal(None::<RuntimeSlot>);
     let runtime_environment_pinned = create_rw_signal(false);
     let runtime_environment_position = create_rw_signal((16, 16));
-    let runtime_infos = create_rw_signal::<Vec<RuntimeInfo>>(vec![]);
-    let runtime_object_states =
-        create_rw_signal::<HashMap<String, RuntimeObjectState>>(HashMap::new());
     let run_clock = create_rw_signal(now_secs());
+    provide_context(chat_render::CompletedRunCards {
+        owners: completed_run_owners,
+        runs: run_records,
+        clock: run_clock.read_only(),
+        dismissed: dismissed_run_cards,
+    });
+    provide_context(chat_render::CompactionRowActions {
+        undo: Callback::new(move |epoch: u64| {
+            if busy.get() {
+                return;
+            }
+            let sid = active_session.get();
+            spawn_local(async move {
+                let args = to_value(&tauri_args::undo_compaction(&sid)).unwrap();
+                if invoke_checked("undo_compaction", args).await.is_err() {
+                    return;
+                }
+                if let Some(id) = sid.as_deref() {
+                    route_items(active_session, items, transcripts, id, |rows| {
+                        apply_compaction_undone(rows, epoch);
+                    });
+                    refresh_context_state.call(id.to_string());
+                }
+            });
+        }),
+        rewind_before: Callback::new(move |kept_from: usize| {
+            if busy.get() {
+                return;
+            }
+            let list = items.get();
+            let offset = active_session
+                .get()
+                .as_deref()
+                .and_then(|id| transcript_pages.with(|pages| pages.get(id).copied()))
+                .map_or(0, |page| page.user_offset);
+            if let Some(ui_index) = compaction_rewind_ui_index(&list, offset, kept_from) {
+                edit_confirm.set(Some(ui_index));
+            }
+        }),
+    });
+    // The transfer tray needs the shared clock only while the active session
+    // has an active or briefly lingering transfer. Once the last card expires,
+    // this effect finds no visible transfers and drops its run_clock
+    // dependency; historical progress records then stay idle between run-list
+    // updates instead of rebuilding the tray every second.
+    let transfer_tray_collapsed = create_rw_signal(false);
+    let transfer_tray_clock_active = create_rw_signal(false);
+    let transfer_tray_now = create_rw_signal(run_clock.get_untracked());
+    create_effect(move |_| {
+        // Decide from the records before subscribing to the clock. Reading a
+        // false flag and then setting it true inside this same effect does not
+        // rerun the effect in Leptos, leaving silent transfers without ticks.
+        let now = run_clock.get_untracked();
+        let has_visible_transfer = active_session.get().is_some_and(|session_id| {
+            run_records.with(|records| {
+                records.iter().any(|run| {
+                    run.frame_id.as_deref() == Some(session_id.as_str())
+                        && run_progress(run).is_some_and(|progress| {
+                            transfer_progress_visible(&progress, &run.status, now)
+                        })
+                })
+            })
+        });
+        let now = if has_visible_transfer {
+            run_clock.get()
+        } else {
+            now
+        };
+        transfer_tray_now.set(now);
+        transfer_tray_clock_active.set(has_visible_transfer);
+    });
     let show_add_host = create_rw_signal(false);
     let host_alias = create_rw_signal(String::new());
     let host_hostname = create_rw_signal(String::new());
@@ -6918,6 +8438,11 @@ fn App() -> impl IntoView {
                         }
                         if active_session.get_untracked().as_deref() == Some(session_id.as_str()) {
                             session_execution_contexts.set(ids.into_iter().collect());
+                            refresh_session_default_execution_context(
+                                session_default_execution_context,
+                                active_session,
+                                session_id.clone(),
+                            );
                         }
                         // First enable of a server in this project: ask where
                         // uploads, run workdirs, and retrieved results go.
@@ -7001,9 +8526,55 @@ fn App() -> impl IntoView {
                     let Ok(saved) = serde_wasm_bindgen::from_value::<Option<String>>(value) else {
                         return;
                     };
-                    default_execution_context.set(saved.clone());
-                    // Make the new default usable in the current session right away.
-                    if let Some(id) = saved {
+                    default_execution_context.set(saved);
+                }
+                Err(error) => {
+                    let message = localize_backend(locale.get_untracked(), &js_error_text(error));
+                    show_toast(&message);
+                }
+            }
+        });
+    });
+
+    let set_session_default_compute_resource = Callback::new(move |context_id: Option<String>| {
+        if demo_mode.get_untracked() {
+            return;
+        }
+        spawn_local(async move {
+            let (session_id, created) = match active_session.get_untracked() {
+                Some(session_id) => (session_id, false),
+                None => match invoke_new_session().await {
+                    Ok(session_id) => (session_id, true),
+                    Err(error) => {
+                        show_toast(&send_failed(locale.get_untracked(), &error));
+                        return;
+                    }
+                },
+            };
+            let args = to_value(&serde_json::json!({
+                "sessionId": session_id.clone(),
+                "contextId": context_id,
+            }))
+            .unwrap();
+            match invoke_checked("set_session_default_execution_context", args).await {
+                Ok(value) => {
+                    let Ok(saved) = serde_wasm_bindgen::from_value::<Option<String>>(value) else {
+                        return;
+                    };
+                    if created && active_session.get_untracked().is_none() {
+                        active_session.set(Some(session_id.clone()));
+                        items.set(vec![]);
+                        refresh_session_history();
+                    }
+                    if active_session.get_untracked().as_deref() == Some(session_id.as_str()) {
+                        session_default_execution_context.set(saved.clone());
+                        refresh_session_execution_contexts(
+                            session_execution_contexts,
+                            active_session,
+                            session_id,
+                        );
+                    }
+                    if let Some(id) = saved.filter(|id| id != "local") {
                         apply_session_compute_resource.call((id, true));
                     }
                 }
@@ -7015,27 +8586,27 @@ fn App() -> impl IntoView {
         });
     });
 
+    let activate_terminal_session = Callback::new(move |session: TerminalSessionSummary| {
+        let session_id = session.id.clone();
+        terminal_sessions.update(|sessions| {
+            if let Some(existing) = sessions.iter_mut().find(|item| item.id == session_id) {
+                *existing = session;
+            } else {
+                sessions.push(session);
+            }
+        });
+        active_terminal_id.set(Some(session_id));
+        terminal_panel_open.set(true);
+        terminal_add_menu_open.set(false);
+    });
+
     let open_terminal_for_context = Callback::new(move |context_id: String| {
         spawn_local(async move {
             let arg = to_value(&serde_json::json!({ "contextId": context_id })).unwrap();
             match invoke_checked("open_terminal", arg).await {
                 Ok(value) => {
                     match serde_wasm_bindgen::from_value::<TerminalSessionSummary>(value) {
-                        Ok(session) => {
-                            let session_id = session.id.clone();
-                            terminal_sessions.update(|sessions| {
-                                if let Some(existing) =
-                                    sessions.iter_mut().find(|item| item.id == session_id)
-                                {
-                                    *existing = session;
-                                } else {
-                                    sessions.push(session);
-                                }
-                            });
-                            active_terminal_id.set(Some(session_id));
-                            terminal_panel_open.set(true);
-                            terminal_add_menu_open.set(false);
-                        }
+                        Ok(session) => activate_terminal_session.call(session),
                         Err(error) => show_toast(&error.to_string()),
                     }
                 }
@@ -7100,6 +8671,14 @@ fn App() -> impl IntoView {
         });
     }
     refresh_execution_contexts(execution_contexts);
+    create_effect(move |_| {
+        if bootstrap
+            .get()
+            .is_some_and(|status| status.local_environment.is_some())
+        {
+            refresh_execution_contexts(execution_contexts);
+        }
+    });
     refresh_default_execution_context(default_execution_context);
     // Auto-register installed WSL distributions so they show up as checkable
     // rows in the compute menu. No-op on non-Windows and (via a registry guard
@@ -7111,6 +8690,27 @@ fn App() -> impl IntoView {
     });
     refresh_runtimes(runtime_infos);
     refresh_runs(run_records, locale);
+    crate::bindings::start_ui_health();
+    {
+        // Keep liveness tied to the WASM app, while JS collects bounded metrics.
+        let beat = Closure::wrap(Box::new(move || {
+            crate::bindings::report_ui_health();
+        }) as Box<dyn FnMut()>);
+        if let Some(window) = web_sys::window() {
+            let _ = window.set_interval_with_callback_and_timeout_and_arguments_0(
+                beat.as_ref().unchecked_ref(),
+                5_000,
+            );
+            let _ = window.add_event_listener_with_callback("focus", beat.as_ref().unchecked_ref());
+            if let Some(document) = window.document() {
+                let _ = document.add_event_listener_with_callback(
+                    "visibilitychange",
+                    beat.as_ref().unchecked_ref(),
+                );
+            }
+        }
+        beat.forget();
+    }
     {
         let ticks = Cell::new(0_u8);
         let refresh = Closure::wrap(Box::new(move || {
@@ -7138,7 +8738,14 @@ fn App() -> impl IntoView {
     }
     {
         let refresh = Closure::wrap(Box::new(move || {
-            if show_right.get_untracked() && right_tab.get_untracked() == RightTab::Hosts {
+            // While a turn runs, agent python/r cells move runtimes between
+            // starting/busy/ready outside any UI action; poll so the composer
+            // strip and memory environment status stay current. The equality
+            // guard in refresh_runtimes keeps unchanged polls from
+            // republishing (and re-rendering) anything.
+            if busy.get_untracked()
+                || (show_right.get_untracked() && right_tab.get_untracked() == RightTab::Hosts)
+            {
                 refresh_runtimes(runtime_infos);
             }
         }) as Box<dyn FnMut()>);
@@ -7177,11 +8784,13 @@ fn App() -> impl IntoView {
             let arg = to_value(&serde_json::json!({ "query": "", "limit": 50 })).unwrap();
             let v = invoke("search_sessions", arg).await;
             if let Ok(rows) = serde_wasm_bindgen::from_value::<Vec<SessionSearchInfo>>(v) {
-                inbox_sessions.set(
-                    rows.into_iter()
-                        .filter(|s| s.status == "needs_you")
-                        .collect(),
-                );
+                let rows: Vec<_> = rows
+                    .into_iter()
+                    .filter(|s| s.status == "needs_you")
+                    .collect();
+                if inbox_sessions.with_untracked(|current| current != &rows) {
+                    inbox_sessions.set(rows);
+                }
             }
         });
     };
@@ -7334,6 +8943,10 @@ fn App() -> impl IntoView {
                 reveal_in_file_manager(payload);
                 return;
             }
+            if action == "openWorkspacePathInSystem" {
+                open_workspace_path_in_system(payload);
+                return;
+            }
             if action == "copyImage" {
                 spawn_local(async move {
                     if context_menu::copy_image(&payload).await {
@@ -7348,6 +8961,39 @@ fn App() -> impl IntoView {
             ) {
                 let _ = attach_ready_path(attachments, payload);
                 focus_composer();
+                return;
+            }
+            if action == "addWorkspaceFileToMotif" {
+                if let Some(instance_id) = active_motif_instance(&mcp_apps.get_untracked()) {
+                    spawn_local(async move {
+                        match add_workspace_file_to_motif(&instance_id, &payload).await {
+                            Ok(_) => show_toast(&tf(
+                                locale.get_untracked(),
+                                "motif.added_file",
+                                &[(
+                                    "name",
+                                    payload.rsplit(['/', '\\']).next().unwrap_or(&payload),
+                                )],
+                            )),
+                            Err(error) => show_warning_toast(&js_error_text(error)),
+                        }
+                    });
+                } else {
+                    let _ = attach_ready_path(attachments, payload.clone());
+                    let filename = payload.rsplit(['/', '\\']).next().unwrap_or(&payload);
+                    input.update(|draft| {
+                        if !draft.trim().is_empty() {
+                            draft.push_str("\n\n");
+                        }
+                        draft.push_str(&tf(
+                            locale.get_untracked(),
+                            "motif.open_and_add_prompt",
+                            &[("name", filename)],
+                        ));
+                    });
+                    show_warning_toast(&t(locale.get_untracked(), "motif.open_first"));
+                    focus_composer();
+                }
                 return;
             }
             if action == "registerWorkspaceArtifact" {
@@ -7381,14 +9027,28 @@ fn App() -> impl IntoView {
                 });
                 return;
             }
+            if action == "openBoundResourceCenter" {
+                if let Ok((path, name, kind)) = serde_json::from_str::<ModalArtifact>(&payload) {
+                    let tab = CenterFileTab::new(path.clone(), name, kind);
+                    center_files.update(|files| {
+                        if !files.iter().any(|file| file.path == path) {
+                            files.push(tab);
+                        }
+                    });
+                    center_file.set(Some(path));
+                }
+                return;
+            }
             if action == "openWorkspaceFileCenter" {
-                let tab = CenterFileTab::from_path(payload.clone());
-                center_files.update(|files| {
-                    if !files.iter().any(|file| file.path == payload) {
-                        files.push(tab.clone());
-                    }
+                confirm_workspace_file_open(payload.clone(), move || {
+                    let tab = CenterFileTab::from_path(payload.clone());
+                    center_files.update(|files| {
+                        if !files.iter().any(|file| file.path == payload) {
+                            files.push(tab.clone());
+                        }
+                    });
+                    center_file.set(Some(payload));
                 });
-                center_file.set(Some(payload));
                 return;
             }
             if action == "closeCenterCurrent" {
@@ -7733,15 +9393,18 @@ fn App() -> impl IntoView {
         } else {
             Vec::new()
         };
-        if let Some(menu) = context_menu::build(
-            &ev,
-            loc,
-            active_session.get().is_some(),
-            center.as_deref(),
-            &quick_actions.get_untracked(),
-            project_root.as_deref(),
-            &selected_paths,
-        ) {
+        if let Some(menu) = items.with_untracked(|rows| {
+            context_menu::build(
+                &ev,
+                loc,
+                active_session.get().is_some(),
+                center.as_deref(),
+                &quick_actions.get_untracked(),
+                project_root.as_deref(),
+                &selected_paths,
+                rows,
+            )
+        }) {
             if !menu.items.is_empty() {
                 ev.prevent_default();
                 // The context menu supersedes the selection popup — never
@@ -7782,6 +9445,34 @@ fn App() -> impl IntoView {
             external_link_confirm.set(None);
             return;
         }
+        if browser_needs_human.get().is_some() {
+            ev.prevent_default();
+            if !browser_needs_human_busy.get() {
+                browser_needs_human.set(None);
+                browser_needs_human_error.set(None);
+            }
+            return;
+        }
+        if browser_tab_cleanup.get().is_some() {
+            ev.prevent_default();
+            if !browser_tab_cleanup_busy.get() {
+                if let Some(prompt) = browser_tab_cleanup.get_untracked() {
+                    let turn_id = prompt.turn_id.clone();
+                    spawn_local(async move {
+                        let arg = to_value(&serde_json::json!({ "turnId": turn_id })).unwrap();
+                        let _ = invoke_checked("dismiss_browser_tab_cleanup", arg).await;
+                    });
+                }
+                advance_browser_tab_cleanup(
+                    browser_tab_cleanup,
+                    browser_tab_cleanup_queue,
+                    browser_tab_cleanup_selected,
+                    browser_tab_cleanup_error,
+                    browser_tab_cleanup_busy,
+                );
+            }
+            return;
+        }
         if turn_memory_proposal.get().is_some() {
             ev.prevent_default();
             if !turn_memory_busy.get() {
@@ -7792,12 +9483,38 @@ fn App() -> impl IntoView {
             }
             return;
         }
+        if compact_idle_prompt.get().is_some() {
+            ev.prevent_default();
+            if let Some((id, _)) = compact_idle_prompt.get_untracked() {
+                compact_idle_dismissed.update(|dismissed| {
+                    dismissed.insert(id);
+                });
+            }
+            compact_idle_prompt.set(None);
+            return;
+        }
+        if compact_dialog.get().is_some() {
+            ev.prevent_default();
+            if !compact_busy.get() {
+                compact_dialog.set(None);
+                compact_instruction.set(String::new());
+                compact_error.set(None);
+            }
+            return;
+        }
         if context_recovery_dialog.get().is_some() {
             ev.prevent_default();
             if !context_recovery_busy.get() {
                 context_recovery_dialog.set(None);
                 context_recovery_error.set(None);
             }
+            return;
+        }
+        // The model switch confirm renders above the export/link/memory
+        // dialogs and everything below; Escape cancels the switch only.
+        if model_switch_confirm.get().is_some() {
+            ev.prevent_default();
+            model_switch_confirm.set(None);
             return;
         }
         if project_export_prompt.get().is_some() {
@@ -7825,6 +9542,13 @@ fn App() -> impl IntoView {
             trajectory_open.set(false);
             return;
         }
+        if archive_frame.get().is_some() && modal_artifact.get().is_none() {
+            ev.prevent_default();
+            if !archive_busy.get() {
+                archive_frame.set(None);
+            }
+            return;
+        }
         if let Some(modal) = update_check_modal.get() {
             ev.prevent_default();
             if modal.dismissible() {
@@ -7850,6 +9574,15 @@ fn App() -> impl IntoView {
         if command_palette_open.get() {
             ev.prevent_default();
             command_palette_open.set(false);
+            return;
+        }
+        if show_onboarding.get() {
+            ev.prevent_default();
+            if onboard_step.get() > 0 {
+                onboard_step.update(|s| *s = s.saturating_sub(1));
+            } else {
+                dismiss_onboarding.call(());
+            }
             return;
         }
         if scratch_open.get() {
@@ -7931,34 +9664,23 @@ fn App() -> impl IntoView {
             modal_artifact.set(None);
             return;
         }
-        if show_publication_workspace.get() {
-            ev.prevent_default();
-            show_publication_workspace.set(false);
-            publication_binding_source.set(None);
-            return;
-        }
-        if show_research_graph.get() {
-            ev.prevent_default();
-            show_research_graph.set(false);
-            return;
-        }
+
         if inbox_open.get() {
             ev.prevent_default();
             inbox_open.set(false);
             return;
         }
+        if show_settings.get()
+            && settings_section.get() == "workflows"
+            && workflow_conversion.open.get()
+        {
+            ev.prevent_default();
+            workflow_conversion.open.set(false);
+            return;
+        }
         if show_settings.get() && !settings_busy.get() {
             ev.prevent_default();
             show_settings.set(false);
-            return;
-        }
-        if show_onboarding.get() {
-            ev.prevent_default();
-            if onboard_step.get() > 0 {
-                onboard_step.update(|s| *s = s.saturating_sub(1));
-            } else {
-                dismiss_onboarding.call(());
-            }
             return;
         }
         if show_library.get() {
@@ -7968,6 +9690,11 @@ fn App() -> impl IntoView {
         }
 
         if show_projects.get() {
+            if home_calendar_open.get() && !home_dialog_open.get() {
+                ev.prevent_default();
+                home_calendar_open.set(false);
+                return;
+            }
             if project_transfer
                 .get()
                 .is_some_and(|transfer| transfer.is_complete() || transfer.is_failed())
@@ -8028,6 +9755,13 @@ fn App() -> impl IntoView {
             return;
         }
 
+        // Research journey is a page below the window's dialogs.
+        if show_research_graph.get() {
+            ev.prevent_default();
+            show_research_graph.set(false);
+            return;
+        }
+
         // --- menus / popovers ---
         if context_usage_open.get() {
             ev.prevent_default();
@@ -8037,6 +9771,24 @@ fn App() -> impl IntoView {
         if artifact_menu.get().is_some() {
             ev.prevent_default();
             artifact_menu.set(None);
+            return;
+        }
+        // Match the drawer breakpoint in right-pane.css. Resizing can leave
+        // composer menus open underneath the Inspector's modal backdrop.
+        // Its own menus (and the floating runtime inspector) still close first;
+        // otherwise Escape dismisses the drawer, preserving the covered layer.
+        if show_right.get() && viewport_size().0 <= 960.0 {
+            ev.prevent_default();
+            if runtime_environment_pinned.get() {
+                runtime_environment.set(None);
+                runtime_environment_pinned.set(false);
+            } else if right_tab_add_menu_open.get() {
+                right_tab_add_menu_open.set(false);
+            } else if side_chat_model_menu_open.get() {
+                side_chat_model_menu_open.set(false);
+            } else {
+                show_right.set(false);
+            }
             return;
         }
         if show_proj_menu.get() {
@@ -8106,6 +9858,18 @@ fn App() -> impl IntoView {
             return;
         }
 
+        if transfer_tray_clock_active.get() && !transfer_tray_collapsed.get() {
+            ev.prevent_default();
+            transfer_tray_collapsed.set(true);
+            return;
+        }
+
+        if chat_find_open.get() {
+            ev.prevent_default();
+            chat_find_open.set(false);
+            return;
+        }
+
         // --- drag cancel ---
         if dragging.get() {
             ev.prevent_default();
@@ -8115,6 +9879,12 @@ fn App() -> impl IntoView {
         if center_split_dragging.get() {
             ev.prevent_default();
             center_split_dragging.set(false);
+            return;
+        }
+        if center_runtime_col_dragging.get() || center_runtime_row_dragging.get() {
+            ev.prevent_default();
+            center_runtime_col_dragging.set(false);
+            center_runtime_row_dragging.set(false);
             return;
         }
         if composer_dragging.get() {
@@ -8146,6 +9916,15 @@ fn App() -> impl IntoView {
         if browser_offline_notice.get().is_some() {
             ev.prevent_default();
             browser_offline_notice.set(None);
+            return;
+        }
+        if let Some(status) = browser_extension_status.get() {
+            ev.prevent_default();
+            browser_extension_dismissed_version
+                .set(Some(status.bundled_version.unwrap_or_default()));
+            browser_extension_status.set(None);
+            browser_extension_update_outcome.set(None);
+            browser_extension_update_error.set(None);
             return;
         }
 
@@ -8227,19 +10006,31 @@ fn App() -> impl IntoView {
     });
 
     window_event_listener(ev::resize, move |_| {
-        let Some(geom) = context_usage_geom.get_untracked() else {
-            return;
-        };
         let (viewport_w, viewport_h) = viewport_size();
-        let clamped =
-            clamp_context_usage_geom(geom.x, geom.y, geom.w, geom.h, viewport_w, viewport_h);
-        if clamped != geom {
-            context_usage_geom.set(Some(clamped));
+        if let Some(geom) = context_usage_geom.get_untracked() {
+            let clamped =
+                clamp_context_usage_geom(geom.x, geom.y, geom.w, geom.h, viewport_w, viewport_h);
+            if clamped != geom {
+                context_usage_geom.set(Some(clamped));
+            }
+        }
+        // The pinned R/Python inspector stores pixel coordinates from the
+        // current window. Restoring from maximize leaves those coordinates
+        // past the new right/bottom edge, so the panel vanishes until the
+        // window is maximized again.
+        if runtime_environment_pinned.get_untracked() {
+            let (x, y) = runtime_environment_position.get_untracked();
+            let next =
+                clamp_runtime_environment_position_in(x, y, viewport_w as i32, viewport_h as i32);
+            if next != (x, y) {
+                runtime_environment_position.set(next);
+            }
         }
     });
 
     // Selecting text inside any file preview (tagged `data-file-path`) raises the
-    // same quote popup the chat uses, plus an "annotate" action. Runs on window
+    // same quote popup the chat uses. Papers also get annotate / literature;
+    // R/Python source gets Run instead. Runs on window
     // so it covers the center preview, the artifact modal, and the right pane
     // uniformly. Fires after the chat's own element handler during bubbling, so
     // it only clears/replaces a *preview* popup (source == Some) and never stomps
@@ -8261,7 +10052,16 @@ fn App() -> impl IntoView {
         if in_popup {
             return;
         }
-        let json = preview_selection();
+        // File links and buttons own the click (image preview, artifact chip).
+        // Do not also raise the quote bar from a leftover selection of the
+        // control's label — that stacks on top of the preview.
+        if context_menu::selection_popup_blocked(&ev) {
+            if matches!(selection_popup.get_untracked(), Some((_, Some(_), _, _))) {
+                selection_popup.set(None);
+            }
+            return;
+        }
+        let json = preview_selection(ev.client_x(), ev.client_y());
         if json.is_empty() {
             if matches!(selection_popup.get_untracked(), Some((_, Some(_), _, _))) {
                 selection_popup.set(None);
@@ -8313,6 +10113,14 @@ fn App() -> impl IntoView {
         focus_composer();
     });
 
+    // User-initiated scroll (wheel/trackpad) — not follow-scroll — should
+    // hide the fixed quote popup, whose client coordinates are now stale.
+    window_event_listener(ev::wheel, move |_| {
+        if selection_popup.get_untracked().is_some() {
+            selection_popup.set(None);
+        }
+    });
+
     // Dismiss the selection popup on any press outside it: starting a new
     // selection, clicking the composer, or clicking elsewhere in the app.
     window_event_listener(ev::mousedown, move |ev| {
@@ -8351,6 +10159,13 @@ fn App() -> impl IntoView {
                 status.set(message);
                 return;
             }
+            let calendar_day = calendar_journey_request
+                .get_untracked()
+                .filter(|(id, _)| id == &project_id)
+                .map(|(_, day)| day);
+            calendar_journey_request.set(None);
+            home_calendar_open.set(false);
+            journey_initial_day.set(None);
             let request_epoch = transition_epoch.get().wrapping_add(1);
             transition_epoch.set(request_epoch);
             *transition_target.borrow_mut() = Some(project_id.clone());
@@ -8463,7 +10278,9 @@ fn App() -> impl IntoView {
 
                 let session_id = match session_id {
                     Some(session_id) => Some(session_id),
-                    None if settings.get_untracked().resume_last_session => {
+                    None if calendar_day.is_none()
+                        && settings.get_untracked().resume_last_session =>
+                    {
                         invoke_latest_used_session().await
                     }
                     None => None,
@@ -8477,6 +10294,11 @@ fn App() -> impl IntoView {
                     return;
                 }
                 project_info.set(Some(project));
+                if let Some(day) = calendar_day {
+                    journey_initial_day.set(Some(day));
+                    show_research_graph.set(true);
+                    refresh_research_graph(research_graph);
+                }
                 if let Some(session_id) = session_id {
                     load_session.call(session_id);
                 }
@@ -8490,6 +10312,7 @@ fn App() -> impl IntoView {
     // window-scoped: the generic event listener is app-wide, so a targeted
     // completion navigation would otherwise repoint every project window.
     let event_open_project = open_project_transition;
+    let event_load_session = load_session.clone();
     let open_session_cb = Closure::wrap(Box::new(move |payload: JsValue| {
         let Ok(target) = serde_wasm_bindgen::from_value::<serde_json::Value>(payload) else {
             return;
@@ -8500,6 +10323,21 @@ fn App() -> impl IntoView {
         let Some(session_id) = target.get("sessionId").and_then(serde_json::Value::as_str) else {
             return;
         };
+        // The backend replays a turn-end notification target on the next
+        // window focus. When this window already shows that project, a full
+        // project transition would tear down and rebuild the shell the user is
+        // looking at (visible flash on the first click after a reply), so only
+        // switch conversations — or do nothing when it is already open.
+        let same_project = !show_projects.get_untracked()
+            && project_info
+                .get_untracked()
+                .is_some_and(|project| project.id == project_id);
+        if same_project {
+            if active_session.get_untracked().as_deref() != Some(session_id) {
+                event_load_session.call(session_id.to_string());
+            }
+            return;
+        }
         event_open_project.call((project_id.to_string(), Some(session_id.to_string())));
     }) as Box<dyn FnMut(JsValue)>);
     let open_session_js = open_session_cb
@@ -8568,7 +10406,10 @@ fn App() -> impl IntoView {
         proj_settings_busy.set(true);
         spawn_local(async move {
             let arg = to_value(&serde_json::json!({
-                "name": form.name, "description": form.description, "agentContext": form.agent_context,
+                "name": form.name,
+                "description": form.description,
+                "agentContext": form.agent_context,
+                "defaultSpecialistId": form.default_specialist_id,
             })).unwrap();
             let res = invoke_checked("update_project", arg).await;
             proj_settings_busy.set(false);
@@ -9057,6 +10898,11 @@ fn App() -> impl IntoView {
                 }
             }
             "scratch" => open_scratch.call(()),
+            "new-window" => {
+                spawn_local(async move {
+                    let _ = invoke("open_new_window", JsValue::UNDEFINED).await;
+                });
+            }
             "search" => command_palette_open.set(true),
             "commands" => action_palette_open.set(true),
             "projects" => show_projects.set(true),
@@ -9064,6 +10910,21 @@ fn App() -> impl IntoView {
             "settings" => {
                 show_settings.set(true);
                 settings_section.set("models".into());
+            }
+            "setup" => {
+                onboard_key.set(String::new());
+                onboard_step.set(0);
+                show_onboarding.set(true);
+                spawn_local(async move {
+                    if let Ok(value) =
+                        invoke_checked("detect_local_environment", JsValue::UNDEFINED).await
+                    {
+                        if let Ok(status) = serde_wasm_bindgen::from_value::<BootstrapStatus>(value)
+                        {
+                            bootstrap.set(Some(status));
+                        }
+                    }
+                });
             }
             "privacy-mode" => privacy_mode_modal_open.set(true),
             "import-codex" => {
@@ -9125,10 +10986,10 @@ fn App() -> impl IntoView {
             "export-current-project" => export_current_project.call(()),
             "skills" => manage_skills.call(()),
             "check-updates" => run_update_check(),
-            "docs" => open_external_url("https://github.com/xuzhougeng/wisp-science#readme".into()),
-            "star-us" => open_external_url("https://github.com/xuzhougeng/wisp-science".into()),
+            "docs" => open_external_url("https://github.com/Yu-Qiao-sjtu/wisp-science-depmap#readme".into()),
+            "star-us" => open_external_url("https://github.com/Yu-Qiao-sjtu/wisp-science-depmap".into()),
             "issues" => {
-                open_external_url("https://github.com/xuzhougeng/wisp-science/issues".into())
+                open_external_url("https://github.com/Yu-Qiao-sjtu/wisp-science-depmap/issues".into())
             }
             "toggle-sidebar" => show_sidebar.update(|show| *show = !*show),
             "artifacts" => {
@@ -9182,15 +11043,16 @@ fn App() -> impl IntoView {
             match action.as_str() {
                 "check-updates" => run_update_check(),
                 "docs" => {
-                    open_external_url("https://github.com/xuzhougeng/wisp-science#readme".into())
+                    open_external_url("https://github.com/Yu-Qiao-sjtu/wisp-science-depmap#readme".into())
                 }
-                "star-us" => open_external_url("https://github.com/xuzhougeng/wisp-science".into()),
+                "star-us" => open_external_url("https://github.com/Yu-Qiao-sjtu/wisp-science-depmap".into()),
                 "issues" => {
-                    open_external_url("https://github.com/xuzhougeng/wisp-science/issues".into())
+                    open_external_url("https://github.com/Yu-Qiao-sjtu/wisp-science-depmap/issues".into())
                 }
                 other => {
                     if let Some(action) = match other {
                         "new" => Some("new"),
+                        "new-window" => Some("new-window"),
                         "search" => Some("search"),
                         "commands" => Some("commands"),
                         "projects" => Some("projects"),
@@ -9225,7 +11087,7 @@ fn App() -> impl IntoView {
             .clone();
         native_menu_cb.forget();
         spawn_local(async move {
-            let _ = listen("native-menu-action", &native_menu_js).await;
+            let _ = listen_current_window("native-menu-action", &native_menu_js).await;
         });
     }
     let palette_project_id = Signal::derive(move || project_info.get().map(|p| p.id));
@@ -9234,16 +11096,38 @@ fn App() -> impl IntoView {
             || (project_info.get().is_some() && !show_projects.get() && !demo_mode.get())
     });
     let home_page = Signal::derive(move || show_projects.get());
+    let window_title = Signal::derive(move || {
+        if scratch_open.get() {
+            app_window_title(Some("Scratch"))
+        } else if show_projects.get() {
+            app_window_title(None)
+        } else if demo_mode.get() {
+            app_window_title(Some(&t(locale.get(), "projects.example")))
+        } else {
+            app_window_title(project_info.get().as_ref().map(|p| p.name.as_str()))
+        }
+    });
+    create_effect(move |_| {
+        let title = window_title.get();
+        spawn_local(async move {
+            set_window_title(&title).await;
+        });
+    });
     let shortcut_action = palette_action.clone();
     window_event_listener(ev::keydown, move |ev| {
         let Some(ev) = ev.dyn_ref::<web_sys::KeyboardEvent>() else {
             return;
         };
-        if ime_composing(ev) || !(ev.ctrl_key() || ev.meta_key()) {
+        if ev.default_prevented() || ime_composing(ev) || !(ev.ctrl_key() || ev.meta_key()) {
             return;
         }
         let key = ev.key().to_lowercase();
         match key.as_str() {
+            "f" if !ev.alt_key() && !ev.shift_key() && chat_find::can_find_chat() => {
+                ev.prevent_default();
+                chat_find_open.set(true);
+                chat_find::focus_chat_find();
+            }
             "p" => {
                 ev.prevent_default();
                 command_palette_open.set(false);
@@ -9389,10 +11273,37 @@ fn App() -> impl IntoView {
         });
     });
 
+    // Leptos 0.6 signals notify on every `set`, even with an equal value. The
+    // right pane and the center preview mount surfaces that animate in from
+    // opacity 0, so remounting them for nothing is a visible flash. Key both
+    // on memos: `ensure_right_tab` on an already-open pane, or a FileChanged
+    // for some other path, must not rebuild what is on screen.
+    let right_pane_visible =
+        create_memo(move |_| show_right.get() && !scratch_open.get() && !demo_mode.get());
+    let center_preview = create_memo(move |_| {
+        let path = (!demo_mode.get()).then(|| center_file.get()).flatten()?;
+        let file =
+            center_files.with(|files| files.iter().find(|file| file.path == path).cloned())?;
+        let revision = center_file_revisions
+            .with(|revisions| revisions.get(&path).copied().unwrap_or_default());
+        let display_path = project_info
+            .with(|project| {
+                project
+                    .as_ref()
+                    .and_then(|project| workspace_relative_path(&project.root, &path))
+            })
+            .unwrap_or_else(|| path.replace('\\', "/"));
+        Some((file, revision, display_path))
+    });
+    provide_context(ModelViewCtrl {
+        on: model_view,
+        toggle: toggle_model_view,
+    });
+
     view! {
         {is_windows().then(|| view! {
             <WindowTitlebar locale=locale has_current_project=has_current_project
-                home=home_page on_action=palette_action.clone() />
+                home=home_page brand=window_title on_action=palette_action.clone() />
         })}
         <ActionPalette open=action_palette_open has_current_project=has_current_project
             on_action=palette_action />
@@ -9430,6 +11341,162 @@ fn App() -> impl IntoView {
         />
         <ProjectTransferOverlay state=ProjectTransferOverlayState { locale, project_transfer } />
         <ExternalLinkConfirm locale=locale pending=external_link_confirm />
+        <BrowserTabCleanupOverlay
+            state=BrowserTabCleanupOverlayState {
+                locale,
+                pending: browser_tab_cleanup,
+                selected: browser_tab_cleanup_selected,
+                busy: browser_tab_cleanup_busy,
+                error: browser_tab_cleanup_error,
+            }
+            on_keep=Callback::new(move |_| {
+                if browser_tab_cleanup_busy.get_untracked() {
+                    return;
+                }
+                let Some(prompt) = browser_tab_cleanup.get_untracked() else {
+                    return;
+                };
+                browser_tab_cleanup_busy.set(true);
+                let project_id = browser_project.get_untracked();
+                spawn_local(async move {
+                    let arg = to_value(&serde_json::json!({ "turnId": prompt.turn_id })).unwrap();
+                    let _ = invoke_checked("dismiss_browser_tab_cleanup", arg).await;
+                    if browser_project.get_untracked() != project_id {
+                        return;
+                    }
+                    advance_browser_tab_cleanup(
+                        browser_tab_cleanup,
+                        browser_tab_cleanup_queue,
+                        browser_tab_cleanup_selected,
+                        browser_tab_cleanup_error,
+                        browser_tab_cleanup_busy,
+                    );
+                });
+            })
+            on_close=Callback::new(move |tabs: Vec<BrowserTabCleanupItem>| {
+                if browser_tab_cleanup_busy.get_untracked() {
+                    return;
+                }
+                let Some(prompt) = browser_tab_cleanup.get_untracked() else {
+                    return;
+                };
+                browser_tab_cleanup_busy.set(true);
+                let project_id = browser_project.get_untracked();
+                spawn_local(async move {
+                    let arg = to_value(&serde_json::json!({
+                        "turnId": prompt.turn_id,
+                        "tabs": tabs,
+                    })).unwrap();
+                    let result = invoke_checked("confirm_browser_tab_cleanup", arg).await;
+                    if browser_project.get_untracked() != project_id {
+                        return;
+                    }
+                    match result {
+                        Ok(_) => advance_browser_tab_cleanup(
+                            browser_tab_cleanup,
+                            browser_tab_cleanup_queue,
+                            browser_tab_cleanup_selected,
+                            browser_tab_cleanup_error,
+                            browser_tab_cleanup_busy,
+                        ),
+                        Err(err) => {
+                            browser_tab_cleanup_busy.set(false);
+                            browser_tab_cleanup_error.set(Some(js_error_text(err)));
+                        }
+                    }
+                });
+            })
+        />
+        <BrowserNeedsHumanOverlay
+            state=BrowserNeedsHumanOverlayState {
+                locale,
+                pending: browser_needs_human,
+                busy: browser_needs_human_busy,
+                error: browser_needs_human_error,
+            }
+            on_later=Callback::new(move |_| {
+                if browser_needs_human_busy.get_untracked() {
+                    return;
+                }
+                browser_needs_human.set(None);
+                browser_needs_human_error.set(None);
+            })
+            on_show=Callback::new(move |tab: BrowserNeedsHumanTab| {
+                if browser_needs_human_busy.get_untracked() {
+                    return;
+                }
+                spawn_local(async move {
+                    let arg = to_value(&serde_json::json!({
+                        "session": tab.session,
+                        "tabId": tab.tab_id,
+                    })).unwrap();
+                    let _ = invoke_checked("focus_browser_needs_human", arg).await;
+                });
+            })
+            on_done=Callback::new(move |tabs: Vec<BrowserNeedsHumanTab>| {
+                if browser_needs_human_busy.get_untracked() {
+                    return;
+                }
+                browser_needs_human_busy.set(true);
+                browser_needs_human_error.set(None);
+                let continue_message = t(locale.get_untracked(), "browser.needs_human.continue");
+                let still_message = t(locale.get_untracked(), "browser.needs_human.still");
+                let fail_message = t(locale.get_untracked(), "browser.needs_human.error");
+                let fallback_session = active_session.get_untracked();
+                let project_id = browser_project.get_untracked();
+                spawn_local(async move {
+                    let arg = to_value(&serde_json::json!({ "tabs": tabs })).unwrap();
+                    match invoke_checked("confirm_browser_needs_human", arg).await {
+                        Ok(value) => {
+                            let result = serde_wasm_bindgen::from_value::<BrowserNeedsHumanConfirmResult>(value)
+                                .unwrap_or_default();
+                            let current_project = browser_project.get_untracked() == project_id;
+                            if current_project {
+                                browser_needs_human_busy.set(false);
+                            }
+                            if result.still_required.is_empty() {
+                                let frame_id = result
+                                    .cleared
+                                    .first()
+                                    .map(|tab| tab.frame_id.clone())
+                                    .filter(|id| !id.is_empty())
+                                    .or(fallback_session);
+                                if current_project {
+                                    browser_needs_human.set(None);
+                                    browser_needs_human_error.set(None);
+                                }
+                                if let Some(session_id) = frame_id {
+                                    let args = to_value(&SendMessageArgs {
+                                        session_id: Some(session_id),
+                                        message: continue_message,
+                                        attachments: vec![],
+                                        references: vec![],
+                                        resume: false,
+                                        acp_agent_id: None,
+                                        guide: None,
+                                        replace: None,
+                                    }).unwrap();
+                                    let _ = invoke_checked("send_message", args).await;
+                                }
+                            } else if current_project {
+                                present_browser_needs_human(
+                                    browser_needs_human,
+                                    browser_needs_human_error,
+                                    BrowserNeedsHumanPrompt { tabs: result.still_required },
+                                );
+                                browser_needs_human_error.set(Some(still_message));
+                            }
+                        }
+                        Err(_) => {
+                            if browser_project.get_untracked() == project_id {
+                                browser_needs_human_busy.set(false);
+                                browser_needs_human_error.set(Some(fail_message));
+                            }
+                        }
+                    }
+                });
+            })
+        />
         <TurnMemoryOverlay
             state=TurnMemoryOverlayState {
                 locale,
@@ -9448,10 +11515,14 @@ fn App() -> impl IntoView {
                 demos, modal_artifact, locale, running, approval_pending,
                 sync_actions_available, command_palette_open, project_transfer,
                 privacy_mode_active, privacy_hidden_project_ids,
-                menu_new_project, menu_import_project,
+                menu_new_project, menu_import_project, home_calendar_open, home_dialog_open,
             }
             open_project=switch_project
             open_project_session=palette_open_session
+            open_project_journey=Callback::new(move |(id, day): (String, i64)| {
+                calendar_journey_request.set(Some((id.clone(), day)));
+                open_project_transition.call((id, None));
+            })
             open_scratch=open_scratch
             open_settings=Callback::new(move |section: Option<String>| open_settings_fn(section))
             open_library=Callback::new(move |_| show_library.set(true))
@@ -9487,21 +11558,21 @@ fn App() -> impl IntoView {
                 can_insert=Signal::derive(move || !show_projects.get())
             />
         })}
-        {move || show_research_graph.get().then(|| view! {
-            <ResearchGraphModal
-                locale=locale.read_only()
+        {move || (!show_projects.get() && show_research_graph.get()).then(|| view! {
+            <ResearchJourneyView
+                locale=locale
+                project_name=project_info.get().map(|p|p.name.clone()).unwrap_or_default()
+                initial_day=journey_initial_day.get_untracked()
+                left=Signal::derive(move || if show_sidebar.get() { sidebar_w.get() } else { 0.0 })
                 graph=research_graph.read_only()
+                artifact_open=Signal::derive(move || modal_artifact.get().is_some()
+                    || archive_frame.get().is_some()
+                    || show_settings.get() || show_library.get() || show_publication_workspace.get()
+                    || show_proj_settings.get() || show_capabilities.get())
                 on_close=Callback::new(move |_| show_research_graph.set(false))
-            />
-        })}
-        {move || show_publication_workspace.get().then(|| view! {
-            <PublicationWorkspaceModal
-                locale=locale.read_only()
-                binding_source=publication_binding_source
-                on_close=Callback::new(move |_| {
-                    publication_binding_source.set(None);
-                    show_publication_workspace.set(false);
-                })
+                on_artifact=Callback::new(move |target| modal_artifact.set(Some(target)))
+                on_session=Callback::new(move |id| { show_research_graph.set(false); load_session.call(id); })
+                on_archive=Callback::new(move |id|archive_frame.set(Some(id)))
             />
         })}
         <SshConnectivityOverlay
@@ -9537,19 +11608,24 @@ fn App() -> impl IntoView {
             })
             toggle_proj_menu=Callback::new(toggle_proj_menu)
             open_proj_settings=Callback::new(open_proj_settings)
-            switch_project=switch_project
-            new_session=Callback::new(new_session)
+            switch_project=Callback::new(move |id| { show_publication_workspace.set(false); publication_binding_source.set(None); switch_project.call(id); })
+            new_session=Callback::new(move |ev| { show_research_graph.set(false); new_session(ev); })
             open_search=Callback::new(move |_| {
                 action_palette_open.set(false);
                 command_palette_open.set(true);
             })
             new_folder=Callback::new(new_folder)
-            open_files=Callback::new(open_files)
+            open_files=Callback::new(move |ev| { show_publication_workspace.set(false); show_research_graph.set(false); open_files(ev); })
+            research_journey_open=show_research_graph.read_only()
             open_research_graph=Callback::new(move |_| {
+                show_publication_workspace.set(false);
+                journey_initial_day.set(None);
                 show_research_graph.set(true);
                 refresh_research_graph(research_graph);
             })
+            publication_open=show_publication_workspace.read_only()
             open_publication_workspace=Callback::new(move |_| {
+                show_research_graph.set(false);
                 publication_binding_source.set(None);
                 show_publication_workspace.set(true);
             })
@@ -9616,7 +11692,18 @@ fn App() -> impl IntoView {
             on_sidebar_resize_start=Callback::new(on_sidebar_resize_start)
         />
 
-        <div class="workspace-area">
+        <div class="workspace-area" class:publication-active=move || show_publication_workspace.get()>
+        {move || show_publication_workspace.get().then(|| view! {
+            <PublicationWorkspacePage
+                locale=locale.read_only()
+                binding_source=publication_binding_source
+                on_close=Callback::new(move |_| {
+                    publication_binding_source.set(None);
+                    show_publication_workspace.set(false);
+                })
+            />
+        })}
+
         <div class="workspace-main">
         <main class="center" class:split=move || center_split_on.get()
             style=move || center_chat_w.get()
@@ -9637,7 +11724,24 @@ fn App() -> impl IntoView {
                 })}
                 <div class="center-tabs" role="tablist">
                     <button type="button" class="center-tab" class:active=move || center_file.get().is_none()
-                        on:click=move |_| center_file.set(None)>
+                        title=move || if demo_mode.get() {
+                            t(locale.get(), "projects.example").into()
+                        } else {
+                            center_conversation_title.get()
+                        }
+                        on:click=move |_| center_file.set(None)
+                        on:dblclick=move |ev: web_sys::MouseEvent| {
+                            if demo_mode.get_untracked() {
+                                return;
+                            }
+                            let Some(id) = active_session.get_untracked() else {
+                                return;
+                            };
+                            ev.prevent_default();
+                            let title = center_conversation_title.get_untracked();
+                            rename_session_input.set(title.clone());
+                            rename_session_target.set(Some((id, title)));
+                        }>
                         <span class="center-tab-label">{move || if demo_mode.get() {
                             t(locale.get(), "projects.example").into()
                         } else {
@@ -9655,7 +11759,7 @@ fn App() -> impl IntoView {
                             view! {
                                 <div class="center-tab-wrap">
                                     <button type="button" class="center-tab" class:active=move || center_file.get().as_ref() == Some(&path)
-                                        title=path.clone() data-center-path=path.clone()
+                                        title=label.clone() data-center-path=path.clone()
                                         on:click=move |_| center_file.set(Some(select_path.clone()))>
                                         <span class="center-tab-label">{label}</span>
                                     </button>
@@ -9689,16 +11793,6 @@ fn App() -> impl IntoView {
                                 </button>
                             </span>
                         }.into_view())
-                    } else if compaction_active.get() {
-                        Some(view! {
-                            <div class="context-compaction-live" role="status" data-testid="context-compaction-live">
-                                <span class="context-compaction-spectrum" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
-                                <span class="context-compaction-live-copy">
-                                    <strong>{move || t(locale.get(), "chat.compacting_title")}</strong>
-                                    <span>{move || t(locale.get(), "chat.compacting_note")}</span>
-                                </span>
-                            </div>
-                        }.into_view())
                     } else if active_session
                         .get()
                         .is_some_and(|id| reviewing.with(|ids| ids.contains(&id)))
@@ -9708,7 +11802,7 @@ fn App() -> impl IntoView {
                                 <span class="review-live-lens" aria-hidden="true">
                                     <i></i><i></i><i></i>
                                 </span>
-                                <span class="context-compaction-live-copy">
+                                <span class="review-live-copy">
                                     <strong>{move || t(locale.get(), "chat.reviewing_title")}</strong>
                                     <span>{move || t(locale.get(), "chat.reviewing_note")}</span>
                                 </span>
@@ -9723,6 +11817,27 @@ fn App() -> impl IntoView {
                 }}
                 <div class="spacer"></div>
                 <div class="topbar-actions">
+                {move || active_session.get().is_some().then(|| view! {
+                    <TranscriptViewToggle />
+                })}
+                {move || {
+                    let count = conversation_outline.with(|rows| rows.len());
+                    (count > 0 && (!center_file_open.get() || center_split.get())).then(|| view! {
+                        <button type="button" class="icon-btn conversation-outline-toggle"
+                            class:active=move || conversation_outline_open.get()
+                            data-testid="conversation-outline-toggle"
+                            title=move || format!("{} · {}",
+                                t(locale.get(), "outline.show"),
+                                tf(locale.get(), "outline.questions_n", &[("n", &count.to_string())]))
+                            aria-label=move || t(locale.get(), "outline.show")
+                            aria-expanded=move || conversation_outline_open.get().to_string()
+                            aria-controls="conversation-outline-panel"
+                            on:click=move |_| conversation_outline_open.update(|open| *open = !*open)>
+                            {compose_icon("list")}
+                            <span class="conversation-outline-count" aria-hidden="true">{count}</span>
+                        </button>
+                    })
+                }}
                 <button type="button" class="icon-btn" data-testid="share-topbar"
                     title=move || {
                         if can_share.get() {
@@ -9743,6 +11858,11 @@ fn App() -> impl IntoView {
                     on:click=move |_| trajectory_open.set(true)>
                     {compose_icon("timeline")}
                 </button>
+                <button type="button" class="icon-btn" data-testid="archive-topbar"
+                    title=move ||research_journey::j(locale.get(),"Archive research","研究归档")
+                    aria-label=move ||research_journey::j(locale.get(),"Archive research","研究归档")
+                    disabled=move ||demo_mode.get() || busy.get() || active_session.get().is_none() || active_is_exploration.get()
+                    on:click=move |_|archive_frame.set(active_session.get_untracked())>{compose_icon("archive")}</button>
                 <div class="inbox-wrap">
                     <button class="icon-btn"
                         class:active=move || inbox_open.get()
@@ -9826,17 +11946,11 @@ fn App() -> impl IntoView {
                 </div>
             </div>
 
-            {move || (!demo_mode.get()).then(|| center_file.get()).flatten().and_then(|path| {
-                center_files.get().into_iter().find(|file| file.path == path)
-            }).map(|file| {
+            {move || center_preview.get().map(|(file, revision, display_path)| {
                 let path = file.path.clone();
-                let display_path = project_info
-                    .get()
-                    .and_then(|project| workspace_relative_path(&project.root, &path))
-                    .unwrap_or_else(|| path.replace('\\', "/"));
-                let revision = center_file_revisions.with(|revisions| {
-                    revisions.get(&path).copied().unwrap_or_default()
-                });
+                let heading_path = path.clone();
+                let heading_name = file.name.clone();
+                let heading_display = display_path;
                 // Including the revision in the preview identity disposes the
                 // old async loader and mounts a fresh read after FileChanged.
                 let dom_id = format!("center-file-{}-{revision}", file.path);
@@ -9863,13 +11977,59 @@ fn App() -> impl IntoView {
                         class:center-mcp-app-preview=is_mcp_app
                         data-file-revision=revision
                         data-preview-kind=kind.clone()
-                        data-file-path=path.clone()>
+                        data-file-path=path.clone()
+                        style=move || (run_language.is_some() && center_runtime_panel.get()).then(|| format!(
+                            "--runtime-right-w:{:.2}%;--runtime-bottom-h:{:.2}%",
+                            center_runtime_right_w.get(),
+                            center_runtime_bottom_h.get(),
+                        ))>
                         <div class="center-file-head">
-                            <span>{if is_mcp_app { label } else { display_path }}</span>
+                            <span>{
+                                let mcp_label = is_mcp_app.then_some(label);
+                                move || {
+                                    if let Some(label) = mcp_label.clone() {
+                                        label
+                                    } else {
+                                        center_preview_heading(
+                                            &heading_path,
+                                            &heading_name,
+                                            &heading_display,
+                                            snapshot_workspace_path.get().as_deref(),
+                                        )
+                                    }
+                                }
+                            }</span>
+                            {(artifact_version_id_path(&path).is_some()
+                                || artifact_id_path(&path).is_some())
+                                .then(|| view! {
+                                    <span class="center-file-snapshot-badge">
+                                        {move || t(locale.get(), "center.snapshot")}
+                                    </span>
+                                })}
                             <div class="spacer"></div>
-                            // Bind this script to a runtime. Whole-file execution
-                            // and direct editing deliberately stay out of this
-                            // AI-first preview; selected code can still be run.
+                            {move || snapshot_workspace_path.get().map(|workspace_path| {
+                                let open_path = workspace_path.clone();
+                                view! {
+                                    <button type="button" class="center-file-btn" data-open-editor=""
+                                        title=move || t(locale.get(), "center.open_editor")
+                                        aria-label=move || t(locale.get(), "center.open_editor")
+                                        on:click=move |_| {
+                                            let tab = CenterFileTab::from_path(open_path.clone());
+                                            center_files.update(|files| {
+                                                if !files.iter().any(|file| file.path == open_path) {
+                                                    files.push(tab.clone());
+                                                }
+                                            });
+                                            center_file.set(Some(open_path.clone()));
+                                        }>
+                                        {compose_icon("code")}
+                                        <span>{move || t(locale.get(), "center.open_editor")}</span>
+                                    </button>
+                                }
+                            })}
+                            // Bind this script to a runtime. The editor can run a
+                            // selection or the whole saved file; this control only
+                            // chooses which process those actions talk to.
                             {run_language.map(|language| {
                                 let bind_path = path.clone();
                                 let options = create_memo(move |_| {
@@ -9976,13 +12136,106 @@ fn App() -> impl IntoView {
                                     if center_split.get_untracked() { show_right.set(false); }
                                 }>{compose_icon("split")}</button>
                         </div>
-                        {if is_mcp_app {
+                        {if let Some(language) = run_language.filter(|_| !is_mcp_app) {
+                            // R/Python sources are directly editable; everything
+                            // else keeps the read-only preview.
+                            let editor_path = path.clone();
+                            let editor_options = create_memo(move |_| {
+                                runtime_binding_options(&execution_contexts.get(), language)
+                            });
+                            let editor_bound = {
+                                let path = editor_path.clone();
+                                create_memo(move |_| {
+                                    let stored = center_runtime_binding.get().get(&path).cloned();
+                                    resolve_runtime_binding(&editor_options.get(), stored.as_deref())
+                                })
+                            };
+                            let editor_run = Callback::new({
+                                let path = editor_path.clone();
+                                move |code: String| {
+                                    let Some(context_id) = editor_bound.get_untracked() else {
+                                        return;
+                                    };
+                                    run_in_runtime(
+                                        path.clone(),
+                                        context_id,
+                                        language.to_string(),
+                                        code,
+                                        locale.get_untracked(),
+                                        RuntimeRunCtx {
+                                            consoles: center_console,
+                                            plots: center_plots,
+                                            busy: center_run_busy,
+                                            runtimes: runtime_infos,
+                                            project: project_info,
+                                            object_states: runtime_object_states,
+                                            inspector_open: center_runtime_panel,
+                                            locale,
+                                        },
+                                    );
+                                }
+                            });
+                            let editor_run_script = Callback::new({
+                                let path = editor_path.clone();
+                                move |_: ()| {
+                                    let Some(context_id) = editor_bound.get_untracked() else {
+                                        return;
+                                    };
+                                    run_script_in_runtime(
+                                        path.clone(),
+                                        context_id,
+                                        language.to_string(),
+                                        locale.get_untracked(),
+                                        RuntimeRunCtx {
+                                            consoles: center_console,
+                                            plots: center_plots,
+                                            busy: center_run_busy,
+                                            runtimes: runtime_infos,
+                                            project: project_info,
+                                            object_states: runtime_object_states,
+                                            inspector_open: center_runtime_panel,
+                                            locale,
+                                        },
+                                    );
+                                }
+                            });
+                            view! {
+                                <RpCodeEditor
+                                    dom_id=dom_id.clone()
+                                    path=path.clone()
+                                    lang=language.to_string()
+                                    drafts=center_editor_drafts
+                                    busy=center_run_busy
+                                    on_run=editor_run
+                                    on_run_script=editor_run_script
+                                />
+                            }.into_view()
+                        } else if is_mcp_app {
                             mcp_apps.get().get(&path).cloned().map(|payload_json| view! {
-                                <McpAppPreview instance_id=path.clone() payload_json=payload_json />
+                                <McpAppPreview
+                                    instance_id=path.clone()
+                                    payload_json=payload_json
+                                    on_selection=Callback::new(move |selection: MotifSelection| {
+                                        let block = selection.composer_text();
+                                        input.update(|draft| {
+                                            if !draft.trim().is_empty() {
+                                                draft.push_str("\n\n");
+                                            }
+                                            draft.push_str(&block);
+                                        });
+                                        motif_selection.set(Some(selection));
+                                        focus_composer();
+                                    })
+                                />
                             }).into_view()
                         } else {
                             view! {
-                                <WorkspaceFilePreview dom_id=dom_id.clone() path=path.clone() kind=kind.clone() />
+                                <WorkspaceFilePreview
+                                    dom_id=dom_id.clone()
+                                    path=path.clone()
+                                    kind=kind.clone()
+                                    filename=file.name.clone()
+                                />
                             }.into_view()
                         }}
                         {run_language.map(|language| {
@@ -10016,18 +12269,83 @@ fn App() -> impl IntoView {
                                 })
                             })
                         })}
-                        {run_language.map(|_| {
+                        {run_language.map(|language| {
                             let console_file = console_file.clone();
+                            let console_options = create_memo(move |_| {
+                                runtime_binding_options(&execution_contexts.get(), language)
+                            });
+                            let console_bound = {
+                                let path = console_file.clone();
+                                create_memo(move |_| {
+                                    let stored = center_runtime_binding.get().get(&path).cloned();
+                                    resolve_runtime_binding(&console_options.get(), stored.as_deref())
+                                })
+                            };
+                            // Typing in the console prompt runs against the same
+                            // bound runtime as a selection run would.
+                            let on_run = Callback::new({
+                                let path = console_file.clone();
+                                move |code: String| {
+                                    let Some(context_id) = console_bound.get_untracked() else {
+                                        return;
+                                    };
+                                    run_in_runtime(
+                                        path.clone(),
+                                        context_id,
+                                        language.to_string(),
+                                        code,
+                                        locale.get_untracked(),
+                                        RuntimeRunCtx {
+                                            consoles: center_console,
+                                            plots: center_plots,
+                                            busy: center_run_busy,
+                                            runtimes: runtime_infos,
+                                            project: project_info,
+                                            object_states: runtime_object_states,
+                                            inspector_open: center_runtime_panel,
+                                            locale,
+                                        },
+                                    );
+                                }
+                            });
+                            let plots_file = console_file.clone();
                             move || center_runtime_panel.get().then(|| view! {
-                                <CenterRuntimeConsole path=console_file.clone() consoles=center_console />
+                                <CenterRuntimeConsole path=console_file.clone() consoles=center_console
+                                    language_label=language_display(language).to_string()
+                                    busy=center_run_busy on_run=on_run />
+                                <CenterRuntimePlots path=plots_file.clone() plots=center_plots />
+                                // Pane dividers: drag to resize the quadrants.
+                                <div class="center-runtime-col-resizer" role="separator"
+                                    aria-orientation="vertical"
+                                    on:mousedown=move |ev: web_sys::MouseEvent| {
+                                        ev.prevent_default();
+                                        center_runtime_col_dragging.set(true);
+                                    }></div>
+                                <div class="center-runtime-row-resizer" role="separator"
+                                    aria-orientation="horizontal"
+                                    on:mousedown=move |ev: web_sys::MouseEvent| {
+                                        ev.prevent_default();
+                                        center_runtime_row_dragging.set(true);
+                                    }></div>
                             })
                         })}
                     </div>
                 }
             })}
             {move || selection_popup.get().filter(|_| !demo_mode.get()).map(|(text, source, x, y)| {
-                let x = selection_popup_x(x);
-                let y = selection_popup_y(y);
+                // Run the selection in the file's bound runtime — the RStudio
+                // reflex. Only for R/Python sources, where a runtime exists.
+                let runtime_source = is_runtime_code_selection(source.as_deref());
+                let x = if runtime_source {
+                    selection_popup_x_with_max_width(x, 320)
+                } else {
+                    selection_popup_x(x)
+                };
+                let y = if runtime_source {
+                    selection_popup_y_with_clearance(y, 200)
+                } else {
+                    selection_popup_y(y)
+                };
                 let quote = text.clone();
                 let quote_source = source.clone();
                 let quote_source_for_click = quote_source.clone();
@@ -10041,13 +12359,16 @@ fn App() -> impl IntoView {
                 // Only chat-transcript selections (no source path) can be saved
                 // as a highlight; file-preview selections have their own actions.
                 let star_text = source.is_none().then(|| text.clone());
-                // Run the selection in the file's bound runtime — the RStudio
-                // reflex. Only for R/Python sources, where a runtime exists.
                 let run_selection = source.as_deref()
                     .and_then(runtime_language)
                     .map(|language| (source.clone().unwrap_or_default(), language, text));
+                let popup_class = if runtime_source {
+                    "selection-popup selection-popup-code"
+                } else {
+                    "selection-popup"
+                };
                 view! {
-                    <div class="selection-popup" style=format!("left:{x}px;top:{y}px")>
+                    <div class=popup_class style=format!("left:{x}px;top:{y}px")>
                         {star_text.map(|text| view! {
                             <button type="button" class="selection-popup-btn"
                                 on:click=move |_| {
@@ -10072,6 +12393,7 @@ fn App() -> impl IntoView {
                         {run_selection.map(|(path, language, code)| {
                             let run_ctx = RuntimeRunCtx {
                                 consoles: center_console,
+                                plots: center_plots,
                                 busy: center_run_busy,
                                 runtimes: runtime_infos,
                                 project: project_info,
@@ -10106,7 +12428,10 @@ fn App() -> impl IntoView {
                                 </button>
                             }
                         })}
-                        {quick_actions.get().into_iter()
+                        {runtime_source.then(|| view! {
+                            <span class="selection-popup-sep" aria-hidden="true"></span>
+                        })}
+                        {(!runtime_source).then(|| quick_actions.get().into_iter()
                             .filter(|action| action.enabled && action.context == "selection")
                             .map(|action| {
                             let action_id = action.id.clone();
@@ -10128,7 +12453,7 @@ fn App() -> impl IntoView {
                                     <span>{label}</span>
                                 </button>
                             }
-                            }).collect_view()}
+                            }).collect_view())}
                         <button type="button" class="selection-popup-btn"
                             on:click=move |_| {
                                 composer_quotes.update(|items| items.push(
@@ -10189,13 +12514,13 @@ fn App() -> impl IntoView {
                                     false,
                                 ));
                             }>
-                            {compose_icon("chat")}
+                            {compose_icon("sparkles")}
                             <span>{t(locale.get(), "selection.explain")}</span>
                         </button>
                         // Annotate → append the passage to reviews/<file>.md, which the
-                        // agent reads back with its ordinary tools. Only offered when the
-                        // selection came from a file preview (source path known).
-                        {annotate_source.map(|src| {
+                        // agent reads back with its ordinary tools. Offered on papers
+                        // and other previews, not on R/Python source (run/ask/quote).
+                        {annotate_source.filter(|_| !runtime_source).map(|src| {
                             let quote = annotate_text.clone();
                             view! {
                                 <button type="button" class="selection-popup-btn"
@@ -10230,12 +12555,22 @@ fn App() -> impl IntoView {
                 aria-label=move || t(locale.get(), "center.resize_split")
                 on:mousedown=on_center_split_resize_start></div>
             <div class="chat-stage" class:center-hidden=move || center_file_open.get() && !center_split.get()>
+            <Show when=move || chat_find_open.get()>
+                <chat_find::ChatFindBar open=chat_find_open locale=locale />
+            </Show>
             <div class="chat" id=CHAT_SCROLLER_ID
                 on:mouseup=move |ev| {
                     // Primary button only: a right-click mouseup would re-raise
                     // the popup on top of the context menu. Also honors the
                     // "selection quick actions" setting.
                     if ev.button() != 0 {
+                        return;
+                    }
+                    // Clicking a path/file link opens the preview on `click`.
+                    // mouseup runs first and must not treat the link text as a
+                    // quote selection, or both overlays appear together.
+                    if context_menu::selection_popup_blocked(&ev) {
+                        selection_popup.set(None);
                         return;
                     }
                     let popup = selection_popup_enabled
@@ -10246,11 +12581,16 @@ fn App() -> impl IntoView {
                     selection_popup.set(popup);
                 }
                 on:scroll=move |_| {
-                    if selection_popup.get_untracked().is_some() {
+                    // Follow-scroll (follow-ups, the runtime strip remounting)
+                    // used to dismiss the quote popup while the selection was
+                    // still live. Only clear it when the selection is gone.
+                    if selection_popup.get_untracked().is_some()
+                        && context_menu::selection_text().is_none()
+                    {
                         selection_popup.set(None);
                     }
                 }>
-                <div class="thread" id=CHAT_THREAD_ID>
+                <div class="thread" id=CHAT_THREAD_ID data-model-view=move || model_view_active().to_string()>
                     {move || active_session.get().and_then(|frame_id| {
                         let rows = explorations.get();
                         if let Some(summary) = rows.iter().find(|row| {
@@ -10297,14 +12637,9 @@ fn App() -> impl IntoView {
                                         )
                                 })
                                 .count();
-                            let latest_turn_index = items.with(|rows| {
-                                rows.iter()
-                                    .filter(|item| matches!(item, ChatItem::User(_)))
-                                    .count()
-                                    .saturating_sub(1)
-                            }) + transcript_pages
-                                .with(|pages| pages.get(&frame_id).copied())
-                                .map_or(0, |page| page.user_offset);
+                            let checkpoint_turn_index = rows.iter()
+                                .find(|row| row.source_frame_id == frame_id)
+                                .map_or(0, |row| row.checkpoint_user_index);
                             (active_count > 0).then(|| view! {
                                 <section class="exploration-banner mainline" data-testid="mainline-exploration-banner">
                                     <div class="exploration-banner-copy">
@@ -10312,12 +12647,25 @@ fn App() -> impl IntoView {
                                         <strong>{tf(locale.get(), "exploration.mainline_count", &[("n", &active_count.to_string())])}</strong>
                                         <span>{t(locale.get(), "exploration.mainline_warning")}</span>
                                     </div>
-                                    <button type="button" on:click=move |_| start_exploration_from_head.call(latest_turn_index)>{t(locale.get(), "exploration.start_another")}</button>
+                                    <button type="button" on:click=move |_| start_exploration_from_turn.call(checkpoint_turn_index)>{t(locale.get(), "exploration.start_another")}</button>
                                 </section>
                             }.into_view())
                         }
                     })}
-                    {move || active_session.get().and_then(|id| {
+                    {move || (transcript_loading.get().is_some() && transcript_loading.get() == active_session.get()).then(|| view! {
+                        <div class="transcript-page-control" role="status" data-testid="transcript-loading">{t(locale.get(), "transcript.open_loading")}</div>
+                    })}
+                    {move || transcript_page_error.get().and_then(|(id, message)| {
+                        (active_session.get().as_deref() == Some(id.as_str())).then(|| view! {
+                            <div class="transcript-page-control" role="alert">{message}
+                                <button type="button" on:click=move |_| load_session.call(id.clone())>{t(locale.get(), "transcript.retry")}</button>
+                            </div>
+                        })
+                    })}
+                    {move || (!model_view_active())
+                        .then(|| active_session.get())
+                        .flatten()
+                        .and_then(|id| {
                         transcript_pages.get().get(&id).copied().and_then(|page| {
                             let (_, window_start, _) = items.with(|rows| {
                                 transcript_render_window(
@@ -10340,7 +12688,7 @@ fn App() -> impl IntoView {
                                 })
                             } else {
                                 page.next_before_seq.map(|_| {
-                                let loading = page.loading;
+                                let loading = page.loading_request.is_some();
                                 view! {
                                     <div class="transcript-page-control">
                                         <button
@@ -10364,9 +12712,20 @@ fn App() -> impl IntoView {
                             }
                         })
                     })}
-                    {move || items.with(|l| l.is_empty()).then(|| view! {
+                    {move || (model_view.get() && context_view_loading.get()).then(|| view! {
+                        <div class="transcript-page-control" role="status" data-testid="context-view-loading">{t(locale.get(), "chat.context_view_loading")}</div>
+                    })}
+                    {move || model_view.get().then(|| context_view_error.get()).flatten().map(|message| view! {
+                        <div class="transcript-page-control" role="alert" data-testid="context-view-error">
+                            {message}
+                            <button type="button" on:click=move |_| {
+                                if let Some(id) = active_session.get_untracked() { refresh_context_state.call(id); }
+                            }>{t(locale.get(), "transcript.retry")}</button>
+                        </div>
+                    })}
+                    {move || (!model_view.get() && thread_items.with(|l| l.is_empty()) && !(transcript_loading.get().is_some() && transcript_loading.get() == active_session.get()) && transcript_page_error.get().is_none_or(|(id, _)| active_session.get().as_deref() != Some(id.as_str()))).then(|| view! {
                         <div class="empty">
-                            <span class="empty-logo"></span>
+                            <span class="empty-logo brand-wordmark" role="img" aria-label="wisp-depmap"></span>
                             <h1>{move || empty_title(locale.get(), empty_title_idx.get())}</h1>
                             <p>{move || empty_subtitle(locale.get(), empty_subtitle_idx.get())}</p>
                         </div>
@@ -10377,7 +12736,6 @@ fn App() -> impl IntoView {
                     <For
                         each=move || {
                             use std::hash::{Hash, Hasher};
-                            let arts_fp = artifact_render_fingerprint.get();
                             let busy_now = busy.get();
                             // `load_session` deliberately swaps the visible rows before
                             // publishing their session id. Carry the id in every keyed row
@@ -10409,20 +12767,21 @@ fn App() -> impl IntoView {
                             let user_offset = transcript_pages
                                 .with(|pages| pages.get(&thread_session_id).copied())
                                 .map_or(0, |page| page.user_offset);
-                            let requested_start = if busy_now {
-                                usize::MAX
-                            } else {
-                                transcript_pages.with(|pages| {
-                                    pages
-                                        .get(&thread_session_id)
-                                        .map(|page| page.window_user_start)
-                                        .unwrap_or(usize::MAX)
-                                })
-                            };
+                            // Sending a turn already selects the latest window.
+                            // Once the user requests history, keep that window
+                            // visible even while new response events arrive.
+                            let requested_start = transcript_pages.with(|pages| {
+                                pages
+                                    .get(&thread_session_id)
+                                    .map(|page| page.window_user_start)
+                                    .unwrap_or(usize::MAX)
+                            });
                             // Rows carry message indices, never cloned messages;
                             // `children` clones lazily, so a flush only pays for
                             // rows whose fingerprint key actually changed.
-                            conversation_outline.with(|outline| items.with(|list| {
+                            conversation_outline.with(|outline| {
+                            let list_owned = thread_items.get();
+                            let list = &list_owned;
                             // Queued user turns live after the active turn and
                             // must not make its process group look historical.
                             let queue_start = trailing_queue_start(list);
@@ -10445,19 +12804,29 @@ fn App() -> impl IntoView {
                             // once complete, fold commentary + reasoning + tools
                             // into one activity summary before the final answer.
                             let mut rows: Vec<(String, usize, bool, u64, ThreadRow)> = Vec::new();
-                            let (window, _, _) = transcript_render_window(
-                                list,
-                                requested_start,
-                                TRANSCRIPT_RENDER_TURNS,
-                            );
+                            // The model working set is already bounded by its
+                            // context window. Never inherit the full transcript's
+                            // paging offset and hide this epoch's checkpoint.
+                            let model_view_on = model_view.get();
+                            let window = if model_view_on {
+                                0..list.len()
+                            } else {
+                                transcript_render_window(list, requested_start, TRANSCRIPT_RENDER_TURNS).0
+                            };
                             let mut i = window.start;
                             while i < window.end {
                                 if renders_nothing(&list[i]) { i += 1; continue; }
-                                if let Some(end) = completed_activity_end(list, i, busy_now) {
+                                // Processed folding is transcript narrative.
+                                // Model view keeps the raw working-set order.
+                                if let Some(end) = (!model_view_on)
+                                    .then(|| completed_activity_end(list, i, busy_now))
+                                    .flatten()
+                                {
                                     let start = i;
                                     let mut indices: Vec<usize> = Vec::new();
                                     for j in i..end {
-                                        if is_turn_activity_at(list, j) {
+                                        if is_turn_activity_at(list, j)
+                                            || matches!(list[j], ChatItem::Usage { .. } | ChatItem::Compaction { .. }) {
                                             indices.push(j);
                                         }
                                     }
@@ -10529,23 +12898,17 @@ fn App() -> impl IntoView {
                                     let streaming_reasoning = live_reasoning_index == Some(i);
                                     let compact_assistant = commentary
                                         || live_assistant_index == Some(i);
-                                    let timestamp = transcript_item_timestamp(
+                                    let timestamp = (!model_view.get()).then(|| transcript_item_timestamp(
                                         list,
                                         i,
                                         user_offset,
                                         &outline,
-                                    );
+                                    )).flatten();
                                     let mut fp = if streaming_assistant || streaming_reasoning {
                                         0
                                     } else {
                                         list[i].fingerprint()
                                     };
-                                    // Assistant markdown embeds artifact chips (index + label).
-                                    if !streaming_assistant
-                                        && matches!(&list[i], ChatItem::Assistant { .. })
-                                    {
-                                        fp ^= arts_fp;
-                                    }
                                     fp ^= (commentary as u64) << 63;
                                     fp ^= (compact_assistant as u64) << 62;
                                     fp ^= timestamp.unwrap_or_default() as u64;
@@ -10566,7 +12929,7 @@ fn App() -> impl IntoView {
                             // session id. Use their persisted creation time to put the
                             // fallback card before the next user turn instead of always
                             // appending it to the live end of the conversation.
-                            let automatic_runs = automatic_session_runs.get();
+                            let automatic_runs = if model_view.get() { Vec::new() } else { automatic_session_runs.get() };
                             let mut automatic_runs = automatic_runs.into_iter().peekable();
                             let mut anchored = Vec::with_capacity(rows.len() + automatic_runs.len());
                             let mut synthetic_start = list.len();
@@ -10603,12 +12966,16 @@ fn App() -> impl IntoView {
                                 synthetic_start += 1;
                             }
                             anchored
-                            }))
+                            })
                         }
                         key=|(session_id, start, streaming, fp, _)| {
-                            (session_id.clone(), *start, *streaming, *fp)
+                            (session_id.clone(), *start, *streaming, *fp, model_view_active())
                         }
                         children=move |(session_id, start, _, _, row)| {
+                            // Model indices refer to the epoch, not the full
+                            // transcript. Keep direct borrows on the normal
+                            // streaming path to avoid cloning a long history.
+                            let row_source = if model_view_active_untracked() { thread_items } else { items.into() };
                             match row {
                                 ThreadRow::AutoRun { run_id } => view! {
                                     <div class="tool-wrap run-monitor-wrap auto-run-monitor"
@@ -10633,17 +13000,11 @@ fn App() -> impl IntoView {
                                 } => {
                                     // Rebuilt only when the fingerprint key changed,
                                     // so this is the one clone that actually pays off.
+                                    let nest_session_id = session_id.clone();
                                     let item = if streaming_reasoning {
                                         ChatItem::Reasoning(String::new())
                                     } else {
-                                        items.with_untracked(|list| list[i].clone())
-                                    };
-                                    let arts = if matches!(&item, ChatItem::Assistant { .. })
-                                        && !compact_assistant
-                                    {
-                                        artifacts.get_untracked()
-                                    } else {
-                                        Vec::new()
+                                        thread_items.with_untracked(|list| list[i].clone())
                                     };
                                     let on_resume = Callback::new(resume_turn);
                                     let class = if commentary {
@@ -10651,7 +13012,7 @@ fn App() -> impl IntoView {
                                     } else {
                                         class_for(&item)
                                     };
-                                    let user_index = items
+                                    let user_index = thread_items
                                         .with_untracked(|rows| user_turn_index(rows, i))
                                         .map(|index| {
                                             index
@@ -10661,7 +13022,7 @@ fn App() -> impl IntoView {
                                                     })
                                                     .map_or(0, |page| page.user_offset)
                                         });
-                                    let explore_turn_index = items
+                                    let explore_turn_index = thread_items
                                         .with_untracked(|rows| owning_user_turn_index(rows, i))
                                         .map(|index| {
                                             index
@@ -10671,6 +13032,26 @@ fn App() -> impl IntoView {
                                                     })
                                                     .map_or(0, |page| page.user_offset)
                                         });
+                                    let context_session_id = session_id.clone();
+                                    // Refresh marks when the context boundary changes,
+                                    // without rescanning history on each streaming chunk.
+                                    let in_context = Signal::derive(move || {
+                                        let boundary = in_context_from_user_index.get();
+                                        let user_offset = transcript_pages
+                                            .with(|pages| pages.get(&context_session_id).copied())
+                                            .map_or(0, |page| page.user_offset);
+                                        model_view.get() || thread_items.with_untracked(|rows| {
+                                            item_in_context(
+                                                rows,
+                                                i,
+                                                user_offset,
+                                                boundary,
+                                            )
+                                        })
+                                    });
+                                    let out_of_context_title = move || (!in_context.get()).then(|| {
+                                        t(locale.get(), "chat.out_of_context").to_string()
+                                    });
                                     let data_user_index =
                                         user_index.map(|index| index.to_string());
                                     let branch_anchor = if matches!(&item, ChatItem::User(_)) {
@@ -10709,18 +13090,23 @@ fn App() -> impl IntoView {
                                         Vec::new()
                                     };
                                     let can_undo = Signal::derive(move || {
-                                        !compact_assistant
+                                        !model_view_active()
+                                            && !compact_assistant
                                             && !matches!(active_branch_state.get().as_deref(), Some("merged" | "orphaned"))
                                             && undo_assistant_index.get() == Some(i)
                                     });
-                                    let show_actions = Signal::derive(move || !busy.get());
+                                    let show_actions = Signal::derive(move || !busy.get() && !model_view_active());
                                     let can_branch = Signal::derive(move || {
-                                        active_branch_state.get().is_none()
+                                        !model_view_active()
+                                            && active_branch_state.get().is_none()
                                             && active_acp_agent_id.get().is_none()
                                             && !active_is_exploration.get()
                                             && !busy.get()
                                     });
                                     let show_explore = Signal::derive(move || {
+                                        if model_view_active() {
+                                            return false;
+                                        }
                                         if compact_assistant
                                             || active_acp_agent_id.get().is_some()
                                             || active_branch_state.get().is_some()
@@ -10731,12 +13117,7 @@ fn App() -> impl IntoView {
                                         let Some(frame_id) = active_session.get() else {
                                             return false;
                                         };
-                                        let is_latest_completed = items.with(|rows| {
-                                            rows.iter().rposition(|item| {
-                                                matches!(item, ChatItem::Assistant { text, .. } if !text.trim().is_empty())
-                                            }) == Some(i)
-                                        });
-                                        is_latest_completed && !explorations.with(|rows| {
+                                        !explorations.with(|rows| {
                                             rows.iter().any(|row| {
                                                 row.exploration.frame_id == frame_id
                                             })
@@ -10754,10 +13135,11 @@ fn App() -> impl IntoView {
                                                 .find(|row| {
                                                     matches!(
                                                         row.exploration.status.as_str(),
-                                                        "creating" | "active" | "promoting"
+                                                        "creating" | "active" | "promoting" | "failed"
                                                     )
                                                 })
-                                                .is_none_or(|row| row.source_frame_id == frame_id)
+                                                .is_none_or(|row| row.source_frame_id == frame_id
+                                                    && Some(row.checkpoint_user_index) == explore_turn_index)
                                         });
                                         if !joins_current_round {
                                             return false;
@@ -10770,11 +13152,14 @@ fn App() -> impl IntoView {
                                                 conversation_outline_selected.get() == Some(index)
                                             })
                                             data-ui-index=i.to_string()
-                                            data-user-index=data_user_index>
+                                            data-user-index=data_user_index
+                                            data-in-context=move || in_context.get().to_string()
+                                            data-testid="transcript-item"
+                                            title=out_of_context_title>
                                             {if streaming_assistant {
                                                 view! {
                                                     <StreamingAssistantMessage
-                                                        items=items
+                                                        items=row_source
                                                         source_item=i
                                                         on_artifact=on_artifact_select
                                                         on_file=on_file_link
@@ -10783,7 +13168,7 @@ fn App() -> impl IntoView {
                                             } else if streaming_reasoning {
                                                 view! {
                                                     <StreamingReasoningMessage
-                                                        items=items
+                                                        items=row_source
                                                         source_item=i
                                                         session_id=session_id
                                                         disclosure_state=step_disclosure_state
@@ -10791,11 +13176,12 @@ fn App() -> impl IntoView {
                                                 }.into_view()
                                             } else {
                                                 render_item(
-                                                    i, &item, timestamp, &arts, on_artifact_select, on_file_link,
+                                                    i, &item, timestamp, artifacts, on_artifact_select, on_file_link,
                                                     run_records, run_clock.read_only(), busy.read_only(), compact_assistant,
-                                                    active_acp_agent_id.get().is_none()
+                                                    !model_view_active_untracked()
+                                                        && active_acp_agent_id.get().is_none()
                                                         && !matches!(active_branch_state.get_untracked().as_deref(), Some("merged" | "orphaned")),
-                                                    can_branch, show_actions, can_undo, show_explore, can_explore, edit_message, branch_message, undo_message, explore_turn_index.unwrap_or_default(), start_exploration_from_head, session_id,
+                                                    can_branch, show_actions, can_undo, show_explore, can_explore, edit_message, branch_message, undo_message, explore_turn_index.unwrap_or_default(), start_exploration_from_turn, session_id,
                                                     request_turn_memory, request_session_review, respond_confirm, on_resume,
                                                     step_disclosure_state,
                                                     plan_mode_active, plan_compat, on_plan_decision,
@@ -10804,82 +13190,137 @@ fn App() -> impl IntoView {
                                                     Callback::new(move |detail| branch_merge_detail.set(Some(detail))),
                                                 ).into_view()
                                             }}
-                                            {(!message_branches.is_empty() || !message_explorations.is_empty()).then(|| view! {
+                                            {(!model_view_active_untracked() && (!message_branches.is_empty() || !message_explorations.is_empty())).then(|| {
+                                                let loc = locale.get();
+                                                let branch_count = message_branches.len();
+                                                let exploration_count = message_explorations.len();
+                                                let branches = store_value(message_branches);
+                                                let explorations = store_value(message_explorations);
+                                                let branch_open_id = format!("{nest_session_id}:{i}:branches");
+                                                let exploration_open_id = format!("{nest_session_id}:{i}:explorations");
+                                                let branch_open_show = branch_open_id.clone();
+                                                let exploration_open_show = exploration_open_id.clone();
+                                                let open_branch = load_session.clone();
+                                                let open_exploration = open_exploration.clone();
+                                                view! {
                                                 <div class="message-branch-links">
-                                                    {message_branches.into_iter().map(|branch| {
-                                                        let open = load_session.clone();
-                                                        let open_id = branch.id.clone();
-                                                        let merged = branch.merged;
-                                                        let merge_summary = branch.merge_summary.clone();
-                                                        let title = if branch.title.trim().is_empty() {
-                                                            t(locale.get(), "sidebar.untitled").to_string()
-                                                        } else {
-                                                            branch.title
-                                                        };
-                                                        let detail_title = title.clone();
-                                                        view! {
-                                                            <div class="message-branch-entry">
-                                                                <button type="button" class="message-branch-link"
-                                                                    data-testid="message-branch-link"
-                                                                    data-session-id=branch.id
-                                                                    data-session-title=title.clone()
-                                                                    data-session-branch="true"
-                                                                    data-session-family="true"
-                                                                    data-branch-merged=if merged { "true" } else { "false" }
-                                                                    on:click=move |_| open.call(open_id.clone())>
-                                                                    <span aria-hidden="true">{compose_icon("branch")}</span>
-                                                                    <span>{title}</span>
-                                                                </button>
-                                                                {merge_summary.map(|summary| {
-                                                                    let detail_summary = summary.clone();
-                                                                    view! {
-                                                                        <button type="button" class="branch-merge-card" data-testid="branch-merge-card"
-                                                                            on:click=move |_| branch_merge_detail.set(Some((detail_title.clone(), detail_summary.clone())))>
-                                                                            <span class="branch-merge-card-icon" aria-hidden="true">{compose_icon("check")}</span>
-                                                                            <span class="branch-merge-card-copy">
-                                                                                <strong>{t(locale.get(), "branch.merged_result")}</strong>
-                                                                            </span>
-                                                                            <span class="branch-merge-card-open">{compose_icon("chevron-right")}</span>
-                                                                        </button>
-                                                                    }
-                                                                })}
-                                                            </div>
-                                                        }
-                                                    }).collect_view()}
-                                                    {message_explorations.into_iter().map(|summary| {
-                                                        let isolation_is_full = summary.isolation_is_full();
-                                                        let exploration = summary.exploration;
-                                                        let exploration_for_open = exploration.clone();
-                                                        let open = open_exploration.clone();
-                                                        let status_key = match exploration.status.as_str() {
-                                                            "active" => "exploration.status_active",
-                                                            "promoting" => "exploration.status_promoting",
-                                                            "creating" => "exploration.status_creating",
-                                                            _ => "exploration.status_failed",
-                                                        };
-                                                        let isolation_key = if isolation_is_full {
-                                                            "exploration.isolation_full"
-                                                        } else {
-                                                            "exploration.isolation_partial"
-                                                        };
-                                                        view! {
-                                                            <div class="message-branch-entry message-exploration-entry">
-                                                                <button type="button" class="message-branch-link exploration-message-card"
-                                                                    data-testid="exploration-message-card"
-                                                                    data-exploration-id=exploration.id.clone()
-                                                                    data-exploration-status=exploration.status.clone()
-                                                                    title=exploration.name.clone()
-                                                                    on:click=move |_| open.call(exploration_for_open.clone())>
-                                                                    <span aria-hidden="true">{compose_icon("flask")}</span>
-                                                                    <span class="message-exploration-copy">
-                                                                        <strong>{exploration.name}</strong>
-                                                                        <span>{format!("{} · {}", t(locale.get(), status_key), t(locale.get(), isolation_key))}</span>
-                                                                    </span>
-                                                                </button>
-                                                            </div>
-                                                        }
-                                                    }).collect_view()}
+                                                    {(branch_count > 0).then(|| view! {
+                                                        <div class="message-nest-group" data-testid="message-branches">
+                                                            {nested_links_toggle(
+                                                                loc,
+                                                                "branch.group",
+                                                                "branch.expand",
+                                                                "branch.collapse",
+                                                                branch_count,
+                                                                branch_open_id,
+                                                                nested_link_disclosure,
+                                                                "message-branch-toggle",
+                                                            )}
+                                                            {move || disclosure_open(nested_link_disclosure, &branch_open_show, true).then(|| {
+                                                                let open = open_branch.clone();
+                                                                view! {
+                                                                    <div class="message-nest-entries">
+                                                                        {branches.get_value().into_iter().map(|branch| {
+                                                                            let open = open.clone();
+                                                                            let open_id = branch.id.clone();
+                                                                            let merged = branch.merged;
+                                                                            let merge_summary = branch.merge_summary.clone();
+                                                                            let title = if branch.title.trim().is_empty() {
+                                                                                t(loc, "sidebar.untitled").to_string()
+                                                                            } else {
+                                                                                branch.title
+                                                                            };
+                                                                            let detail_title = title.clone();
+                                                                            view! {
+                                                                                <div class="message-branch-entry">
+                                                                                    <button type="button" class="message-branch-link"
+                                                                                        data-testid="message-branch-link"
+                                                                                        data-session-id=branch.id
+                                                                                        data-session-title=title.clone()
+                                                                                        data-session-branch="true"
+                                                                                        data-session-family="true"
+                                                                                        data-branch-merged=if merged { "true" } else { "false" }
+                                                                                        on:click=move |_| open.call(open_id.clone())>
+                                                                                        <span aria-hidden="true">{compose_icon("branch")}</span>
+                                                                                        <span>{title}</span>
+                                                                                    </button>
+                                                                                    {merge_summary.map(|summary| {
+                                                                                        let detail_summary = summary.clone();
+                                                                                        view! {
+                                                                                            <button type="button" class="branch-merge-card" data-testid="branch-merge-card"
+                                                                                                on:click=move |_| branch_merge_detail.set(Some((detail_title.clone(), detail_summary.clone())))>
+                                                                                                <span class="branch-merge-card-icon" aria-hidden="true">{compose_icon("check")}</span>
+                                                                                                <span class="branch-merge-card-copy">
+                                                                                                    <strong>{t(loc, "branch.merged_result")}</strong>
+                                                                                                </span>
+                                                                                                <span class="branch-merge-card-open">{compose_icon("chevron-right")}</span>
+                                                                                            </button>
+                                                                                        }
+                                                                                    })}
+                                                                                </div>
+                                                                            }
+                                                                        }).collect_view()}
+                                                                    </div>
+                                                                }
+                                                            })}
+                                                        </div>
+                                                    })}
+                                                    {(exploration_count > 0).then(|| view! {
+                                                        <div class="message-nest-group" data-testid="message-explorations">
+                                                            {nested_links_toggle(
+                                                                loc,
+                                                                "exploration.group",
+                                                                "exploration.expand",
+                                                                "exploration.collapse",
+                                                                exploration_count,
+                                                                exploration_open_id,
+                                                                nested_link_disclosure,
+                                                                "message-exploration-toggle",
+                                                            )}
+                                                            {move || disclosure_open(nested_link_disclosure, &exploration_open_show, true).then(|| {
+                                                                let open = open_exploration.clone();
+                                                                view! {
+                                                                    <div class="message-nest-entries">
+                                                                        {explorations.get_value().into_iter().map(|summary| {
+                                                                            let isolation_is_full = summary.isolation_is_full();
+                                                                            let exploration = summary.exploration;
+                                                                            let exploration_for_open = exploration.clone();
+                                                                            let open = open.clone();
+                                                                            let status_key = match exploration.status.as_str() {
+                                                                                "active" => "exploration.status_active",
+                                                                                "promoting" => "exploration.status_promoting",
+                                                                                "creating" => "exploration.status_creating",
+                                                                                _ => "exploration.status_failed",
+                                                                            };
+                                                                            let isolation_key = if isolation_is_full {
+                                                                                "exploration.isolation_full"
+                                                                            } else {
+                                                                                "exploration.isolation_partial"
+                                                                            };
+                                                                            view! {
+                                                                                <div class="message-branch-entry message-exploration-entry">
+                                                                                    <button type="button" class="message-branch-link exploration-message-card"
+                                                                                        data-testid="exploration-message-card"
+                                                                                        data-exploration-id=exploration.id.clone()
+                                                                                        data-exploration-status=exploration.status.clone()
+                                                                                        title=exploration.name.clone()
+                                                                                        on:click=move |_| open.call(exploration_for_open.clone())>
+                                                                                        <span aria-hidden="true">{compose_icon("flask")}</span>
+                                                                                        <span class="message-exploration-copy">
+                                                                                            <strong>{exploration.name}</strong>
+                                                                                            <span>{format!("{} · {}", t(loc, status_key), t(loc, isolation_key))}</span>
+                                                                                        </span>
+                                                                                    </button>
+                                                                                </div>
+                                                                            }
+                                                                        }).collect_view()}
+                                                                    </div>
+                                                                }
+                                                            })}
+                                                        </div>
+                                                    })}
                                                 </div>
+                                                }
                                             })}
                                         </div>
                                     }.into_view()
@@ -10892,7 +13333,7 @@ fn App() -> impl IntoView {
                                         <div class="steps-wrap" data-ui-indices=ui_indices>{
                                             render_steps_group(
                                                 indices,
-                                                items,
+                                                row_source,
                                                 live,
                                                 false,
                                                 None,
@@ -10908,7 +13349,7 @@ fn App() -> impl IntoView {
                                         <div class="steps-wrap" data-ui-indices=ui_indices>{
                                             render_steps_group(
                                                 indices,
-                                                items,
+                                                row_source,
                                                 false,
                                                 true,
                                                 duration_ms,
@@ -10921,6 +13362,16 @@ fn App() -> impl IntoView {
                             }
                         }
                     />
+                    {move || compaction_active.get().then(|| view! {
+                        <div class="context-compaction-live context-compaction-status" role="status" aria-live="polite" data-testid="context-compaction-live">
+                            <span class="context-compaction-mark" aria-hidden="true">{compose_icon("context-compact")}</span>
+                            <span class="context-compaction-copy">
+                                <strong>{move || t(locale.get(), "chat.compacting_title")}</strong>
+                                <span class="context-compaction-detail">{move || t(locale.get(), "chat.compacting_note")}</span>
+                            </span>
+                            <span class="context-compaction-rule" aria-hidden="true"></span>
+                        </div>
+                    })}
                     {move || (!busy.get()).then(|| active_session.get()).flatten().and_then(|frame_id| {
                         follow_up_questions.with(|all| all.get(&frame_id).cloned()).map(|questions| {
                             let close_frame_id = frame_id.clone();
@@ -10956,7 +13407,10 @@ fn App() -> impl IntoView {
                             }
                         })
                     })}
-                    {move || (!busy.get()).then(|| active_session.get()).flatten().and_then(|id| {
+                    {move || (!model_view_active())
+                        .then(|| active_session.get())
+                        .flatten()
+                        .and_then(|id| {
                         transcript_pages.get().get(&id).copied().and_then(|page| {
                             let (_, start, total) = items.with(|rows| {
                                 transcript_render_window(
@@ -10983,7 +13437,14 @@ fn App() -> impl IntoView {
             // Static element; scroll.js toggles `.visible` — no reactive rebuild.
             <button type="button" id="chat-jump-pill" class="chat-jump-pill"
                 aria-label=move || t(locale.get(), "chat.jump_bottom")
-                on:click=move |_| force_chat_bottom()>
+                on:click=move |_| {
+                    if let Some(id) = active_session.get_untracked() {
+                        transcript_pages.update(|pages| {
+                            pages.entry(id).or_default().window_user_start = usize::MAX;
+                        });
+                    }
+                    force_chat_bottom();
+                }>
                 {compose_icon("chevron-down")}
                 {move || t(locale.get(), "chat.jump_bottom")}
             </button>
@@ -11012,6 +13473,7 @@ fn App() -> impl IntoView {
                                     type="button"
                                     class="conversation-outline-item"
                                     class:active=move || conversation_outline_selected.get() == Some(target)
+                                    aria-current=move || if conversation_outline_selected.get() == Some(target) { "location" } else { "false" }
                                     aria-label=aria_label
                                     title=title
                                     prop:disabled=move || {
@@ -11052,38 +13514,10 @@ fn App() -> impl IntoView {
                             }
                         })
                         .collect_view();
-                    let stride = (rows.len() + 27) / 28;
-                    let marks = rows
-                        .iter()
-                        .step_by(stride.max(1))
-                        .map(|entry| {
-                            let width = 45 + entry.text.chars().count().min(40);
-                            let target = entry.user_index;
-                            view! {
-                                <span
-                                    class="conversation-outline-mark"
-                                    class:active=move || conversation_outline_selected.get() == Some(target)
-                                    style=format!("width:{width}%")
-                                ></span>
-                            }
-                        })
-                        .collect_view();
                     view! {
-                        <button
-                            type="button"
-                            class="conversation-outline-toggle"
-                            class:is-hidden=move || conversation_outline_mounted.get()
-                            data-testid="conversation-outline-toggle"
-                            title=move || t(locale.get(), "outline.show")
-                            aria-label=move || t(locale.get(), "outline.show")
-                            aria-expanded=move || conversation_outline_open.get().to_string()
-                            aria-hidden=move || conversation_outline_mounted.get().to_string()
-                            on:click=move |_| conversation_outline_open.set(true)
-                        >
-                            <span class="conversation-outline-marks" aria-hidden="true">{marks}</span>
-                        </button>
                         {conversation_outline_mounted.get().then(|| view! {
                             <nav
+                                id="conversation-outline-panel"
                                 class="conversation-outline-panel"
                                 class:is-open=move || conversation_outline_open.get()
                                 data-testid="conversation-outline"
@@ -11092,6 +13526,7 @@ fn App() -> impl IntoView {
                                 prop:inert=move || !conversation_outline_open.get()
                             >
                                 <header>
+                                    <span class="conversation-outline-heading-icon" aria-hidden="true">{compose_icon("list")}</span>
                                     <div>
                                         <strong>{move || t(locale.get(), "outline.title")}</strong>
                                         <span>{move || tf(locale.get(), "outline.questions_n", &[("n", &count)])}</span>
@@ -11115,10 +13550,10 @@ fn App() -> impl IntoView {
             </div>
 
             {move || active_session.get().and_then(|session_id| {
-                // Finished transfers linger briefly for confirmation. Reading
-                // the shared clock makes this tray recompute after run polling
-                // stops, so settled cards cannot remain over the conversation.
-                let now = run_clock.get();
+                // Finished transfers linger briefly for confirmation. The
+                // clock-driving effect above stops updating this signal after
+                // the final card expires.
+                let now = transfer_tray_now.get();
                 let transfers = run_records.with(|records| {
                     records
                         .iter()
@@ -11131,8 +13566,18 @@ fn App() -> impl IntoView {
                         .collect::<Vec<_>>()
                 });
                 (!transfers.is_empty()).then(|| view! {
-                    <div class="transfer-tray" aria-live="polite">
-                        {transfers.into_iter().map(|(run, progress)| {
+                    <div class="transfer-tray" class:collapsed=transfer_tray_collapsed.get()>
+                        {if transfer_tray_collapsed.get() {
+                            view! {
+                                <button type="button" class="transfer-summary"
+                                    aria-label=t(locale.get(), "transfer.expand") aria-expanded="false"
+                                    on:click=move |_| transfer_tray_collapsed.set(false)>
+                                    {compose_icon("sync")}
+                                    <span>{tf(locale.get(), "transfer.count", &[("n", &transfers.len().to_string())])}</span>
+                                    {compose_icon("expand")}
+                                </button>
+                            }.into_view()
+                        } else { transfers.into_iter().map(|(run, progress)| {
                             let run_id = run.id.clone();
                             let cancellable = matches!(
                                 run.status.as_str(),
@@ -11145,16 +13590,25 @@ fn App() -> impl IntoView {
                             };
                             let direction = progress.direction.clone();
                             let icon = match direction.as_str() {
-                                "download" => "↓",
-                                "relay" => "↔",
-                                _ => "↑",
+                                "download" => "download",
+                                "relay" => "sync",
+                                _ => "upload",
                             };
                             view! {
                                 <section class="transfer-card" data-run-id=run.id>
                                     <div class="transfer-card-head">
-                                        <span class="transfer-card-icon">{icon}</span>
-                                        <strong>{run.title}</strong>
-                                        <span>{run.context_id}</span>
+                                        <span class="transfer-card-icon" aria-hidden="true">{compose_icon(icon)}</span>
+                                        <strong title=run.context_id>{run.title}</strong>
+                                        <span class="transfer-elapsed">{tf(locale.get(), "transfer.elapsed", &[("time", &transfer_duration(
+                                            run.ended_at.filter(|_| !cancellable).unwrap_or(now)
+                                                .saturating_sub(run.started_at.unwrap_or(run.created_at)).max(0) as u64
+                                        ))])}</span>
+                                        <button type="button" class="icon-btn transfer-collapse"
+                                            title=t(locale.get(), "transfer.collapse")
+                                            aria-label=t(locale.get(), "transfer.collapse") aria-expanded="true"
+                                            on:click=move |_| transfer_tray_collapsed.set(true)>
+                                            {compose_icon("chevron-down")}
+                                        </button>
                                         {cancellable.then(|| {
                                             let tip = cancel_label.clone();
                                             view! {
@@ -11175,7 +13629,7 @@ fn App() -> impl IntoView {
                                     {run_progress_meter(progress, locale.get())}
                                 </section>
                             }
-                        }).collect_view()}
+                        }).collect_view()}}
                     </div>
                 })
             })}
@@ -11183,6 +13637,169 @@ fn App() -> impl IntoView {
             <div class="composer"
                 class:center-hidden=move || center_file_open.get() && !center_split.get()
                 class:demo-read-only=move || demo_mode.get()>
+                {move || browser_extension_status.get().map(|status| {
+                    let loc = locale.get();
+                    let current = status
+                        .current_version
+                        .clone()
+                        .unwrap_or_else(|| t(loc, "browser.extension.unknown"));
+                    let bundled = status
+                        .bundled_version
+                        .clone()
+                        .unwrap_or_else(|| t(loc, "browser.extension.unknown"));
+                    let path = status.extension_path.clone().unwrap_or_default();
+                    let manual = browser_extension_update_outcome
+                        .get()
+                        .as_deref()
+                        == Some("manual_reload_required");
+                    let title_key = if manual {
+                        "browser.extension.manual_title"
+                    } else if !status.connected {
+                        "browser.extension.waiting_title"
+                    } else {
+                        "browser.extension.title"
+                    };
+                    let body_key = if manual {
+                        "browser.extension.manual_body"
+                    } else if !status.connected {
+                        "browser.extension.waiting_body"
+                    } else {
+                        "browser.extension.body"
+                    };
+                    let body = tf(
+                        loc,
+                        body_key,
+                        &[("current", current.as_str()), ("required", bundled.as_str())],
+                    );
+                    let backend_error = browser_extension_update_error
+                        .get()
+                        .or_else(|| status.error.clone());
+                    let target_version = bundled.clone();
+                    let update_path = path.clone();
+                    let copy_path = path.clone();
+                    view! {
+                        <section class="exploration-banner browser-extension-update"
+                            data-testid="browser-extension-update-banner" role="status">
+                            <div class="exploration-banner-copy">
+                                <span class="exploration-banner-eyebrow">{t(loc, "browser.extension.eyebrow")}</span>
+                                <strong>{t(loc, title_key)}</strong>
+                                <span>{body}</span>
+                                {(!path.is_empty()).then(|| view! {
+                                    <code class="browser-extension-path" data-testid="browser-extension-path">{path}</code>
+                                })}
+                                {backend_error.map(|error| view! {
+                                    <span class="browser-extension-error" role="alert">{error}</span>
+                                })}
+                            </div>
+                            <div class="exploration-banner-actions">
+                                {(!manual).then(|| view! {
+                                    <button type="button" class="primary"
+                                        disabled=move || browser_extension_update_busy.get()
+                                        on:click=move |_| {
+                                            if browser_extension_update_busy.get_untracked() {
+                                                return;
+                                            }
+                                            browser_extension_update_busy.set(true);
+                                            browser_extension_update_error.set(None);
+                                            let update_path = update_path.clone();
+                                            spawn_local(async move {
+                                                let value = invoke("update_browser_extension", JsValue::UNDEFINED).await;
+                                                match from_value::<BrowserExtensionUpdateResult>(value) {
+                                                    Ok(result) => {
+                                                        let outcome = result.outcome.clone();
+                                                        browser_extension_update_outcome.set(Some(outcome.clone()));
+                                                        browser_extension_update_error
+                                                            .set(result.error.clone().or_else(|| result.status.error.clone()));
+                                                        if outcome == "updated" {
+                                                            browser_extension_status.set(None);
+                                                            show_actionable_toast(&t(
+                                                                locale.get_untracked(),
+                                                                "browser.extension.updated",
+                                                            ));
+                                                        } else {
+                                                            browser_extension_status.set(Some(result.status));
+                                                            if outcome == "manual_reload_required" {
+                                                                if !update_path.is_empty() {
+                                                                    if let Some(window) = web_sys::window() {
+                                                                        let _ = wasm_bindgen_futures::JsFuture::from(
+                                                                            window.navigator().clipboard().write_text(&update_path),
+                                                                        )
+                                                                        .await;
+                                                                    }
+                                                                }
+                                                                show_actionable_warning_toast(&t(
+                                                                    locale.get_untracked(),
+                                                                    "browser.extension.manual_ready",
+                                                                ));
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(error) => {
+                                                        browser_extension_update_error.set(Some(error.to_string()));
+                                                        show_actionable_warning_toast(&t(
+                                                            locale.get_untracked(),
+                                                            "browser.extension.failed",
+                                                        ));
+                                                    }
+                                                }
+                                                browser_extension_update_busy.set(false);
+                                            });
+                                        }>
+                                        {move || if browser_extension_update_busy.get() {
+                                            t(locale.get(), "browser.extension.updating")
+                                        } else {
+                                            t(locale.get(), "browser.extension.update")
+                                        }}
+                                    </button>
+                                })}
+                                {(!copy_path.is_empty()).then(|| view! {
+                                    <button type="button"
+                                        on:click=move |_| {
+                                            let path = copy_path.clone();
+                                            spawn_local(async move {
+                                                if let Some(window) = web_sys::window() {
+                                                    let _ = wasm_bindgen_futures::JsFuture::from(
+                                                        window.navigator().clipboard().write_text(&path),
+                                                    )
+                                                    .await;
+                                                    show_actionable_toast(&t(
+                                                        locale.get_untracked(),
+                                                        "browser.extension.path_copied",
+                                                    ));
+                                                }
+                                            });
+                                        }>{t(loc, "browser.extension.copy_path")}</button>
+                                })}
+                                <button type="button"
+                                    on:click=move |_| {
+                                        spawn_local(async move {
+                                            let setup = from_value::<BrowserExtensionSetup>(
+                                                open_browser_extension_page().await,
+                                            )
+                                            .unwrap_or_default();
+                                            if !setup.opened {
+                                                show_actionable_warning_toast(&t(
+                                                    locale.get_untracked(),
+                                                    "browser.extension.open_failed",
+                                                ));
+                                            }
+                                        });
+                                    }>{t(loc, "browser.extension.open_page")}</button>
+                                <button type="button"
+                                    on:click=move |_| refresh_browser_extension_status.call(())>
+                                    {t(loc, "browser.extension.recheck")}
+                                </button>
+                                <button type="button"
+                                    on:click=move |_| {
+                                        browser_extension_dismissed_version.set(Some(target_version.clone()));
+                                        browser_extension_status.set(None);
+                                        browser_extension_update_outcome.set(None);
+                                        browser_extension_update_error.set(None);
+                                    }>{t(loc, "browser.extension.dismiss")}</button>
+                            </div>
+                        </section>
+                    }
+                })}
                 {move || {
                     let Some(notice) = browser_offline_notice.get() else {
                         return None;
@@ -11209,6 +13826,33 @@ fn App() -> impl IntoView {
                                             send.call(ComposerSendAction::Normal);
                                         }>{t(locale.get(), "browser.offline.retry")}</button>
                                     <button type="button"
+                                        on:click=move |_| {
+                                            spawn_local(async move {
+                                                let reply = open_browser_extension_page().await;
+                                                let setup = from_value::<BrowserExtensionSetup>(reply)
+                                                    .unwrap_or_default();
+                                                let path = setup
+                                                    .extension_path
+                                                    .filter(|path| !path.trim().is_empty());
+                                                let has_path = path.is_some();
+                                                // Keep the remaining manual steps to one paste:
+                                                // the extension path goes onto the clipboard.
+                                                if let Some(path) = path {
+                                                    if let Some(window) = web_sys::window() {
+                                                        let _ = wasm_bindgen_futures::JsFuture::from(
+                                                            window.navigator().clipboard().write_text(&path),
+                                                        )
+                                                        .await;
+                                                    }
+                                                }
+                                                if setup.opened && has_path {
+                                                    show_actionable_toast(&t(locale.get_untracked(), "browser.offline.setup_done"));
+                                                } else {
+                                                    show_actionable_warning_toast(&t(locale.get_untracked(), "browser.offline.setup_failed"));
+                                                }
+                                            });
+                                        }>{t(locale.get(), "browser.offline.setup")}</button>
+                                    <button type="button"
                                         on:click=move |_| browser_offline_notice.set(None)>{t(locale.get(), "browser.offline.dismiss")}</button>
                                 </div>
                             </section>
@@ -11219,6 +13863,9 @@ fn App() -> impl IntoView {
                     <div class="demo-read-only-notice" data-testid="demo-read-only" role="status">
                         {t(locale.get(), "projects.example_read_only")}
                     </div>
+                })}
+                {move ||active_archived.get().then(||view!{
+                    <div class="archive-readonly" data-testid="archive-readonly"><span>{research_journey::j(locale.get(),"Archived notebook · read only","实验记录本已归档 · 只读")}</span><button class="btn-ghost" on:click=move |_|archive_frame.set(active_session.get_untracked())>{research_journey::j(locale.get(),"View milestone / Continue research","查看归档 / 继续研究")}</button></div>
                 })}
                 {move || next_stopping_session(
                     stopping_session.get(),
@@ -11257,6 +13904,21 @@ fn App() -> impl IntoView {
                                         on_compact=compact_from_usage
                                         on_new_session=new_session_from_usage
                                         compact_disabled=Signal::derive(move || busy.get())
+                                        epoch_line=context_epoch_line(
+                                            locale.get(),
+                                            head_epoch.get(),
+                                            context_epochs.with(|rows| {
+                                                rows.iter().any(|row| {
+                                                    row.epoch == head_epoch.get()
+                                                        && row.checkpoint_seq.is_some()
+                                                })
+                                            }),
+                                            conversation_outline.with(|rows| {
+                                                rows.len().saturating_sub(
+                                                    in_context_from_user_index.get().unwrap_or(0),
+                                                )
+                                            }),
+                                        )
                                     />
                                 </div>
                             }
@@ -11267,7 +13929,26 @@ fn App() -> impl IntoView {
                         items=items
                         user_offset=composer_queue_offset
                         can_cut_in=composer_queue_can_cut_in
+                        queue_states=Signal::derive(move || { let sid = active_session.get().unwrap_or_default(); queue_states.get().into_iter().filter_map(|((session, id), state)| (session == sid).then_some((id, state))).collect() })
                         on_queue=on_queue
+                    />
+                })}
+                {move || (!demo_mode.get()).then(|| view! {
+                    <ComposerPlanProgress items=items busy=busy session_id=active_session />
+                    <SessionRuntimeStrip
+                        locale=locale
+                        execution_contexts=execution_contexts
+                        session_execution_contexts=session_execution_contexts
+                        default_execution_context=default_execution_context
+                        session_default_execution_context=session_default_execution_context
+                        runtimes=runtime_infos
+                        active_project=project_info
+                        projects=proj_list
+                        runtime_environment=runtime_environment
+                        runtime_environment_pinned=runtime_environment_pinned
+                        object_states=runtime_object_states
+                        context_details_modal=context_details_modal
+                        selected_context_id=selected_context_id
                     />
                 })}
                 <div class="composer-inner"
@@ -11294,6 +13975,29 @@ fn App() -> impl IntoView {
                                     on:click=move |_| feedback_context.set(None)>{compose_icon("close")}</button>
                             </div>
                         </div>
+                    })}
+                    {move || motif_selection.get().map(|selection| {
+                        let selection_label = selection.feature_name.as_deref()
+                            .filter(|name| !name.trim().is_empty())
+                            .map(|name| format!("{} · {name}", selection.record_name.clone()))
+                            .unwrap_or_else(|| selection.record_name.clone());
+                        view! { <div class="composer-attachments composer-reference-chips" data-testid="motif-selection-reference">
+                            <div class="composer-attachment-row composer-reference-card motif-selection">
+                                <span class="composer-attachment-icon">{compose_icon("dna")}</span>
+                                <span class="composer-attachment-copy">
+                                    <span class="composer-attachment ready">{selection_label}</span>
+                                    <span class="composer-attachment-meta">{format!("{}-{} · {} bp", selection.start, selection.end, selection.length_bp())}</span>
+                                </span>
+                                <button type="button" class="composer-attachment-remove"
+                                    title=move || t(locale.get(), "composer.remove_attachment")
+                                    aria-label=move || t(locale.get(), "composer.remove_attachment")
+                                    on:click=move |_| {
+                                        let block = selection.composer_text();
+                                        input.update(|draft| *draft = draft.replace(&block, "").trim().to_string());
+                                        motif_selection.set(None);
+                                    }>{compose_icon("close")}</button>
+                            </div>
+                        </div> }
                     })}
                     {move || (!attachments.get().is_empty()).then(|| view! {
                         <div class="composer-attachments">
@@ -11373,6 +14077,7 @@ fn App() -> impl IntoView {
                                 let label = reference.label();
                                 let kind = reference.kind();
                                 let (icon, meta_key) = match kind {
+                                    "file-path" => ("doc", "attachment.file_path"),
                                     "skill" => ("skill", "attachment.skill"),
                                     "session" => ("chat", "attachment.session"),
                                     "project" => ("folder", "attachment.project"),
@@ -11382,7 +14087,7 @@ fn App() -> impl IntoView {
                                 };
                                 view! {
                                     <div class=format!("composer-attachment-row composer-reference-card {kind}")
-                                        data-reference-kind=kind title=label.clone()>
+                                        data-reference-kind=kind title=match &reference { ComposerReferenceChip::FilePath { path } => path.clone(), _ => label.clone() }>
                                         <span class="composer-attachment-icon">{compose_icon(icon)}</span>
                                         <span class="composer-attachment-copy">
                                             <span class="composer-attachment ready">{label}</span>
@@ -11396,6 +14101,41 @@ fn App() -> impl IntoView {
                                 }
                             }).collect_view()}
                         </div>
+                    })}
+                    {move || mcp_app_context.get().map(|context| {
+                        let context_id = context.context_id.clone();
+                        let app_name = context.app_name.clone();
+                        let app_name_label = app_name.clone();
+                        let summary = context.summary.clone();
+                        view! {
+                            <div class="composer-attachments composer-reference-chips" data-testid="mcp-app-context-attachment">
+                                <div class="composer-attachment-row composer-reference-card mcp-app-context"
+                                    title=summary>
+                                    <span class="composer-attachment-icon">{compose_icon("server")}</span>
+                                    <span class="composer-attachment-copy">
+                                        <span class="composer-attachment ready">{app_name_label}</span>
+                                        <span class="composer-attachment-meta">{move || t(locale.get(), "attachment.mcp_context")}</span>
+                                    </span>
+                                    <button type="button"
+                                        class="composer-attachment-remove"
+                                        title=move || t(locale.get(), "composer.remove_attachment")
+                                        aria-label=move || t(locale.get(), "composer.remove_attachment")
+                                        on:click=move |_| {
+                                            mcp_app_context.set(None);
+                                            let instance_id = context_id.clone();
+                                            let app_name = app_name.clone();
+                                            spawn_local(async move {
+                                                let args = to_value(&serde_json::json!({
+                                                    "instanceId": instance_id,
+                                                    "appName": app_name,
+                                                    "context": {},
+                                                })).unwrap();
+                                                let _ = invoke_checked("update_mcp_app_context", args).await;
+                                            });
+                                        }>{compose_icon("close")}</button>
+                                </div>
+                            </div>
+                        }
                     })}
                     {move || (!composer_quotes.get().is_empty()).then(|| view! {
                         <div class="composer-attachments composer-reference-chips">
@@ -11488,6 +14228,7 @@ fn App() -> impl IntoView {
                             on:keydown:undelegated=on_send
                             on:paste=on_paste
                             prop:placeholder=move || {
+                                if active_archived.get(){return research_journey::j(locale.get(),"Archived notebook. Continue research in a new conversation.","实验记录本已归档，请从归档节点继续研究。").to_string();}
                                 if matches!(active_branch_state.get().as_deref(), Some("merged" | "orphaned")) {
                                     t(locale.get(), "branch.frozen_placeholder").into()
                                 } else if mainline_frozen.get() {
@@ -11665,7 +14406,14 @@ fn App() -> impl IntoView {
                             })}
                             <button type="button" class="composer-compute"
                                 class:active=move || agent_menu_open.get()
-                                class:has-resource=move || !session_execution_contexts.get().is_empty()
+                                class:has-resource=move || {
+                                    !session_execution_contexts.get().is_empty()
+                                        || resolved_session_default_id(
+                                            session_default_execution_context.get().as_deref(),
+                                            default_execution_context.get().as_deref(),
+                                        )
+                                        .is_some()
+                                }
                                 title=move || t(locale.get(), "composer.agent_options")
                                 aria-label=move || t(locale.get(), "composer.agent_options")
                                 on:click=move |_| {
@@ -11852,9 +14600,34 @@ fn App() -> impl IntoView {
                                                     let enabled = event_target_checked(&ev);
                                                     auto_review_enabled.set(enabled);
                                                     spawn_local(async move {
-                                                        let arg = to_value(&serde_json::json!({ "enabled": enabled })).unwrap();
-                                                        if invoke_checked("set_auto_review_enabled", arg).await.is_err() {
-                                                            auto_review_enabled.set(!enabled);
+                                                        let (session_id, created_session) = match active_session.get_untracked() {
+                                                            Some(session_id) => (session_id, false),
+                                                            None if enabled => {
+                                                                let Some(session_id) = invoke("new_session", JsValue::UNDEFINED).await.as_string() else {
+                                                                    auto_review_enabled.set(false);
+                                                                    return;
+                                                                };
+                                                                (session_id, true)
+                                                            }
+                                                            None => {
+                                                                auto_review_enabled.set(false);
+                                                                return;
+                                                            }
+                                                        };
+                                                        let args = to_value(&serde_json::json!({
+                                                            "sessionId": session_id.clone(),
+                                                            "enabled": enabled,
+                                                        })).unwrap();
+                                                        let saved = invoke_checked("set_auto_review_enabled", args).await
+                                                            .ok()
+                                                            .and_then(|value| value.as_bool());
+                                                        if created_session {
+                                                            active_session.set(Some(session_id.clone()));
+                                                            items.set(vec![]);
+                                                            refresh_session_history();
+                                                        }
+                                                        if active_session.get_untracked().as_deref() == Some(session_id.as_str()) {
+                                                            auto_review_enabled.set(saved.unwrap_or(!enabled));
                                                         }
                                                     });
                                                 } />
@@ -11963,9 +14736,19 @@ fn App() -> impl IntoView {
                                         }>
                                         <span>{move || t(locale.get(), "composer.compute")}</span>
                                         <span class="agent-menu-value">{move || {
-                                            let count = session_execution_contexts.get().len();
-                                            if count == 0 { t(locale.get(), "compute.default_local") }
-                                            else { tf(locale.get(), "composer.compute_count", &[("n", &count.to_string())]) }
+                                            let default_id = resolved_session_default_id(
+                                                session_default_execution_context.get().as_deref(),
+                                                default_execution_context.get().as_deref(),
+                                            );
+                                            let label = default_id.as_ref().map(|id| {
+                                                compute_default_label(id, &execution_contexts.get())
+                                            });
+                                            compute_menu_summary(
+                                                locale.get(),
+                                                default_id.as_deref(),
+                                                label.as_deref(),
+                                                session_execution_contexts.get().len(),
+                                            )
                                         }}</span>
                                         <span class="agent-menu-chevron">{compose_icon("chevron-right")}</span>
                                     </button>
@@ -12055,13 +14838,25 @@ fn App() -> impl IntoView {
                                     {move || compute_menu_open.get().then(|| view! {
                                         <div class="compose-menu agent-submenu compute-menu" role="menu"
                                             aria-label=move || t(locale.get(), "composer.compute")>
-                                            <button type="button" class="agent-submenu-row" on:click=move |_| {
-                                                agent_menu_open.set(false);
-                                                compute_menu_open.set(false);
-                                                open_add_host_form.call(());
-                                            }>
-                                                <span>{move || t(locale.get(), "compute.add_host")}</span>
-                                            </button>
+                                            <p class="compute-menu-hint">{move || t(locale.get(), "compute.menu_hint")}</p>
+                                            <div class="compute-default-field">
+                                                <label>
+                                                    <span>{move || t(locale.get(), "compute.session_default")}</span>
+                                                    <DefaultAnalysisSelect
+                                                        locale=locale
+                                                        execution_contexts=execution_contexts
+                                                        default_execution_context=Signal::derive(move || {
+                                                            resolved_session_default_id(
+                                                                session_default_execution_context.get().as_deref(),
+                                                                default_execution_context.get().as_deref(),
+                                                            )
+                                                        })
+                                                        on_change=set_session_default_compute_resource
+                                                        test_id="compute-default-analysis".to_string()
+                                                        label_key="compute.session_default"
+                                                    />
+                                                </label>
+                                            </div>
                                             <div class="compute-menu-search">
                                                 {compose_icon("search")}
                                                 <input type="search" inputmode="search" autocomplete="off"
@@ -12080,7 +14875,12 @@ fn App() -> impl IntoView {
                                                     let context_id = format!("ssh:{}", host.alias);
                                                     let enabled = session_execution_contexts.get().contains(&context_id);
                                                     let is_analysis_default =
-                                                        default_execution_context.get().as_deref() == Some(context_id.as_str());
+                                                        resolved_session_default_id(
+                                                            session_default_execution_context.get().as_deref(),
+                                                            default_execution_context.get().as_deref(),
+                                                        )
+                                                        .as_deref()
+                                                            == Some(context_id.as_str());
                                                     let toggle_id = context_id.clone();
                                                     let default_id = context_id.clone();
                                                     view! {
@@ -12099,7 +14899,7 @@ fn App() -> impl IntoView {
                                                                     })}
                                                                 </span>
                                                                 <span class="compute-resource-state">
-                                                                    {if enabled { t(locale.get(), "compute.enabled") } else { t(locale.get(), "compute.disabled") }}
+                                                                    {t(locale.get(), compute_resource_state_key(enabled, is_analysis_default))}
                                                                 </span>
                                                             </button>
                                                             <button type="button" class="compute-resource-default-toggle"
@@ -12107,7 +14907,7 @@ fn App() -> impl IntoView {
                                                                 title=move || t(locale.get(), if is_analysis_default { "compute.clear_default" } else { "compute.set_default" })
                                                                 aria-label=move || t(locale.get(), if is_analysis_default { "compute.clear_default" } else { "compute.set_default" })
                                                                 on:click=move |_| {
-                                                                    set_default_compute_resource.call(if is_analysis_default { None } else { Some(default_id.clone()) });
+                                                                    set_session_default_compute_resource.call(if is_analysis_default { None } else { Some(default_id.clone()) });
                                                                 }>
                                                                 {compose_icon("star")}
                                                             </button>
@@ -12123,7 +14923,12 @@ fn App() -> impl IntoView {
                                                     let context_id = ctx.id.clone();
                                                     let enabled = session_execution_contexts.get().contains(&context_id);
                                                     let is_analysis_default =
-                                                        default_execution_context.get().as_deref() == Some(context_id.as_str());
+                                                        resolved_session_default_id(
+                                                            session_default_execution_context.get().as_deref(),
+                                                            default_execution_context.get().as_deref(),
+                                                        )
+                                                        .as_deref()
+                                                            == Some(context_id.as_str());
                                                     let toggle_id = context_id.clone();
                                                     let default_id = context_id.clone();
                                                     let name = if ctx.label.trim().is_empty() { ctx.id.clone() } else { ctx.label.clone() };
@@ -12150,7 +14955,7 @@ fn App() -> impl IntoView {
                                                                     })}
                                                                 </span>
                                                                 <span class="compute-resource-state">
-                                                                    {if enabled { t(locale.get(), "compute.enabled") } else { t(locale.get(), "compute.disabled") }}
+                                                                    {t(locale.get(), compute_resource_state_key(enabled, is_analysis_default))}
                                                                 </span>
                                                             </button>
                                                             <button type="button" class="compute-resource-default-toggle"
@@ -12158,7 +14963,7 @@ fn App() -> impl IntoView {
                                                                 title=move || t(locale.get(), if is_analysis_default { "compute.clear_default" } else { "compute.set_default" })
                                                                 aria-label=move || t(locale.get(), if is_analysis_default { "compute.clear_default" } else { "compute.set_default" })
                                                                 on:click=move |_| {
-                                                                    set_default_compute_resource.call(if is_analysis_default { None } else { Some(default_id.clone()) });
+                                                                    set_session_default_compute_resource.call(if is_analysis_default { None } else { Some(default_id.clone()) });
                                                                 }>
                                                                 {compose_icon("star")}
                                                             </button>
@@ -12166,6 +14971,13 @@ fn App() -> impl IntoView {
                                                     }
                                                 }).collect_view()}}
                                             </div>
+                                            <button type="button" class="agent-submenu-row compute-add-host-row" on:click=move |_| {
+                                                agent_menu_open.set(false);
+                                                compute_menu_open.set(false);
+                                                open_add_host_form.call(());
+                                            }>
+                                                <span>{move || t(locale.get(), "compute.add_host")}</span>
+                                            </button>
                                             <button type="button" class="agent-submenu-row compute-manage-row"
                                                 on:click=move |_| {
                                                     agent_menu_open.set(false);
@@ -12236,6 +15048,39 @@ fn App() -> impl IntoView {
                                         }>
                                         {compose_icon("gauge")}
                                         <span class="context-usage-pct" data-testid="context-usage-percent">{percent_label}</span>
+                                    </button>
+                                }
+                            })}
+                            {move || fast_profile.get().map(|_| {
+                                let enabled = fast_enabled.get();
+                                let session_override = fast_is_session_override.get();
+                                let saving = service_tier_busy.get();
+                                let running_now = busy.get();
+                                let loaded = fast_loaded.get();
+                                let key = if running_now {
+                                    "composer.fast.running"
+                                } else if saving || !loaded {
+                                    "composer.fast.saving"
+                                } else {
+                                    match (enabled, session_override) {
+                                        (true, true) => "composer.fast.on_session",
+                                        (true, false) => "composer.fast.on_profile",
+                                        (false, true) => "composer.fast.off_session",
+                                        (false, false) => "composer.fast.off_profile",
+                                    }
+                                };
+                                let title = t(locale.get(), key).to_string();
+                                view! {
+                                    <button type="button" class="composer-fast"
+                                        class:enabled=enabled
+                                        class:pending=saving || !loaded
+                                        data-testid="composer-fast-toggle"
+                                        aria-pressed=enabled.to_string()
+                                        aria-label=title.clone()
+                                        title=title
+                                        disabled=running_now || saving || !loaded
+                                        on:click=move |_| toggle_fast.call(())>
+                                        {compose_icon("bolt")}
                                     </button>
                                 }
                             })}
@@ -12677,11 +15522,12 @@ fn App() -> impl IntoView {
                             {move || busy.get().then(|| view! {
                                 <button type="button" class="stop"
                                     disabled=move || active_session.get() == stopping_session.get()
-                                    on:click=stop>
+                                    on:click=move |_| stop.call(())>
                                     {move || t(locale.get(), if active_session.get() == stopping_session.get() { "composer.stopping" } else { "composer.stop" })}
                                 </button>
                             })}
-                            <div class="send-split">
+                            <div class="send-split"
+                                style:display=move || if busy.get() && !composer_has_draft() { "none" } else { "inline-flex" }>
                                 <button class="send" disabled=composer_blocked on:click=move |_| send.call(ComposerSendAction::Normal)>
                                     {move || t(locale.get(), if busy.get() { "composer.queue_button" } else { "composer.send" })}
                                 </button>
@@ -12771,7 +15617,7 @@ fn App() -> impl IntoView {
             </div>
         </main>
 
-        {move || (show_right.get() && !scratch_open.get() && !demo_mode.get()).then(|| view! {
+        {move || right_pane_visible.get().then(|| view! {
             <div class="resizer" on:mousedown=on_resize_start></div>
             <button type="button" class="rightpane-backdrop"
                 aria-label=move || t(locale.get(), "right.close")
@@ -13213,6 +16059,8 @@ fn App() -> impl IntoView {
                             delegation_enabled,
                             locale,
                             Callback::new(move |_: ()| {
+                                workflow_studio_state.legacy_conversion_requested.set(agent_panel.legacy_conversion_requested.get_untracked());
+                                agent_panel.legacy_conversion_requested.set(None);
                                 open_settings_fn(Some("workflows".into()));
                                 refresh_agent_resources(workflow_studio_state, specialists);
                             }),
@@ -13260,6 +16108,7 @@ fn App() -> impl IntoView {
                                                 let next = dom_value(&event);
                                                 selecting_workspace_entries.set(false);
                                                 selected_workspace_paths.set(HashSet::new());
+                                                file_sort_menu_open.set(false);
                                                 file_source.set(next.clone());
                                                 file_query.set(String::new());
                                                 if next == "local" {
@@ -13346,6 +16195,7 @@ fn App() -> impl IntoView {
                                                         "files.select_entries"
                                                     })}</span>
                                                 </button>
+                                                <FileSortControl sort_by=file_sort menu_open=file_sort_menu_open />
                                             </div>
                                             <input class="fb-search" type="text"
                                                 placeholder=move || t(locale.get(), "files.search")
@@ -13396,10 +16246,14 @@ fn App() -> impl IntoView {
                                                                 }.into_view()
                                                             } else {
                                                                 let path_open = path.clone();
+                                                                let path_drag = path.clone();
                                                                 let path_selected = path.clone();
                                                                 let path_pressed = path.clone();
                                                                 view! {
                                                                     <button class="fb-row" data-workspace-path=path.clone()
+                                                                        draggable="true"
+                                                                        on:dragstart=move |ev| start_workspace_path_drag(&ev, &path_drag)
+                                                                        on:dragend=move |_| drag_over.set(false)
                                                                         class:selected=move || selected_workspace_paths.get().contains(&path_selected)
                                                                         attr:aria-pressed=move || selecting_workspace_entries.get().then(|| {
                                                                             selected_workspace_paths.get().contains(&path_pressed).to_string()
@@ -13420,7 +16274,9 @@ fn App() -> impl IntoView {
                                                             }
                                                         }).collect_view()
                                                     } else {
-                                                        let entries = file_entries.get();
+                                                        let sort = file_sort.get();
+                                                        let mut entries = file_entries.get();
+                                                        sort_dir_entries(&mut entries, &sort);
                                                         if entries.is_empty() {
                                                             // Nothing listed also covers "the tab
                                                             // was opened before a project was", so
@@ -13462,14 +16318,19 @@ fn App() -> impl IntoView {
                                                                     }>
                                                                         <span class="fb-icon">{compose_icon("folder")}</span>
                                                                         <span class="fb-name">{name}</span>
+                                                                        {file_row_meta_view(&e, &sort)}
                                                                     </button>
                                                                 }.into_view()
                                                             } else {
                                                                 let full_open = full.clone();
+                                                                let full_drag = full.clone();
                                                                 let full_selected = full.clone();
                                                                 let full_pressed = full.clone();
                                                                 view! {
                                                                     <button class="fb-row" data-workspace-path=full.clone()
+                                                                        draggable="true"
+                                                                        on:dragstart=move |ev| start_workspace_path_drag(&ev, &full_drag)
+                                                                        on:dragend=move |_| drag_over.set(false)
                                                                         class:selected=move || selected_workspace_paths.get().contains(&full_selected)
                                                                         attr:aria-pressed=move || selecting_workspace_entries.get().then(|| {
                                                                             selected_workspace_paths.get().contains(&full_pressed).to_string()
@@ -13483,7 +16344,7 @@ fn App() -> impl IntoView {
                                                                     }>
                                                                         <span class="fb-icon">{compose_icon("doc")}</span>
                                                                         <span class="fb-name">{name}</span>
-                                                                        <span class="fb-size">{format_bytes(e.size)}</span>
+                                                                        {file_row_meta_view(&e, &sort)}
                                                                     </button>
                                                                 }.into_view()
                                                             }
@@ -13576,6 +16437,7 @@ fn App() -> impl IntoView {
                                                     {compose_icon("sync")}
                                                     <span>{t(loc, "files.refresh")}</span>
                                                 </button>
+                                                <FileSortControl sort_by=file_sort menu_open=file_sort_menu_open />
                                             </div>
                                             <div class="fb-list" class:grid=move || rp_grid.get()>
                                                 {if remote_file_loading.get() {
@@ -13638,7 +16500,10 @@ fn App() -> impl IntoView {
                                                 } else if remote_file_entries.get().is_empty() {
                                                     view! { <div class="rp-empty rp-files-empty"><p>{t(loc, "files.empty_remote")}</p></div> }.into_view()
                                                 } else {
-                                                    remote_file_entries.get().into_iter().map(|entry| {
+                                                    let sort = file_sort.get();
+                                                    let mut entries = remote_file_entries.get();
+                                                    sort_dir_entries(&mut entries, &sort);
+                                                    entries.into_iter().map(|entry| {
                                                         let name = entry.name.clone();
                                                         let full = join_path(&remote_file_cwd.get(), &name);
                                                         if entry.is_dir {
@@ -13658,6 +16523,7 @@ fn App() -> impl IntoView {
                                                                 }>
                                                                     <span class="fb-icon">{compose_icon("folder")}</span>
                                                                     <span class="fb-name">{name}</span>
+                                                                    {file_row_meta_view(&entry, &sort)}
                                                                 </button>
                                                             }.into_view()
                                                         } else {
@@ -13682,7 +16548,7 @@ fn App() -> impl IntoView {
                                                                     }>
                                                                     <span class="fb-icon">{compose_icon("doc")}</span>
                                                                     <span class="fb-name">{name}</span>
-                                                                    <span class="fb-size">{format_bytes(entry.size)}</span>
+                                                                    {file_row_meta_view(&entry, &sort)}
                                                                     {download_uri.map(|uri| {
                                                                         let download = uri.clone();
                                                                         view! {
@@ -14068,6 +16934,7 @@ fn App() -> impl IntoView {
                                         })}
                                     </div>
                                     <div class="sidechat-composer">
+                                      <div class="sidechat-composer-inner">
                                         {move || (!side_chat_quotes.get().is_empty()).then(|| view! {
                                             <div class="composer-attachments composer-reference-chips sidechat-quotes">
                                                 {side_chat_quotes.get().into_iter().enumerate().map(|(idx, quote)| {
@@ -14100,6 +16967,7 @@ fn App() -> impl IntoView {
                                         })}
                                         <textarea
                                             id=SIDE_CHAT_INPUT_ID
+                                            rows="2"
                                             prop:value=move || side_chat_input.get()
                                             prop:placeholder=move || t(locale.get(), "sidechat.placeholder")
                                             on:input=move |ev| side_chat_input.set(event_target_value(&ev))
@@ -14121,7 +16989,7 @@ fn App() -> impl IntoView {
                                                     <button type="button" class="sidechat-model-btn"
                                                         class:active=move || side_chat_model_menu_open.get()
                                                         on:click=move |_| side_chat_model_menu_open.update(|o| *o = !*o)>
-                                                        {move || {
+                                                        <span class="model-picker-label">{move || {
                                                             if let Some(id) = side_chat_acp_agent.get() {
                                                                 acp_agents.get().into_iter().find(|agent| agent.id == id).map(|agent| agent.label).unwrap_or_else(|| "ACP Agent".into())
                                                             } else {
@@ -14132,8 +17000,8 @@ fn App() -> impl IntoView {
                                                                     .map(|m| m.label.clone())
                                                                     .unwrap_or_default()
                                                             }
-                                                        }}
-                                                        <span>"▾"</span>
+                                                        }}</span>
+                                                        {compose_icon("chevron-down")}
                                                     </button>
                                                     {move || side_chat_model_menu_open.get().then(|| view! {
                                                         <div class="sidechat-model-backdrop" on:click=move |_| side_chat_model_menu_open.set(false)></div>
@@ -14157,7 +17025,7 @@ fn App() -> impl IntoView {
                                                                             });
                                                                         }>
                                                                         <span>{m.label.clone()}</span>
-                                                                        {is_active.then(|| view! { <span>"✓"</span> })}
+                                                                        {is_active.then(|| compose_icon("check"))}
                                                                     </button>
                                                                 }
                                                             }).collect_view()}
@@ -14173,7 +17041,7 @@ fn App() -> impl IntoView {
                                                                                 side_chat_acp_agent.set(Some(id.clone()));
                                                                             }>
                                                                             <span>{agent.label.clone()}</span>
-                                                                            {selected.then(|| view! { <span>"✓"</span> })}
+                                                                            {selected.then(|| compose_icon("check"))}
                                                                         </button>
                                                                     }
                                                                 }).collect_view()}
@@ -14194,6 +17062,7 @@ fn App() -> impl IntoView {
                                                 {move || t(locale.get(), "composer.send")}
                                             </button>
                                         </div>
+                                      </div>
                                     </div>
                                 </div>
                             }.into_view()
@@ -14332,6 +17201,21 @@ fn App() -> impl IntoView {
                             on_compact=compact_from_usage
                             on_new_session=new_session_from_usage
                             compact_disabled=Signal::derive(move || busy.get())
+                            epoch_line=context_epoch_line(
+                                locale.get(),
+                                head_epoch.get(),
+                                context_epochs.with(|rows| {
+                                    rows.iter().any(|row| {
+                                        row.epoch == head_epoch.get()
+                                            && row.checkpoint_seq.is_some()
+                                    })
+                                }),
+                                conversation_outline.with(|rows| {
+                                    rows.len().saturating_sub(
+                                        in_context_from_user_index.get().unwrap_or(0),
+                                    )
+                                }),
+                            )
                         />
                     }
                 })
@@ -14347,6 +17231,34 @@ fn App() -> impl IntoView {
             <div class="drag-overlay"
                 on:mousemove=on_center_split_resize_move
                 on:mouseup=move |_| center_split_dragging.set(false)></div>
+        })}
+
+        {move || center_runtime_col_dragging.get().then(|| view! {
+            <div class="drag-overlay"
+                on:mousemove=move |ev: web_sys::MouseEvent| {
+                    let Some(rect) = runtime_workbench_rect() else { return; };
+                    if rect.width() > 0.0 {
+                        center_runtime_right_w.set(
+                            ((rect.right() - ev.client_x() as f64) / rect.width() * 100.0)
+                                .clamp(16.0, 70.0),
+                        );
+                    }
+                }
+                on:mouseup=move |_| center_runtime_col_dragging.set(false)></div>
+        })}
+
+        {move || center_runtime_row_dragging.get().then(|| view! {
+            <div class="drag-overlay drag-overlay-row"
+                on:mousemove=move |ev: web_sys::MouseEvent| {
+                    let Some(rect) = runtime_workbench_rect() else { return; };
+                    if rect.height() > 0.0 {
+                        center_runtime_bottom_h.set(
+                            ((rect.bottom() - ev.client_y() as f64) / rect.height() * 100.0)
+                                .clamp(12.0, 70.0),
+                        );
+                    }
+                }
+                on:mouseup=move |_| center_runtime_row_dragging.set(false)></div>
         })}
 
         {move || sidebar_dragging.get().then(|| view! {
@@ -14672,7 +17584,7 @@ fn App() -> impl IntoView {
 
         <ProjSettingsOverlay
             state=ProjSettingsOverlayState {
-                locale, show_proj_settings, proj_settings, proj_settings_busy,
+                locale, show_proj_settings, proj_settings, proj_settings_busy, specialists,
             }
             on_save=Callback::new(save_proj_settings)
         />
@@ -14722,7 +17634,18 @@ fn App() -> impl IntoView {
                     on_library_changed=refresh_library_items />
             }
         })}
+        <workflow_conversion::ConversionNotice state=workflow_conversion locale=locale
+            visible=Signal::derive(move || !(show_settings.get() && settings_section.get() == "workflows" && workflow_conversion.open.get()))
+            on_open=Callback::new(move |_| {
+                if let Some((id, _)) = workflow_conversion.project.get_untracked() {
+                    if project_info.get_untracked().is_none_or(|project| project.id != id) {
+                        open_project_transition.call((id, None));
+                    }
+                }
+                workflow_conversion.open_requested.set(true);
+            }) />
         <SettingsView
+            external_link_confirm=external_link_confirm
             state=SettingsViewState {
                 locale, theme_mode, light_palette, dark_palette, ui_font_size, code_font_size, ui_font_family, code_font_family, selection_popup_enabled, send_with_modifier, custom_css, update_check_enabled, show_settings, settings_section, open_conn_key, channels_open, connectors, model_form, model_catalog_limits,
                 conn_form, memory_selected, specialist_form, settings, bootstrap, settings_message,
@@ -14735,7 +17658,8 @@ fn App() -> impl IntoView {
                 custom_credentials, cred_msg, approval_grants, conns_view, conn_form_open,
                 conn_form_kind, conn_test_msg, custom_conn_tools, custom_conn_tools_loading,
                 custom_conn_tool_errors, pet_status, ssh_hosts, execution_contexts,
-                runtime_interpreter_form, probing_context_id, delete_confirm,
+                default_execution_context, runtime_interpreter_form, probing_context_id,
+                delete_confirm,
             }
             open_project=switch_project
             go_settings_section=Callback::new(move |section: String| go_settings_section(&section))
@@ -14747,9 +17671,11 @@ fn App() -> impl IntoView {
             test_reviewer_form=Callback::new(test_reviewer_form)
             validate_model_form=Callback::new(validate_model_form)
             start_specialist_chat=start_specialist_chat
+            start_specialist_session=start_specialist_session
             refresh_conns=Callback::new(move |_: ()| refresh_conns())
             refresh_skills=Callback::new(move |_: ()| refresh_skills())
             reload_skills=reload_skills
+            skills_reloading=extensions.skills_reloading
             refresh_approval_grants=Callback::new(move |_: ()| refresh_approval_grants())
             load_memory_file=Callback::new(load_memory_file)
             load_custom_conn_tools=Callback::new(load_custom_conn_tools)
@@ -14797,6 +17723,7 @@ fn App() -> impl IntoView {
                     }
                 });
             })
+            set_default_compute_resource=set_default_compute_resource
             probe_compute_resource=Callback::new(move |context_id: String| {
                 if probing_context_id.get_untracked().is_some() {
                     return;
@@ -14880,6 +17807,7 @@ fn App() -> impl IntoView {
                     probing_context_id.set(None);
                 });
             })
+            open_terminal_session=activate_terminal_session
         />
 
         {(!is_windows()).then(|| view! {
@@ -14907,6 +17835,8 @@ fn App() -> impl IntoView {
             runtime_interpreter_form=runtime_interpreter_form object_states=runtime_object_states
             locale=locale selection_popup=selection_popup
             on_use_in_publication=Callback::new(move |source| {
+                context_details_modal.set(None);
+                show_research_graph.set(false);
                 publication_binding_source.set(Some(source));
                 show_publication_workspace.set(true);
             })
@@ -14915,6 +17845,7 @@ fn App() -> impl IntoView {
             <RuntimeEnvironmentPanel selected=runtime_environment pinned=runtime_environment_pinned
                 position=runtime_environment_position context_modal=context_details_modal
                 locale=locale states=runtime_object_states runtimes=runtime_infos
+                contexts=execution_contexts active_project=project_info projects=proj_list
                 selection_popup=selection_popup />
         })}
         <RuntimeInterpreterOverlay
@@ -14932,6 +17863,7 @@ fn App() -> impl IntoView {
             snapshot=trajectory_snapshot
             live=trajectory_live
             busy=busy
+            session_id=active_session
         />
         <CapabilitiesOverlay
             locale=locale show_capabilities=show_capabilities
@@ -14939,7 +17871,7 @@ fn App() -> impl IntoView {
             start_env_setup=Callback::new(start_env_setup)
         />
         <OnboardingOverlay
-            locale=locale show_onboarding=show_onboarding onboard_step=onboard_step
+            locale=locale bootstrap=bootstrap show_onboarding=show_onboarding onboard_step=onboard_step
             onboard_key=onboard_key
             save_onboard_key=save_onboard_key
             dismiss_onboard=Callback::new(dismiss_onboard)
@@ -14951,13 +17883,77 @@ fn App() -> impl IntoView {
             on_compact=compact_context_recovery
             on_new_session=new_session_context_recovery
         />
+        <CompactOverlay
+            state=CompactOverlayState {
+                locale,
+                dialog: compact_dialog,
+                mode: compact_mode,
+                instruction: compact_instruction,
+                busy: compact_busy,
+                error: compact_error,
+            }
+            on_start=start_compact_dialog
+            on_close=close_compact_dialog
+        />
+        <CompactIdlePromptOverlay
+            state=CompactIdlePromptOverlayState {
+                locale,
+                prompt: compact_idle_prompt,
+            }
+            on_accept=Callback::new(move |id: String| {
+                compact_idle_dismissed.update(|dismissed| {
+                    dismissed.insert(id.clone());
+                });
+                compact_idle_prompt.set(None);
+                open_compact_dialog.call((id, String::new(), CompactDialogMode::Semantic));
+            })
+            on_dismiss=Callback::new(move |_| {
+                if let Some((id, _)) = compact_idle_prompt.get_untracked() {
+                    compact_idle_dismissed.update(|dismissed| {
+                        dismissed.insert(id);
+                    });
+                }
+                compact_idle_prompt.set(None);
+            })
+        />
         <ContextMenuPortal menu=ctx_menu.read_only() set_menu=ctx_menu.write_only() on_pick=on_ctx_pick />
+        {move ||archive_frame.get().map(|id|view!{
+            <research_archive::ArchiveReview locale=locale frame_id=id busy=archive_busy
+                on_close=Callback::new(move |_|archive_frame.set(None))
+                on_frozen=Callback::new(move |id:String|{archived_sessions.update(|s|{s.insert(id);});refresh_session_history();})
+                on_continue=Callback::new(move |id|{archive_frame.set(None);show_research_graph.set(false);refresh_session_history();load_session.call(id);})
+                on_notebook=Callback::new(move |id|{archive_frame.set(None);show_research_graph.set(false);load_session.call(id);})
+                on_file=Callback::new(move |target|modal_artifact.set(Some(target)))
+            />
+        })}
         </div>
     }
 }
 
+/// `console_error_panic_hook` plus one deliberate downgrade: leptos 0.6
+/// runs a `create_effect`'s first pass in a microtask bound to its owner, and
+/// an owner disposed in between makes `with_owner` panic with
+/// `OwnerDisposed`. Keyed rows (streaming turns, artifact-card rebuilds) hit
+/// that race routinely; under release `panic = "abort"` it used to take the
+/// whole renderer down — a dead window with the backend still running. A
+/// disposed-owner effect has nothing left to update, so the correct handling
+/// is to drop it with a console warning instead of aborting.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(move |info| {
+        let message = format!("{info}");
+        if message.contains("OwnerDisposed") {
+            web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(&format!(
+                "dropped reactive effect for a disposed owner: {message}"
+            )));
+            return;
+        }
+        // Everything else keeps the standard hook behavior (error + stack).
+        console_error_panic_hook::hook(info);
+    }));
+}
+
 pub fn main() {
-    console_error_panic_hook::set_once();
+    install_panic_hook();
     let is_pet_window = window().location().search().ok().is_some_and(|query| {
         query
             .split('&')

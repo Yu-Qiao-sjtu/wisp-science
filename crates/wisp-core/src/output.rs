@@ -90,6 +90,12 @@ pub trait Output: Send + Sync {
     fn approval_bypass(&self) -> bool {
         false
     }
+    /// When true, mutating tools require Ask even if the host policy is Allow
+    /// and even if [`Self::approval_bypass`] is set. Used for unattended IM
+    /// turns that share the desktop approval UI.
+    fn force_ask_mutations(&self) -> bool {
+        false
+    }
     fn restrict_read_paths_to_project(&self) -> bool {
         false
     }
@@ -108,10 +114,19 @@ pub trait Output: Send + Sync {
     fn project_write_locked(&self) -> bool {
         false
     }
+    /// False on query-only DepMap turns: `write`/`edit` must not create
+    /// `results/reports/**` or unsolicited CSV.
+    fn artifact_requested(&self) -> bool {
+        true
+    }
     /// Fired once per message appended to the context during a turn (user,
     /// assistant, tool). Lets the host persist incrementally so a crash or a
     /// mid-turn "new session" doesn't lose the whole turn. Default: no-op.
     fn on_message(&self, _msg: &wisp_llm::Message) {}
+    /// Preserve the host's guidance identity when it becomes a user message.
+    fn on_guidance_message(&self, _id: u64, msg: &wisp_llm::Message) {
+        self.on_message(msg);
+    }
     /// Fired once per producing tool call that wrote ≥1 file, with the code,
     /// result text, and diffed inputs/outputs. Default: no-op (CLI ignores it).
     fn provenance(&self, _rec: &crate::provenance::ProvenanceRecord) {}
@@ -120,6 +135,24 @@ pub trait Output: Send + Sync {
     /// and its subagents — are not foreign to each other when disambiguating
     /// concurrent writes (#911). Default `None`: every other window is foreign.
     fn provenance_scope(&self) -> Option<String> {
+        None
+    }
+    /// Host-owned id of the in-flight user-visible turn. Default `None`.
+    fn turn_id(&self) -> Option<&str> {
+        None
+    }
+    /// Conversation frame this loop belongs to. Default `None`.
+    fn frame_id(&self) -> Option<&str> {
+        None
+    }
+    /// Host-owned project this loop belongs to. Default `None`.
+    fn project_id(&self) -> Option<&str> {
+        None
+    }
+    /// Shared observability handle. CLI, desktop, and eval attach the tracer
+    /// built by [`crate::host_agent_observability`]. Default `None` keeps
+    /// existing tests silent.
+    fn agent_trace(&self) -> Option<&crate::observability::AgentTrace> {
         None
     }
     /// Hard host-owned boundary checked before free-form source reaches a
@@ -155,6 +188,8 @@ pub struct ToolEnvAdapter<'a> {
     /// drained unconditionally after every tool call so a stale report can
     /// never leak into the next call's record.
     reported_writes: std::sync::Mutex<Vec<String>>,
+    /// Open tool span so approval waits become child spans of that call.
+    current_span: std::sync::Mutex<Option<crate::observability::SpanGuard>>,
 }
 
 impl<'a> ToolEnvAdapter<'a> {
@@ -165,6 +200,7 @@ impl<'a> ToolEnvAdapter<'a> {
             cancel: None,
             guidance: None,
             reported_writes: std::sync::Mutex::new(Vec::new()),
+            current_span: std::sync::Mutex::new(None),
         }
     }
     /// Like `new`, but tools can poll `is_cancelled()` to stop mid-execution.
@@ -179,6 +215,38 @@ impl<'a> ToolEnvAdapter<'a> {
             cancel: Some(cancel),
             guidance: None,
             reported_writes: std::sync::Mutex::new(Vec::new()),
+            current_span: std::sync::Mutex::new(None),
+        }
+    }
+    pub(crate) fn set_span(&self, span: Option<crate::observability::SpanGuard>) {
+        *self
+            .current_span
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = span;
+    }
+    fn approval_span(&self) -> Option<crate::observability::SpanGuard> {
+        let current = self
+            .current_span
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let parent = current.as_ref()?;
+        let span = parent.child(crate::observability::SpanKind::Approval, "agent.approval");
+        span.mark_blocked();
+        Some(span)
+    }
+    fn finish_approval(&self, span: crate::observability::SpanGuard, approved: bool) {
+        use crate::observability::{ErrorClass, SpanStatus};
+        if self
+            .cancel
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            span.set_error_class(ErrorClass::Cancelled);
+            span.end(SpanStatus::Cancelled);
+        } else if approved {
+            span.end(SpanStatus::Ok);
+        } else {
+            span.set_error_class(ErrorClass::ApprovalDenied);
+            span.end(SpanStatus::Error);
         }
     }
     /// Drain kernel-reported writes accumulated during the current tool call.
@@ -207,11 +275,24 @@ impl<'a> wisp_tools::ToolEnv for ToolEnvAdapter<'a> {
     fn restrict_read_paths_to_project(&self) -> bool {
         self.out.restrict_read_paths_to_project()
     }
+    fn project_id(&self) -> Option<&str> {
+        self.out.project_id()
+    }
     async fn confirm(&self, message: &str) -> bool {
-        self.out.confirm_async(message).await
+        let approval = self.approval_span();
+        let approved = self.out.confirm_async(message).await;
+        if let Some(span) = approval {
+            self.finish_approval(span, approved);
+        }
+        approved
     }
     async fn confirm_decision(&self, message: &str) -> wisp_tools::ConfirmDecision {
-        self.out.confirm_decision_async(message).await
+        let approval = self.approval_span();
+        let decision = self.out.confirm_decision_async(message).await;
+        if let Some(span) = approval {
+            self.finish_approval(span, decision.approved());
+        }
+        decision
     }
     async fn approval_mode(&self, tool: &str) -> wisp_tools::Approval {
         self.out.approval_mode(tool)
@@ -226,6 +307,9 @@ impl<'a> wisp_tools::ToolEnv for ToolEnvAdapter<'a> {
     fn approval_bypass(&self) -> bool {
         self.out.approval_bypass()
     }
+    fn force_ask_mutations(&self) -> bool {
+        self.out.force_ask_mutations()
+    }
     fn danger_auto_approve(&self) -> bool {
         self.out.danger_auto_approve()
     }
@@ -234,6 +318,9 @@ impl<'a> wisp_tools::ToolEnv for ToolEnvAdapter<'a> {
     }
     fn project_write_locked(&self) -> bool {
         self.out.project_write_locked()
+    }
+    fn artifact_requested(&self) -> bool {
+        self.out.artifact_requested()
     }
     fn is_cancelled(&self) -> bool {
         self.cancel
@@ -262,6 +349,72 @@ impl<'a> wisp_tools::ToolEnv for ToolEnvAdapter<'a> {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .extend(paths.iter().cloned());
     }
+    fn turn_id(&self) -> Option<&str> {
+        self.out.turn_id()
+    }
+    fn frame_id(&self) -> Option<&str> {
+        self.out.frame_id()
+    }
+    fn tool_execution_scope(&self) -> wisp_tools::ToolExecutionScope {
+        wisp_tools::ToolExecutionScope {
+            agent_identity: "wisp-agent:v1".to_string(),
+            authorization_scope: self.out.project_id().unwrap_or_default().to_string(),
+            policy_projection: format!(
+                "plan={};write_locked={};approval_bypass={};force_ask_mutations={}",
+                self.out.plan_mode(),
+                self.out.project_write_locked(),
+                self.out.approval_bypass(),
+                self.out.force_ask_mutations()
+            ),
+        }
+    }
+    fn note_tool_execution(&self, event: &wisp_tools::ToolExecutionDiagnostic) {
+        use crate::observability::CacheOutcome;
+        let current = self
+            .current_span
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(span) = current.as_ref() else {
+            return;
+        };
+        match event.signal {
+            wisp_tools::ToolExecutionSignal::Hit => {
+                span.set_cache_outcome(CacheOutcome::Hit);
+                span.set_str("cache_event", event.signal.as_str());
+            }
+            wisp_tools::ToolExecutionSignal::Miss => {
+                span.set_cache_outcome(CacheOutcome::Miss);
+                span.set_str("cache_event", event.signal.as_str());
+            }
+            wisp_tools::ToolExecutionSignal::Stale => {
+                span.set_cache_outcome(CacheOutcome::Stale);
+                span.set_str("cache_event", event.signal.as_str());
+            }
+            wisp_tools::ToolExecutionSignal::Bypass => {
+                span.set_cache_outcome(CacheOutcome::Bypass);
+                span.set_str("cache_event", event.signal.as_str());
+            }
+            wisp_tools::ToolExecutionSignal::Coalesced => {
+                span.set_cache_outcome(CacheOutcome::Coalesced);
+                span.set_str("cache_event", event.signal.as_str());
+            }
+            wisp_tools::ToolExecutionSignal::Evicted => {
+                span.set_cache_outcome(CacheOutcome::Evicted);
+                span.set_str("cache_event", event.signal.as_str());
+            }
+            wisp_tools::ToolExecutionSignal::Queued
+            | wisp_tools::ToolExecutionSignal::Backpressure
+            | wisp_tools::ToolExecutionSignal::Cancelled => {
+                span.set_str("queue_event", event.signal.as_str());
+                if let Some(depth) = event.queue_depth {
+                    span.set_str("queue_depth", &depth.to_string());
+                }
+            }
+        }
+        if let Some(fingerprint) = event.fingerprint.as_deref() {
+            span.set_str("contract_fingerprint", fingerprint);
+        }
+    }
     async fn emit(&self, event: wisp_tools::ToolEvent) {
         match event {
             wisp_tools::ToolEvent::Call { name, preview } => self.out.tool_call(&name, &preview),
@@ -284,10 +437,15 @@ impl<'a> wisp_tools::ToolEnv for ToolEnvAdapter<'a> {
 pub struct StreamSinkAdapter<'a> {
     out: &'a dyn Output,
     cancel: Option<&'a std::sync::atomic::AtomicBool>,
+    buffered_text: String,
 }
 impl<'a> StreamSinkAdapter<'a> {
     pub fn new(out: &'a dyn Output) -> Self {
-        Self { out, cancel: None }
+        Self {
+            out,
+            cancel: None,
+            buffered_text: String::new(),
+        }
     }
     /// Like `new`, but the streaming loop can poll `is_cancelled()` to stop
     /// token generation mid-stream when the user hits Stop.
@@ -295,12 +453,28 @@ impl<'a> StreamSinkAdapter<'a> {
         Self {
             out,
             cancel: Some(cancel),
+            buffered_text: String::new(),
         }
+    }
+
+    pub fn clear_buffered_text(&mut self) {
+        self.buffered_text.clear();
+    }
+
+    pub fn flush_assistant_text(&mut self) {
+        if !self.buffered_text.is_empty() {
+            self.out.assistant_text(&self.buffered_text);
+            self.buffered_text.clear();
+        }
+    }
+
+    pub fn discard_assistant_text(&mut self) {
+        self.buffered_text.clear();
     }
 }
 impl<'a> wisp_llm::StreamSink for StreamSinkAdapter<'a> {
     fn on_text(&mut self, delta: &str) {
-        self.out.assistant_text(delta);
+        self.buffered_text.push_str(delta);
     }
     fn on_reasoning(&mut self, delta: &str) {
         self.out.reasoning(delta);
@@ -336,6 +510,23 @@ mod tests {
         );
         // A sink built without a cancel flag never reports cancelled.
         assert!(!StreamSinkAdapter::new(&out).is_cancelled());
+    }
+
+    struct CaptureText(std::sync::Mutex<String>);
+    impl Output for CaptureText {
+        fn assistant_text(&self, delta: &str) {
+            self.0.lock().unwrap().push_str(delta);
+        }
+    }
+
+    #[test]
+    fn stream_sink_holds_assistant_text_until_flush() {
+        let out = CaptureText(std::sync::Mutex::new(String::new()));
+        let mut sink = StreamSinkAdapter::new(&out);
+        sink.on_text("secret");
+        assert!(out.0.lock().unwrap().is_empty());
+        sink.flush_assistant_text();
+        assert_eq!(out.0.lock().unwrap().as_str(), "secret");
     }
 
     struct AsyncConfirmOutput {

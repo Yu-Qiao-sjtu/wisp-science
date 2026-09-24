@@ -1,7 +1,15 @@
 // Chat scroll follow (mirrors web-dist ConversationView pinned-at-bottom behavior).
 
 const hooks = new Map();
-const chatPositions = new Map();
+let panelSession = null;
+
+function scrollWithin(scroller, target) {
+  const isRange = target instanceof Range;
+  if (!scroller || !scroller.contains(isRange ? target.commonAncestorContainer : target)) return;
+  scroller.scrollTop += target.getBoundingClientRect().top
+    - scroller.getBoundingClientRect().top - scroller.clientTop
+    - (isRange ? scroller.clientHeight / 2 : 0);
+}
 
 // ponytail: single chat scroller, so the jump pill id is a constant.
 const JUMP_PILL_ID = "chat-jump-pill";
@@ -39,6 +47,7 @@ export function attach_chat_scroll(scrollerId, contentId) {
   let hidden = false;
   let pointerDown = false;
   let jumping = false;
+  let followGeneration = 0;
   const setFollow = (value) => {
     follow = value;
     scroller.style.overflowAnchor = value ? "none" : "auto";
@@ -54,10 +63,18 @@ export function attach_chat_scroll(scrollerId, contentId) {
   const rememberProgrammatic = () => {
     programmaticTop = scroller.scrollTop;
   };
-  const snapFollow = () => {
-    snapBottom(scroller);
-    rememberProgrammatic();
-    readingTop = scroller.scrollTop;
+  const snapFollow = (force = false) => {
+    // Write-only follow snap: skip the assignment when we already wrote this
+    // max. Repeated programmatic scrollTop writes suppress Chromium overflow
+    // anchoring, which #663 needs after the user scrolls away. `force` is for
+    // jump-to-latest / rebuild clamps, where scrollTop moved without max
+    // changing.
+    const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    if (force || max - programmaticTop > 2) {
+      scroller.scrollTop = max;
+    }
+    programmaticTop = max;
+    readingTop = max;
   };
   const restoreBookmark = () => {
     const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
@@ -114,7 +131,7 @@ export function attach_chat_scroll(scrollerId, contentId) {
         && scroller.scrollTop < 8
         && readingTop > Math.max(scroller.clientHeight, 200)
       ) {
-        snapFollow();
+        snapFollow(true);
         syncPill();
         return;
       }
@@ -126,11 +143,15 @@ export function attach_chat_scroll(scrollerId, contentId) {
     // Reflow-driven clamp. Scroll events fire before paint, so an instant
     // snap here means the clamped position is never painted — without it the
     // view visibly bounces on every thinking delta. When parked, restore the
-    // bookmark instead of adopting the collapse's scrollTop=0 (#927).
+    // bookmark if the thread collapsed toward 0 (#927); if scrollTop moved
+    // down, that is overflow-anchor compensating a prepend (#663) — keep it.
     if (follow) {
-      snapFollow();
-    } else {
+      snapFollow(true);
+    } else if (scroller.scrollTop + 2 < readingTop) {
       restoreBookmark();
+    } else {
+      readingTop = scroller.scrollTop;
+      programmaticTop = scroller.scrollTop;
     }
     syncPill();
   };
@@ -148,7 +169,7 @@ export function attach_chat_scroll(scrollerId, contentId) {
       hidden = false;
       lastHeight = h;
       if (follow) {
-        snapFollow();
+        snapFollow(true);
       } else {
         restoreBookmark();
       }
@@ -160,13 +181,18 @@ export function attach_chat_scroll(scrollerId, contentId) {
     if (follow) {
       // ResizeObserver already coalesces streaming DOM changes. Keep the hot
       // path to one bottom snap and skip the row/viewport geometry used only
-      // by the scroll-away pill.
+      // by the scroll-away pill — reading gap geometry here forces a layout
+      // on every streaming frame, so the pill is only synced when it could
+      // actually be visible (not following).
       snapFollow();
-      syncPill();
       return;
     }
     if (grew) {
-      restoreBookmark();
+      // Parked: overflow-anchor keeps the visible rows stable on prepend.
+      // Do not restoreBookmark here — that writes the pre-prepend scrollTop
+      // and undoes the compensation (#663).
+      syncPill();
+      return;
     }
     syncFollow();
   };
@@ -205,23 +231,28 @@ export function attach_chat_scroll(scrollerId, contentId) {
     onGrowth,
     unfollow: parkHere,
     jumpTo: (el) => {
+      // Result navigation supersedes delayed follow snaps queued before it.
+      followGeneration++;
+      lastUserScroll = -Infinity;
+      pointerDown = false;
       jumping = true;
       setFollow(false);
-      el.scrollIntoView({ block: "start" });
+      scrollWithin(scroller, el);
       parkHere();
       jumping = false;
     },
     snap: () => {
       const requested = performance.now();
+      const generation = ++followGeneration;
       setFollow(true);
-      snapFollow();
+      snapFollow(true);
       lastHeight = content.scrollHeight;
       syncPill();
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
-          if (lastUserScroll < requested) {
+          if (generation === followGeneration && lastUserScroll < requested) {
             setFollow(true);
-            snapFollow();
+            snapFollow(true);
             lastHeight = content.scrollHeight;
             syncPill();
           }
@@ -229,29 +260,24 @@ export function attach_chat_scroll(scrollerId, contentId) {
       });
     },
     switchSession: (sessionId) => {
-      if (activeSession !== sessionId) {
-        if (activeSession) {
-          chatPositions.set(activeSession, {
-            top: scroller.scrollTop,
-            follow,
-          });
-        }
-        activeSession = sessionId;
-      }
-
+      activeSession = sessionId;
       const generation = ++restoreGeneration;
-      const saved = chatPositions.get(sessionId);
+      const followRequest = ++followGeneration;
+      const requested = performance.now();
+      // Opening a conversation always starts at latest, including revisits.
+      // Reset the previous conversation's scroll intent before async history
+      // grows; otherwise its parked state can strand the new transcript.
+      lastUserScroll = -Infinity;
+      pointerDown = false;
+      setFollow(true);
+      syncPill();
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
-          if (generation !== restoreGeneration || activeSession !== sessionId) return;
-          if (!saved || saved.follow) {
-            setFollow(true);
-            snapFollow();
-          } else {
-            setFollow(false);
-            readingTop = saved.top;
-            restoreBookmark();
-          }
+          if (generation !== restoreGeneration || activeSession !== sessionId
+            || followRequest !== followGeneration || lastUserScroll >= requested
+            || pointerDown) return;
+          // Equal-height and shorter transcripts also need an explicit snap.
+          snapFollow(true);
           lastHeight = content.scrollHeight;
           syncPill();
         });
@@ -263,11 +289,23 @@ export function attach_chat_scroll(scrollerId, contentId) {
   snapFollow();
 }
 
-/** Save the previous conversation and restore this conversation after render.
- * Calling this again for the same session reapplies its saved position after an
- * asynchronous transcript load without overwriting the saved state.
+/** Navigate a find result through the same bookmark/follow contract as a turn jump. */
+export function reveal_chat_range(range) {
+  const hook = hooks.get("chat-scroller");
+  if (hook) hook.jumpTo(range);
+  else scrollWithin(document.getElementById("chat-scroller"), range);
+}
+
+/** Open this conversation at latest after render.
+ * Called again after asynchronous transcript hydration to align the loaded tail.
  * @param {string} scrollerId @param {string} sessionId */
 export function switch_chat_scroll(scrollerId, sessionId) {
+  if (panelSession !== sessionId) {
+    panelSession = sessionId;
+    document.querySelectorAll(".rightpane .rp-tiles, .rightpane .agents-pane, .rightpane .fb-list").forEach((el) => {
+      el.scrollTop = 0;
+    });
+  }
   hooks.get(scrollerId)?.switchSession(sessionId);
 }
 
@@ -369,7 +407,7 @@ export function jump_chat_scroll(scrollerId, selector) {
         hook.jumpTo(target);
         return;
       }
-      target.scrollIntoView({ block: "start" });
+      scrollWithin(document.getElementById(scrollerId), target);
     });
   });
 }

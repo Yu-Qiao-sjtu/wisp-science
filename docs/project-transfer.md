@@ -1,6 +1,6 @@
 # Project transfer
 
-Wisp supports two deliberately different ways to bring a project onto a device:
+Wisp supports three deliberately different ways to bring a project onto a device:
 
 - **Open a folder in place** registers an existing local folder as a project. The
   folder remains where it is and Wisp does not copy its files. Use this after
@@ -9,11 +9,16 @@ Wisp supports two deliberately different ways to bring a project onto a device:
 - **Import a ZIP archive** restores a complete Wisp transfer into a new folder.
   The ZIP contains the workspace's regular files plus project-owned conversations,
   artifacts, runs, plans, provenance, and research-graph records.
+- **Recover conversations from a workspace** scans `.wisp/history` in an
+  orphaned folder whose application database and Wisp project ZIP are no longer
+  available. It registers the folder in place and imports the recoverable message
+  timelines into a `Recovered` conversation folder.
 
-Opening a folder in place creates a new local Wisp project record. Conversation
+Opening an unregistered folder in place creates a new local Wisp project record. Conversation
 history and other records that exist only in another device's Wisp database are
 not recovered from a plain folder copy; use ZIP export/import when those records
-must move too.
+must move too. Workspace conversation recovery is a best-effort disaster fallback,
+not an equivalent replacement for a complete project ZIP.
 
 To move a project from Windows to macOS:
 
@@ -38,6 +43,54 @@ copy.
 For a folder you copied yourself, choose **Import project → Open a folder in
 place** instead. Confirm its local name and path; Wisp registers that exact path
 without creating a duplicate workspace.
+
+If the folder is already registered, Wisp instead shows **Choose an existing
+project**, with the name, full project ID, workspace path, and conversation count
+for every matching project. Select the identity whose history you want to open.
+Older databases can contain several project IDs for the same directory, even
+with identical names. Each keeps its own conversations and groups. Opening one
+does not merge projects, reassign conversations, or import `.wisp/history` JSON.
+Cancelling leaves the active project unchanged. Projects hidden by Privacy mode
+remain hidden in this chooser.
+
+Folder matching uses the existing local filesystem path comparison, resolving
+existing aliases with canonical paths (including Windows junctions and symlinks).
+On Windows, canonical paths are compared without ASCII case differences. This
+lookup is read-only and does not infer that matching projects should be merged.
+
+When conversations appear missing after an update but remain in `wisp.sqlite`,
+try this existing-project chooser before archive recovery. Session visibility is
+scoped to project ID, not just the workspace path. A small `.wisp/history`
+directory does not establish that database conversations were deleted. The
+chooser provides access to existing identities; it does not diagnose which
+version or operation originally created duplicates or changed window restoration.
+
+## Recovering conversations from an orphaned workspace
+
+Choose **Import project → Recover conversations from a workspace** only when the
+original Wisp application database, project ZIP, and sync revision are unavailable.
+After a folder is selected, Wisp scans regular JSON files under `.wisp/history`,
+accepts both plain message-array compaction snapshots and structured Exploration
+checkpoints, deduplicates exact message arrays by content hash, and keeps the
+greatest `message_head` for checkpoints with the same source frame. The preview
+shows the recoverable conversation count, message count, valid archive count,
+time range, and skipped damaged/duplicate archives before making any database
+change.
+
+Confirming the preview registers the existing folder and inserts the project,
+`Recovered` folder, conversations, messages, and import provenance in one SQLite
+transaction. A failed insert leaves no half-recovered project, and Wisp never
+rewrites or deletes the source history archives.
+
+The history files are snapshots rather than a complete portable project database.
+Recovery can restore their stored message timelines, including tool calls and
+reasoning fields, but cannot reconstruct database-only UI events, reviews,
+resource bindings, runs, undo indexes, branch relationships, or other project
+records. Plain message arrays do not identify their original frame, so exact
+copies can be deduplicated but distinct snapshots from one conversation may be
+recovered separately. Ordinary conversations that never produced a compaction or
+Exploration checkpoint may not appear in `.wisp/history` at all. Use project ZIP
+export/import or manual project sync for complete, planned backup and migration.
 
 ## Path rules
 

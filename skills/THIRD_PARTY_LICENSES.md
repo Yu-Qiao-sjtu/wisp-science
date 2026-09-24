@@ -1,6 +1,6 @@
 # Third-Party Licenses
 
-This distribution of Wisp Science includes components derived from or bundling
+This distribution of wisp-depmap includes components derived from or bundling
 third-party open-source software. The required attributions and license texts
 are reproduced below. Per-skill `LICENSE`/`NOTICE` files, where present in a
 skill directory, ship alongside that skill and also apply.
@@ -8,66 +8,6 @@ skill directory, ship alongside that skill and also apply.
 ================================================================================
 1. BUNDLED THIRD-PARTY COMPONENTS
 ================================================================================
-
-### Ketcher
-
-Ketcher (chemical structure editor), EPAM Systems, version 3.12.0 — Apache
-License 2.0 (https://www.apache.org/licenses/LICENSE-2.0). Bundled unmodified
-inside the ketcher-chemistry MCP App widget. Ketcher's NOTICE file is
-reproduced in full below, as required by Apache License 2.0 §4(d):
-
-```
- Ketcher
- Copyright (C) 2018 EPAM Systems
- This product includes software developed at EPAM Systems, Inc.
-
- In addition, this product contains dependencies on files licensed under:
-
- The FreeBSD Documentation License https://www.freebsd.org/copyright/freebsd-doc-license.html
- The MIT License https://opensource.org/licenses/MIT
- X11 License http://www.xfree86.org/3.3.6/COPYRIGHT2.html
- Academic Free License https://opensource.org/licenses/AFL-3.0
- Apache License, Version 1.0 http://www.apache.org/licenses/LICENSE-1.0
- Apache License, Version 2.0 http://www.apache.org/licenses/LICENSE-2.0
- The 2-Clause BSD License https://opensource.org/licenses/BSD-2-Clause
- The 3-Clause BSD License https://opensource.org/licenses/BSD-3-Clause
- ISC License (ISC) https://opensource.org/licenses/ISC
- GNU Lesser General Public License version 2.1 https://opensource.org/licenses/LGPL-2.1
- The Mozilla Public License https://opensource.org/licenses/MPL-1.0
- Public Domain https://wiki.creativecommons.org/wiki/Public_domain
- Unlicense http://unlicense.org/
-```
-
-### biomart-mcp
-
-biomart-mcp (BioMart MCP server) — https://github.com/jzinno/biomart-mcp,
-used under the MIT License.
-
-Copyright (c) 2025 John Zinno
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-The vendored server source (formerly `core/mcp-sources/biomart/biomart_mcp.py`)
-has been replaced by an independent implementation, but
-`mcp-servers/bio-tools/src/lib/mcp_biomart/schemas.json` still serves the
-tool names, descriptions, and input schemas captured verbatim from the
-biomart-mcp-derived connector. See also `mcp-servers/bio-tools/NOTICE`.
 
 ### micromamba
 
@@ -103,21 +43,6 @@ INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
 CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 POSSIBILITY OF SUCH DAMAGE.
-```
-
-### bear-research-skills
-
-Literature research Agent Skills (`bear-support`, `bear-counter`, `bear-map`,
-`bear-scoop`, `bear-trace`, `bear-review`, `bear-onboard`, `bear-propose`) from
-https://github.com/fei0810/bear-research-skills — Creative Commons
-Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0).
-Bundled unmodified under `skills/bear-*/`. Requires `scimaster-cli` (SciMaster)
-for live paper retrieval. License: https://creativecommons.org/licenses/by-nc-sa/4.0/
-
-```
-Copyright (c) bear-research-skills contributors
-Licensed under CC BY-NC-SA 4.0 — attribution required; non-commercial use;
-     derivative works must use the same license.
 ```
 
 ### sharp image runtime
@@ -206,7 +131,7 @@ Components above are licensed under the Apache License 2.0, the GNU LGPL
 v3.0, and the ISC License; those license texts are reproduced here in full.
 The GNU GPL v3.0 is included because the GNU LGPL v3.0 incorporates it by
 reference (LGPL-3.0 §4(b) requires it to accompany the Combined Work). The
-MIT License text appears with the @img/colour and biomart-mcp entries above;
+MIT License text appears with the @img/colour entry above;
 the remaining licenses named in the libvips listing are linked from the
 sharp-libvips source release referenced there.
 

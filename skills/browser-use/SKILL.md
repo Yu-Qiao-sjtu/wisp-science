@@ -9,10 +9,11 @@ fold_cue: "instead_of=guessing-selectors use=web_scan first — it returns a uni
 Wisp talks to the **Browser Runtime**. Shared mode uses the user's daily
 Chrome via the unpacked extension — every action runs in their real
 profile: existing cookies, logins, extensions, and normal fingerprint all
-apply. Workspace mode can launch a separate Chrome profile. If both are
-connected, pass `session: "shared"` or `session: "workspace"`. If
+apply. Workspace mode can launch a separate Chrome profile. Omitting
+`session` always uses shared, even when workspace is connected. Pass
+`session: "workspace"` only when the user explicitly requests isolation. If
 Settings → Browser has **Open browser automatically** enabled (the
-default) and no extension is connected, Wisp may start the installed
+default) and the shared extension is disconnected, Wisp may start the installed
 Chrome/Chromium/Edge so the extension can reconnect. That is still the
 user's profile, not Playwright or Selenium.
 
@@ -25,9 +26,16 @@ and fails with `WORKSPACE_EXTENSION_BLOCKED`. On that error: relay the
 message, do not retry `start_workspace`, do not claim any workspace page
 was opened or read, and get the shared session working instead.
 
+Start with `browser_setup` without an action (an empty action is also a status
+check). If the task supplies a target URL, pass it as `url` so a disconnected
+daily browser opens that page directly; otherwise startup uses its new-tab page.
+A connected shared browser is reused without opening another window. Startup
+does not close existing tabs, including pre-existing blank or new-tab pages.
+
 For figures/code extraction use `web_scan` with `mode: "article"` then
-`web_save_assets`. For ChatGPT web one-shot use `web_agent_send`,
-`web_agent_wait`, `web_agent_read` on an already-logged-in tab.
+`web_save_assets`. For an already-logged-in in-browser chat (ChatGPT,
+Gemini, or Google AI Mode at `google.com/search?udm=50`) use
+`web_agent_send`, `web_agent_wait`, `web_agent_read` on that tab.
 
 Every `web_scan` and `web_execute_js` call needs the user's approval by
 design. Do not treat that as a bug to route around.
@@ -49,10 +57,13 @@ never report a bare "not connected" when either is set:
   refused it (usually a different extension id, or another loopback
   bridge holding the port). Its popup can still read *Connected to Wisp*.
   Relay `refused_connection.explanation`.
-- `reload_required` — a connected extension is older than the protocol
-  this build needs. Have the user open `chrome://extensions` and
-  **Reload** Wisp Real Browser Bridge from `extension_path`; Chrome does
-  not auto-update an unpacked extension.
+- `update_required` / `reload_required` — a connected extension is older than
+  this build. Call `browser_setup {"action":"update_extension"}` first. If it
+  returns `updated`, call `browser_setup` again and continue only when
+  `update_required=false`. If it returns `manual_reload_required`, relay the
+  current and bundled versions plus `extension_path` verbatim, ask the user to
+  **Reload** Wisp Real Browser Bridge on `chrome://extensions`, and wait. Older
+  unpacked extensions cannot accept Wisp's automatic service-worker reload.
 
 One exception: the user says the extension is already installed. Chrome
 suspends its service worker when idle and reconnects on a one-minute
@@ -99,6 +110,22 @@ relay the install steps only if that call fails too.
 Prefer plain JS. Reach for `cmd:cdp` only when a page blocks synthetic
 events or you truly need trusted input.
 
+## In-browser chat — `web_agent_send` / `web_agent_wait` / `web_agent_read`
+
+Use these on an **already signed-in** tab. They are not a new Wisp agent;
+they drive the chat composer in the user's Chrome.
+
+Supported tabs (HTTPS, exact host, no lookalikes):
+
+- ChatGPT: `chatgpt.com` / `chat.openai.com`
+- Gemini: `gemini.google.com`
+- Google AI Mode: `google.com/search?udm=50` (plain Google Search without
+  `udm=50` is refused)
+
+Flow: `web_agent_send {prompt}` → `web_agent_wait` → `web_agent_read`. The
+read result is `{answer_text, citations, status, site}`. If the page is
+login or CAPTCHA, stop and let the user finish it in that tab.
+
 ## Seeing the page — `web_screenshot`
 
 `web_scan` gives text and elements; **`web_screenshot`** gives sight. Use it
@@ -112,32 +139,35 @@ Pass `question` to say what to read out of it, e.g.
 It goes through the configured vision model, so `web_scan` stays the cheaper
 default — screenshot when you need eyes, not for every step.
 
-## Tab hygiene — track what you open, offer to close it
+## Tab hygiene — the app tracks what you open
 
-Browsing tasks (searching papers, opening a dozen results) leave the user
-with a pile of tabs to close by hand. So:
+Browsing tasks (searching papers, opening a dozen results) used to leave the
+user with a pile of tabs. **Do not ask in chat whether to close them.** The
+desktop records every tab `web_open_tab` (and tab-create commands) opened in
+this turn, including after URL changes, and never includes tabs that were
+already open.
 
-1. Every `web_open_tab` returns `tab.id`. **Keep a running list of the ids
-   you opened in this task**, in your own message text — e.g. after a batch
-   write `opened tabs: 1234, 1235, 1236`. `{"cmd":"tabs"}` cannot tell you
-   which tabs are yours, only what exists.
-2. When the task is done, before your final answer, **ask the user**:
-   name the count and offer to close them, e.g. *"我为这次检索开了 6 个标签
-   页，需要我关掉吗？"* Do not close anything without a yes.
-3. On a yes, close them in one call:
-   `{"cmd":"tabs","method":"close","tabIds":[1234,1235,1236]}`. Report
-   `closed`; ids already gone are skipped silently.
+- If Settings → Browser has **Automatically close browser tabs** on
+  (`browser_setup.auto_close_tabs=true`), the app closes this turn's tabs
+  when the turn ends. Do not also close them yourself unless the user asks
+  mid-task.
+- If that setting is off, the app shows a confirmation after the turn
+  (default: close all this-turn tabs; the user can uncheck pages to keep).
+- You may still close a tab **mid-task** with
+  `{"cmd":"tabs","method":"close","tabIds":[...]}` if a later step does not
+  need it, or if the user explicitly asks now.
 
 Close **only ids you opened yourself**. Tabs the user had open, or ones
-they opened during the task, are theirs — never include them, and never
-close a tab mid-task that later steps still need.
+they opened during the task, are theirs.
 
 ## Stop conditions (do not automate through these)
 
 - **Human verification / CAPTCHA:** if `web_scan` returns
-  `human_intervention.required=true`, stop, ask the user to complete the
-  challenge in the visible tab, and wait for their confirmation before
-  scanning again.
+  `human_intervention.required=true`, a Wisp prompt has already been shown.
+  Stop browser automation. Do not open another in-app question about the
+  challenge. Do not click, solve, or bypass it. End your turn. The user
+  confirms in the app after completing it in the visible tab; the next
+  message is their confirmation.
 - **Credentials:** never type passwords, card numbers, or one-time codes
   yourself. If a step needs a password, have the user sign in directly in
   the browser and continue once they confirm.

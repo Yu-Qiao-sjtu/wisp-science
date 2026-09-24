@@ -194,7 +194,7 @@ pub(super) fn NotebookView(
                             <span class="notebook-language">{language.clone()}</span>
                             <span class="spacer"></span>
                             <span class=format!("notebook-status {status}") title=status></span>
-                            <span class="notebook-runtime">{format!("{runtime} · wisp-science")}</span>
+                            <span class="notebook-runtime">{format!("{runtime} · wisp-depmap")}</span>
                             <button type="button" class="notebook-star" class:starred=move || starred.get()
                                 disabled=move || active_session.get().is_none()
                                 title=move || t(locale, if starred.get() { "library.remove" } else { "library.add" })
@@ -264,6 +264,42 @@ pub(super) fn NotebookView(
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_notebook_fixture_matches_webview_projection() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../contracts/native-conversations/v1/panel-notebook.json"
+        ))
+        .unwrap();
+        let rows: Vec<wisp_dto::native_conversations::Item> =
+            serde_json::from_value(fixture["items"].clone()).unwrap();
+        let items: Vec<_> = rows
+            .into_iter()
+            .map(|row| match row.role.as_str() {
+                "assistant" => ChatItem::Assistant {
+                    text: row.text,
+                    model: None,
+                    resources: vec![],
+                },
+                "tool" => ChatItem::Tool {
+                    name: row.tool_name.unwrap_or_default(),
+                    input: row.input.unwrap_or_default(),
+                    output: row.text,
+                    ok: row.ok,
+                    started_at_ms: None,
+                    duration_ms: None,
+                },
+                _ => ChatItem::User(row.text),
+            })
+            .collect();
+        let cells = collect_notebook_cells(&items, &mut NotebookCache::new());
+        let actual: Vec<_> = cells.into_iter().map(|cell| serde_json::json!({
+            "index": cell.index, "language": cell.language, "source": cell.source,
+            "output": cell.output, "ok": cell.ok, "origin": match cell.origin {
+                NotebookOrigin::Assistant => "assistant", NotebookOrigin::Repl => "repl", NotebookOrigin::Shell => "shell",
+            },
+        })).collect();
+        assert_eq!(serde_json::to_value(actual).unwrap(), fixture["cells"]);
+    }
     #[test]
     fn notebook_prefers_executed_cells_and_ignores_data_fences() {
         let items = vec![

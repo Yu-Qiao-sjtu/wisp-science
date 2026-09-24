@@ -24,7 +24,7 @@ fn active_session_id(state: &AppState, window_label: &str) -> String {
 /// project shows the viewed conversation's runtimes plus scope-shared ones;
 /// other projects keep all their mainline runtimes visible so a large kernel
 /// is never invisible.
-fn runtime_visible(
+pub(crate) fn runtime_visible(
     key: &wisp_runtime::RuntimeKey,
     scope: &wisp_store::StateScope,
     active_session: &str,
@@ -45,7 +45,7 @@ fn runtime_visible(
 /// Pick the runtime a UI command targets: prefer the viewed conversation's
 /// runtime, fall back to an existing scope-shared one, and default new
 /// runtimes to the conversation identity when a conversation is open.
-fn resolve_runtime_key(
+pub(crate) fn resolve_runtime_key(
     manager: &wisp_runtime::RuntimeManager,
     project_id: String,
     scope_key: String,
@@ -85,7 +85,7 @@ fn resolve_runtime_key(
 #[tauri::command]
 pub(super) async fn list_runtimes(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
 ) -> Result<Vec<wisp_runtime::RuntimeInfo>, String> {
     let (_, scope) =
         exploration_commands::working_project_for_active_frame(&state, window.label()).await?;
@@ -101,7 +101,7 @@ pub(super) async fn list_runtimes(
 #[tauri::command]
 pub(super) async fn inspect_runtime(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     project_id: String,
     context_id: String,
     language: wisp_runtime::RuntimeLanguage,
@@ -135,22 +135,33 @@ pub(super) async fn inspect_runtime(
         .map_err(|error| error.to_string())
 }
 
-/// Run code the user selected in the file preview against their bound runtime.
-/// Deferred in the runtime design until the UI gained a code editor; it has one
-/// now. The user is looking at the code they pressed Run on, so this path is
-/// deliberately outside the agent tool-approval flow.
+/// What one user-driven runtime execution hands back to the workbench:
+/// rendered console text plus any plots the cell produced (base64 PNGs).
+/// Mirrored by `wisp_dto::RuntimeExecutionSummary`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeExecutionSummary {
+    pub(crate) text: String,
+    pub(crate) plots: Vec<String>,
+}
+
+/// Run code the user selected in the file preview — or typed into the
+/// workbench console — against their bound runtime. Deferred in the runtime
+/// design until the UI gained a code editor; it has one now. The user is
+/// looking at the code they pressed Run on, so this path is deliberately
+/// outside the agent tool-approval flow.
 ///
-/// Returns console text. Code that raised is still `Ok`: `format_response` tags
-/// it `[error]` exactly as the agent tools render it. `Err` means the runtime
-/// itself never produced a result.
+/// Returns console text and plots. Code that raised is still `Ok`:
+/// `format_response` tags it `[error]` exactly as the agent tools render it.
+/// `Err` means the runtime itself never produced a result.
 #[tauri::command]
 pub(super) async fn execute_runtime(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     context_id: String,
     language: wisp_runtime::RuntimeLanguage,
     code: String,
-) -> Result<String, String> {
+) -> Result<RuntimeExecutionSummary, String> {
     if code.len() > wisp_runtime::MAX_CODE_BYTES {
         return Err(format!(
             "Selection exceeds the {} byte runtime limit.",
@@ -176,11 +187,83 @@ pub(super) async fn execute_runtime(
         context_id,
         language,
     );
-    let mut execution = state
+    let execution = state
         .runtime_manager
         .execute(&key, &project.root, code)
         .await
         .map_err(|error| error.to_string())?;
+    finish_runtime_execution(&state, &scope, execution, |response, _| {
+        wisp_runtime::format_response(response)
+    })
+    .await
+}
+
+/// Run a whole saved project script in the runtime the editor bound it to.
+/// The editor saves the buffer first, so the bytes read here are the bytes the
+/// user is looking at, and the reported hash is a real provenance record rather
+/// than a hash of a transient buffer. Reuses the agent tools' reader and
+/// `source_name` so a traceback names the script, not an anonymous cell.
+#[tauri::command]
+pub(super) async fn execute_runtime_script(
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+    context_id: String,
+    language: wisp_runtime::RuntimeLanguage,
+    script_path: String,
+) -> Result<RuntimeExecutionSummary, String> {
+    let (project, scope) =
+        exploration_commands::working_project_for_active_frame(&state, window.label()).await?;
+    let _project_activity = state.begin_project_activity(&project.id)?;
+    exploration_commands::require_writable_scope(&state.store, &scope).await?;
+    let script = wisp_runtime::read_project_script(
+        &project.root,
+        &script_path,
+        language.script_extension(),
+    )?;
+    if exploration_isolation::is_host_local_context(&context_id) {
+        if let Some(boundary) =
+            exploration_isolation::boundary_for_scope(&state.store, &scope).await?
+        {
+            boundary.check_local_source(&script.code)?;
+        }
+    }
+    let key = resolve_runtime_key(
+        &state.runtime_manager,
+        project.id.clone(),
+        scope.scope_key().to_string(),
+        &active_session_id(&state, window.label()),
+        context_id,
+        language,
+    );
+    let execution = state
+        .runtime_manager
+        .execute_with_options(
+            &key,
+            &project.root,
+            script.code,
+            wisp_runtime::RuntimeExecutionOptions {
+                source_name: Some(script.provenance.path.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    finish_runtime_execution(&state, &scope, execution, |response, runtime| {
+        wisp_runtime::format_script_response(response, Some(&script.provenance), runtime)
+    })
+    .await
+}
+
+/// Drain one execution until the worker finishes, then bump the scope so the
+/// workbench refreshes. Shared by cell and whole-script runs because the only
+/// difference is how the console text is formatted.
+pub(crate) async fn finish_runtime_execution(
+    state: &AppState,
+    scope: &wisp_store::StateScope,
+    mut execution: wisp_runtime::RuntimeExecution,
+    format: impl FnOnce(&wisp_runtime::KernelResp, &wisp_runtime::RuntimeInfo) -> String,
+) -> Result<RuntimeExecutionSummary, String> {
+    let runtime = execution.info().clone();
     loop {
         match execution.recv().await {
             // ponytail: buffered, not streamed — the final frame repeats every
@@ -189,11 +272,14 @@ pub(super) async fn execute_runtime(
             Some(wisp_runtime::RuntimeEvent::Finished(result)) => {
                 state
                     .store
-                    .bump_state_generation(&scope)
+                    .bump_state_generation(scope)
                     .await
                     .map_err(|error| error.to_string())?;
                 return result
-                    .map(|response| wisp_runtime::format_response(&response))
+                    .map(|response| RuntimeExecutionSummary {
+                        text: format(&response, &runtime),
+                        plots: response.plots,
+                    })
                     .map_err(|error| error.to_string());
             }
             None => return Err("Runtime ended before returning a result.".into()),
@@ -204,7 +290,7 @@ pub(super) async fn execute_runtime(
 #[tauri::command]
 pub(super) async fn start_runtime(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     context_id: String,
     language: wisp_runtime::RuntimeLanguage,
 ) -> Result<wisp_runtime::RuntimeInfo, String> {
@@ -228,9 +314,37 @@ pub(super) async fn start_runtime(
 }
 
 #[tauri::command]
+pub(super) async fn dismiss_runtime(
+    state: State<'_, AppState>,
+    window: crate::workspace_surface::WorkspaceSurface,
+    runtime_id: String,
+) -> Result<(), String> {
+    let (_, scope) =
+        exploration_commands::working_project_for_active_frame(&state, window.label()).await?;
+    if let Some(info) = state
+        .runtime_manager
+        .list()
+        .into_iter()
+        .find(|info| info.runtime_id == runtime_id)
+    {
+        if !runtime_visible(
+            &info.key,
+            &scope,
+            &active_session_id(&state, window.label()),
+        ) {
+            return Err("runtime is outside this window's scope".into());
+        }
+    }
+    state
+        .runtime_manager
+        .dismiss_dead(&runtime_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub(super) async fn stop_runtime(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     project_id: String,
     context_id: String,
     language: wisp_runtime::RuntimeLanguage,
@@ -279,7 +393,7 @@ pub(super) async fn stop_runtime(
 #[tauri::command]
 pub(super) async fn restart_runtime(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     project_id: String,
     context_id: String,
     language: wisp_runtime::RuntimeLanguage,
@@ -333,7 +447,7 @@ pub(super) async fn restart_runtime(
 #[tauri::command]
 pub(super) async fn list_runs(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
 ) -> Result<Vec<wisp_store::RunSummary>, String> {
     let (_, scope) =
         exploration_commands::working_project_for_active_frame(&state, window.label()).await?;
@@ -347,7 +461,7 @@ pub(super) async fn list_runs(
 #[tauri::command]
 pub(super) async fn get_run_detail(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     run_id: String,
 ) -> Result<wisp_store::RunRecord, String> {
     let (_, scope) =
@@ -371,7 +485,7 @@ pub(super) async fn get_run_detail(
 #[tauri::command]
 pub(super) async fn cancel_run(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     run_id: String,
 ) -> Result<wisp_store::RunRecord, String> {
     let (ap, scope) =
@@ -410,7 +524,7 @@ pub(super) async fn cancel_run(
 #[tauri::command]
 pub(super) async fn harvest_run(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     run_id: String,
 ) -> Result<wisp_store::RunRecord, String> {
     let (ap, scope) =
@@ -446,7 +560,7 @@ pub(super) async fn harvest_run(
 
 async fn scoped_run(
     state: &State<'_, AppState>,
-    window: &tauri::WebviewWindow,
+    window: &crate::workspace_surface::WorkspaceSurface,
     run_id: &str,
 ) -> Result<(), String> {
     let (ap, scope) =
@@ -478,7 +592,7 @@ async fn scoped_run(
 #[tauri::command]
 pub(super) async fn list_run_workspace_files(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     run_id: String,
     path: Option<String>,
     name_filter: Option<String>,
@@ -504,7 +618,7 @@ pub(super) async fn list_run_workspace_files(
 #[tauri::command]
 pub(super) async fn download_run_files(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     run_id: String,
     files: Option<Vec<String>>,
     dirs: Option<Vec<String>>,
@@ -531,7 +645,7 @@ pub(super) async fn download_run_files(
 #[tauri::command]
 pub(super) async fn should_prompt_run_review(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     run_id: String,
 ) -> Result<bool, String> {
     scoped_run(&state, &window, &run_id).await?;
@@ -546,7 +660,7 @@ pub(super) async fn should_prompt_run_review(
 #[tauri::command]
 pub(super) async fn dismiss_run_review(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     run_id: String,
 ) -> Result<(), String> {
     scoped_run(&state, &window, &run_id).await?;
@@ -562,7 +676,7 @@ pub(super) async fn dismiss_run_review(
 #[tauri::command]
 pub(super) async fn delete_run_files(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     run_id: String,
     paths: Vec<String>,
 ) -> Result<(), String> {
@@ -580,7 +694,7 @@ pub(super) async fn delete_run_files(
 #[tauri::command]
 pub(super) async fn list_remote_files(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     context_id: String,
 ) -> Result<Vec<crate::run_context::remote_files::RemoteFileView>, String> {
     let (ap, _) =
@@ -593,7 +707,7 @@ pub(super) async fn list_remote_files(
 #[tauri::command]
 pub(super) async fn remove_remote_files(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     context_id: String,
     ids: Vec<String>,
     force: Option<bool>,
@@ -627,7 +741,7 @@ pub(super) async fn remove_remote_files(
 #[tauri::command]
 pub(super) async fn context_disposal_report(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     context_id: String,
 ) -> Result<crate::run_context::remote_files::ContextDisposalReport, String> {
     let (ap, _) =
@@ -646,7 +760,7 @@ pub(super) async fn context_disposal_report(
 #[tauri::command]
 pub(super) async fn cleanup_run_workspace(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     run_id: String,
     force: Option<bool>,
 ) -> Result<wisp_store::RunRecord, String> {

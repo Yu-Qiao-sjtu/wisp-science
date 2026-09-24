@@ -182,7 +182,10 @@ mod endpoint_tests {
             "https://api.deepseek.com",
             "https://api.openai.com"
         ));
-        assert_eq!(endpoint_host("https://api.deepseek.com/v1"), "api.deepseek.com");
+        assert_eq!(
+            endpoint_host("https://api.deepseek.com/v1"),
+            "api.deepseek.com"
+        );
     }
 
     #[test]
@@ -348,13 +351,174 @@ pub(crate) fn md_document_to_html(src: &str) -> String {
 
 fn preprocess_markdown(src: &str) -> std::borrow::Cow<'_, str> {
     let src = rewrite_image_tags(src);
+    let src = match rewrite_file_citations(src.as_ref()) {
+        std::borrow::Cow::Borrowed(_) => src,
+        std::borrow::Cow::Owned(s) => std::borrow::Cow::Owned(s),
+    };
     let src = match normalize_math_delimiters(src.as_ref()) {
         std::borrow::Cow::Borrowed(_) => src,
         std::borrow::Cow::Owned(s) => std::borrow::Cow::Owned(s),
     };
-    match rejoin_empty_list_markers(src.as_ref()) {
+    let src = match rejoin_empty_list_markers(src.as_ref()) {
         std::borrow::Cow::Borrowed(_) => src,
         std::borrow::Cow::Owned(s) => std::borrow::Cow::Owned(s),
+    };
+    match relax_emphasis_flanking(src.as_ref()) {
+        std::borrow::Cow::Borrowed(_) => src,
+        std::borrow::Cow::Owned(s) => std::borrow::Cow::Owned(s),
+    }
+}
+
+/// CommonMark will not close `**strong**` / `__strong__` / `~~strike~~` when
+/// the closer is preceded by punctuation and followed by a non-space,
+/// non-punctuation character (`**对得上。**两份`). Chinese replies do this
+/// constantly. Rewrite those pairs to inline HTML so they still render.
+/// Fenced code and inline code spans are left untouched.
+fn relax_emphasis_flanking(src: &str) -> std::borrow::Cow<'_, str> {
+    if !src.contains("**") && !src.contains("__") && !src.contains("~~") {
+        return std::borrow::Cow::Borrowed(src);
+    }
+    let mut out = String::with_capacity(src.len() + 32);
+    let mut changed = false;
+    let mut fence: Option<(char, usize)> = None;
+    for chunk in src.split_inclusive('\n') {
+        let line = chunk.trim_end_matches(['\r', '\n']);
+        let stripped = line.trim_start();
+        let mark = stripped.chars().next().filter(|c| matches!(c, '`' | '~'));
+        let run = mark.map_or(0, |m| stripped.chars().take_while(|&c| c == m).count());
+        match fence {
+            Some((m, n)) => {
+                out.push_str(chunk);
+                if mark == Some(m) && run >= n && stripped[run..].trim().is_empty() {
+                    fence = None;
+                }
+            }
+            None if run >= 3 => {
+                out.push_str(chunk);
+                fence = Some((mark.unwrap(), run));
+            }
+            None => rewrite_emphasis_outside_code(chunk, &mut out, &mut changed),
+        }
+    }
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(src)
+    }
+}
+
+fn rewrite_emphasis_outside_code(seg: &str, out: &mut String, changed: &mut bool) {
+    let mut rest = seg;
+    loop {
+        let Some(bt) = rest.find('`') else {
+            rewrite_failing_emphasis(rest, out, changed);
+            return;
+        };
+        rewrite_failing_emphasis(&rest[..bt], out, changed);
+        let n = rest[bt..].chars().take_while(|&c| c == '`').count();
+        out.push_str(&rest[bt..bt + n]);
+        rest = &rest[bt + n..];
+        if let Some(end) = find_backtick_run(rest, n) {
+            out.push_str(&rest[..end + n]);
+            rest = &rest[end + n..];
+        }
+    }
+}
+
+fn rewrite_failing_emphasis(seg: &str, out: &mut String, changed: &mut bool) {
+    let mut owned: Option<String> = None;
+    for (mark, tag) in [("**", "strong"), ("__", "strong"), ("~~", "del")] {
+        let src = owned.as_deref().unwrap_or(seg);
+        if !src.contains(mark) {
+            continue;
+        }
+        let mut buf = String::new();
+        let mut local = false;
+        rewrite_failing_mark(src, mark, tag, &mut buf, &mut local);
+        if local {
+            *changed = true;
+            owned = Some(buf);
+        }
+    }
+    out.push_str(owned.as_deref().unwrap_or(seg));
+}
+
+fn rewrite_failing_mark(seg: &str, mark: &str, tag: &str, out: &mut String, changed: &mut bool) {
+    let mut rest = seg;
+    while let Some(start) = rest.find(mark) {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start + mark.len()..];
+        let search = &after_open[..paragraph_break(after_open)];
+        if let Some(rel) = search.find(mark) {
+            let inner = &search[..rel];
+            let after_close = &after_open[rel + mark.len()..];
+            if !inner.is_empty()
+                && !inner.chars().next().is_some_and(is_cmark_whitespace)
+                && closer_needs_relax(inner, after_close)
+            {
+                *changed = true;
+                out.push('<');
+                out.push_str(tag);
+                out.push('>');
+                out.push_str(&html_escape(inner));
+                out.push_str("</");
+                out.push_str(tag);
+                out.push('>');
+                rest = after_close;
+                continue;
+            }
+            out.push_str(mark);
+            out.push_str(inner);
+            out.push_str(mark);
+            rest = after_close;
+            continue;
+        }
+        out.push_str(mark);
+        rest = after_open;
+    }
+    out.push_str(rest);
+}
+
+fn closer_needs_relax(inner: &str, after_close: &str) -> bool {
+    let Some(before) = inner.chars().next_back() else {
+        return false;
+    };
+    let Some(after) = after_close.chars().next() else {
+        return false;
+    };
+    is_cmark_punctuation(before) && !is_cmark_whitespace(after) && !is_cmark_punctuation(after)
+}
+
+fn paragraph_break(s: &str) -> usize {
+    let n = s.find("\n\n");
+    let r = s.find("\r\n\r\n");
+    match (n, r) {
+        (Some(a), Some(b)) => a.min(b),
+        (Some(a), None) | (None, Some(a)) => a,
+        (None, None) => s.len(),
+    }
+}
+
+/// CommonMark punctuation: ASCII punctuation plus Unicode Pc/Pd/Pe/Pf/Pi/Po/Ps
+/// that actually show up next to emphasis closers in CJK replies.
+fn is_cmark_punctuation(c: char) -> bool {
+    if c.is_ascii_punctuation() {
+        return true;
+    }
+    let u = c as u32;
+    (0x3001..=0x303F).contains(&u)
+        || (0xFF01..=0xFF0F).contains(&u)
+        || (0xFF1A..=0xFF20).contains(&u)
+        || (0xFF3B..=0xFF40).contains(&u)
+        || (0xFF5B..=0xFF65).contains(&u)
+        || (0x2010..=0x2027).contains(&u)
+        || (0x2030..=0x205E).contains(&u)
+        || matches!(c, '«' | '»' | '·' | '¿' | '¡')
+}
+
+fn is_cmark_whitespace(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{000C}') || {
+        c.is_whitespace() && !matches!(c, '\u{000B}' | '\u{0085}' | '\u{2028}' | '\u{2029}')
     }
 }
 
@@ -714,6 +878,139 @@ fn image_tag_attr<'a>(tag: &'a str, key: &str) -> Option<&'a str> {
         .find(|c: char| c.is_whitespace() || c == '>')
         .unwrap_or(rest.len());
     Some(&rest[..end])
+}
+
+/// Codex Desktop emits `:codex-file-citation{path="..." purpose="output"}`
+/// (one to three leading colons). Rewrite those tokens into ordinary Markdown
+/// file links so the existing click handler can open the file.
+fn rewrite_file_citations(src: &str) -> std::borrow::Cow<'_, str> {
+    if !src.contains("codex-file-citation{") {
+        return std::borrow::Cow::Borrowed(src);
+    }
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    let mut changed = false;
+    while let Some(idx) = rest.find("codex-file-citation{") {
+        let colon_count = rest[..idx]
+            .bytes()
+            .rev()
+            .take_while(|&byte| byte == b':')
+            .count();
+        if !(1..=3).contains(&colon_count) {
+            out.push_str(&rest[..idx + 1]);
+            rest = &rest[idx + 1..];
+            continue;
+        }
+        let start = idx - colon_count;
+        out.push_str(&rest[..start]);
+        let body = &rest[idx + "codex-file-citation{".len()..];
+        if let Some((path, consumed)) = parse_codex_file_citation_body(body) {
+            if path.is_empty() {
+                let token_end = idx + "codex-file-citation{".len() + consumed;
+                out.push_str(&rest[start..token_end]);
+                rest = &rest[token_end..];
+                continue;
+            }
+            changed = true;
+            out.push_str(&codex_file_citation_link(&path));
+            rest = &body[consumed..];
+            continue;
+        }
+        out.push_str(&rest[start..idx + "codex-file-citation{".len()]);
+        rest = &rest[idx + "codex-file-citation{".len()..];
+    }
+    out.push_str(rest);
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(src)
+    }
+}
+
+pub(crate) fn for_each_codex_file_citation_path(src: &str, mut visit: impl FnMut(&str)) {
+    if !src.contains("codex-file-citation{") {
+        return;
+    }
+    let mut rest = src;
+    while let Some(idx) = rest.find("codex-file-citation{") {
+        let colon_count = rest[..idx]
+            .bytes()
+            .rev()
+            .take_while(|&byte| byte == b':')
+            .count();
+        let body = &rest[idx + "codex-file-citation{".len()..];
+        if (1..=3).contains(&colon_count) {
+            if let Some((path, consumed)) = parse_codex_file_citation_body(body) {
+                if !path.is_empty() {
+                    visit(&path);
+                }
+                rest = &body[consumed..];
+                continue;
+            }
+        }
+        rest = &rest[idx + 1..];
+    }
+}
+
+fn parse_codex_file_citation_body(body: &str) -> Option<(String, usize)> {
+    let mut rest = body;
+    let mut path = None;
+    loop {
+        rest = rest.trim_start_matches([' ', '\t']);
+        if rest.starts_with('}') {
+            let consumed = body.len() - rest.len() + 1;
+            return path.map(|path| (path, consumed));
+        }
+        if rest.is_empty() || rest.starts_with(['\n', '\r']) {
+            return None;
+        }
+        let key_len = rest
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'-')
+            .count();
+        if key_len == 0 {
+            return None;
+        }
+        let key = &rest[..key_len];
+        rest = rest[key_len..].trim_start_matches([' ', '\t']);
+        rest = rest.strip_prefix('=')?;
+        rest = rest.trim_start_matches([' ', '\t']);
+        let (value, after) = parse_codex_file_citation_attr_value(rest)?;
+        if key == "path" {
+            path = Some(value);
+        }
+        rest = after;
+    }
+}
+
+fn parse_codex_file_citation_attr_value(rest: &str) -> Option<(String, &str)> {
+    let first = rest.as_bytes().first().copied()?;
+    if first == b'"' || first == b'\'' {
+        let inner = &rest[1..];
+        let end = inner.find(first as char)?;
+        if inner[..end].contains(['\n', '\r']) {
+            return None;
+        }
+        Some((inner[..end].to_string(), &inner[end + 1..]))
+    } else {
+        let end = rest
+            .find([' ', '\t', '}', '\n', '\r'])
+            .unwrap_or(rest.len());
+        if end == 0 {
+            return None;
+        }
+        Some((rest[..end].to_string(), &rest[end..]))
+    }
+}
+
+fn codex_file_citation_link(path: &str) -> String {
+    let label = path
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path);
+    let label = label.replace('[', "\\[").replace(']', "\\]");
+    format!("[{label}](<{path}>)")
 }
 
 /// Bare runs of snake_case tool/API names collapse into one unreadable `<p>`
@@ -1408,6 +1705,14 @@ pub(crate) fn code_lang(path: &str) -> Option<&'static str> {
     })
 }
 
+/// Highlight language for a preview path. Durable resource tabs use
+/// `artifact-version:<id>` (no extension), so fall back to the display filename.
+pub(crate) fn preview_code_lang(path: &str, filename: Option<&str>) -> &'static str {
+    code_lang(path)
+        .or_else(|| filename.and_then(code_lang))
+        .unwrap_or("plaintext")
+}
+
 /// The persistent-runtime language a source file can be bound to, or `None` for
 /// files with no runtime. The returned ids are the `RuntimeLanguage` wire
 /// spelling, so they pass straight to the runtime commands.
@@ -1416,6 +1721,601 @@ pub(crate) fn runtime_language(path: &str) -> Option<&'static str> {
         language @ ("r" | "python") => Some(language),
         _ => None,
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SourceSelection {
+    pub(crate) before: String,
+    pub(crate) selected: String,
+    pub(crate) after: String,
+    pub(crate) start_line: usize,
+    pub(crate) end_line: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SourceExecution {
+    pub(crate) code: String,
+    /// When running a collapsed caret, move it to the following line just like
+    /// RStudio. A real selection stays selected, so this is `None` for it.
+    pub(crate) next_caret_utf16: Option<u32>,
+}
+
+fn utf16_to_byte_index(text: &str, target: u32) -> usize {
+    let mut utf16 = 0_u32;
+    for (byte, ch) in text.char_indices() {
+        if utf16 >= target {
+            return byte;
+        }
+        let next = utf16.saturating_add(ch.len_utf16() as u32);
+        if next > target {
+            return byte;
+        }
+        utf16 = next;
+    }
+    text.len()
+}
+
+fn byte_to_utf16_index(text: &str, byte: usize) -> u32 {
+    text[..byte.min(text.len())].encode_utf16().count() as u32
+}
+
+fn source_line_at(text: &str, byte: usize) -> usize {
+    text[..byte.min(text.len())]
+        .bytes()
+        .filter(|ch| *ch == b'\n')
+        .count()
+        + 1
+}
+
+/// Split a textarea selection using its UTF-16 DOM offsets. Keeping this
+/// conversion explicit matters for Chinese source comments and astral Unicode:
+/// Rust string indexes are bytes, while `selectionStart`/`selectionEnd` are
+/// UTF-16 code units.
+pub(crate) fn source_selection(text: &str, start_utf16: u32, end_utf16: u32) -> SourceSelection {
+    let (start_utf16, end_utf16) = if start_utf16 <= end_utf16 {
+        (start_utf16, end_utf16)
+    } else {
+        (end_utf16, start_utf16)
+    };
+    let start = utf16_to_byte_index(text, start_utf16);
+    let end = utf16_to_byte_index(text, end_utf16).max(start);
+    // When the selection ends immediately after a newline, that newline still
+    // belongs to the preceding rendered line; do not report the empty next line.
+    let end_for_line = if end > start && text.as_bytes().get(end - 1) == Some(&b'\n') {
+        end - 1
+    } else {
+        end
+    };
+    SourceSelection {
+        before: text[..start].to_string(),
+        selected: text[start..end].to_string(),
+        after: text[end..].to_string(),
+        start_line: source_line_at(text, start),
+        end_line: source_line_at(text, end_for_line),
+    }
+}
+
+/// RStudio-style execution unit: run the selection when present, otherwise
+/// run the complete statement that contains the caret (parenthesized calls,
+/// pipes, `if`/`function`/`def` bodies) and advance to the next statement.
+pub(crate) fn source_execution(
+    text: &str,
+    start_utf16: u32,
+    end_utf16: u32,
+    language: &str,
+) -> Option<SourceExecution> {
+    if end_utf16 > start_utf16 {
+        let selection = source_selection(text, start_utf16, end_utf16);
+        return (!selection.selected.trim().is_empty()).then_some(SourceExecution {
+            code: selection.selected,
+            next_caret_utf16: None,
+        });
+    }
+
+    let caret = utf16_to_byte_index(text, start_utf16);
+    let lang = exec_lang(language);
+    let (stmt_start, stmt_end) = statement_bounds(text, caret, lang);
+    let code = text[stmt_start..stmt_end].to_string();
+    if code.trim().is_empty() {
+        return None;
+    }
+    let next = next_statement_caret(text, stmt_end);
+    Some(SourceExecution {
+        code,
+        next_caret_utf16: Some(byte_to_utf16_index(text, next)),
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecLang {
+    R,
+    Python,
+    Generic,
+}
+
+fn exec_lang(name: &str) -> ExecLang {
+    match name {
+        "r" => ExecLang::R,
+        "python" => ExecLang::Python,
+        _ => ExecLang::Generic,
+    }
+}
+
+fn line_start_at(text: &str, byte: usize) -> usize {
+    let byte = byte.min(text.len());
+    text[..byte].rfind('\n').map_or(0, |newline| newline + 1)
+}
+
+fn line_end_at(text: &str, byte: usize) -> usize {
+    let byte = byte.min(text.len());
+    text[byte..]
+        .find('\n')
+        .map_or(text.len(), |offset| byte + offset)
+}
+
+fn prev_line_start(text: &str, current_start: usize) -> Option<usize> {
+    if current_start == 0 {
+        return None;
+    }
+    Some(line_start_at(text, current_start - 1))
+}
+
+fn line_indent(text: &str, line_start: usize) -> usize {
+    let mut n = 0usize;
+    for ch in text[line_start.min(text.len())..].chars() {
+        match ch {
+            ' ' => n += 1,
+            '\t' => n += 8 - (n % 8),
+            _ => break,
+        }
+    }
+    n
+}
+
+fn line_is_trivia(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.is_empty() || trimmed.starts_with('#')
+}
+
+fn next_nontrivia_line(text: &str, from: usize) -> Option<(usize, usize)> {
+    let mut from = from;
+    while from < text.len() {
+        if text.as_bytes()[from] == b'\n' {
+            from += 1;
+            if from >= text.len() {
+                return None;
+            }
+        }
+        let end = line_end_at(text, from);
+        if !line_is_trivia(&text[from..end]) {
+            return Some((from, end));
+        }
+        if end >= text.len() {
+            return None;
+        }
+        from = end;
+    }
+    None
+}
+
+fn next_statement_caret(text: &str, stmt_end: usize) -> usize {
+    let mut next = if stmt_end < text.len() && text.as_bytes()[stmt_end] == b'\n' {
+        stmt_end + 1
+    } else {
+        stmt_end
+    };
+    while next < text.len() {
+        let end = line_end_at(text, next);
+        if !line_is_trivia(&text[next..end]) {
+            break;
+        }
+        next = if end < text.len() { end + 1 } else { end };
+    }
+    next
+}
+
+/// Smallest range covering the statement that contains `caret`.
+fn statement_bounds(text: &str, caret: usize, lang: ExecLang) -> (usize, usize) {
+    let mut start = line_start_at(text, caret);
+    while let Some(prev) = prev_nontrivia_line_start(text, start) {
+        if may_join_previous(text, prev, start, lang) {
+            start = prev;
+        } else {
+            break;
+        }
+    }
+    (start, expand_statement_end(text, start, lang))
+}
+
+fn prev_nontrivia_line_start(text: &str, current_start: usize) -> Option<usize> {
+    let mut look = current_start;
+    loop {
+        let prev = prev_line_start(text, look)?;
+        if prev == look {
+            return None;
+        }
+        let end = line_end_at(text, prev);
+        if !line_is_trivia(&text[prev..end]) {
+            return Some(prev);
+        }
+        look = prev;
+    }
+}
+
+fn may_join_previous(text: &str, prev: usize, start: usize, lang: ExecLang) -> bool {
+    let prev_end = line_end_at(text, prev);
+    if chunk_is_incomplete(&text[prev..prev_end], lang) {
+        return true;
+    }
+    match lang {
+        ExecLang::Python => {
+            let cur_end = line_end_at(text, start);
+            let prev_indent = line_indent(text, prev);
+            let cur_indent = line_indent(text, start);
+            if cur_indent > 0 && prev_indent >= cur_indent {
+                return true;
+            }
+            if python_opens_block(&text[prev..prev_end]) && cur_indent > prev_indent {
+                return true;
+            }
+            python_suite_continuer(&text[start..cur_end]) && cur_indent <= prev_indent
+        }
+        ExecLang::R => {
+            let cur_end = line_end_at(text, start);
+            line_starts_with_keyword(&text[start..cur_end], "else")
+        }
+        ExecLang::Generic => false,
+    }
+}
+
+fn expand_statement_end(text: &str, start: usize, lang: ExecLang) -> usize {
+    let mut end = line_end_at(text, start);
+    loop {
+        if !should_extend_forward(text, start, end, lang) {
+            break;
+        }
+        if end >= text.len() || text.as_bytes()[end] != b'\n' {
+            break;
+        }
+        let next_end = line_end_at(text, end + 1);
+        if next_end == end {
+            break;
+        }
+        end = next_end;
+    }
+    end
+}
+
+fn should_extend_forward(text: &str, start: usize, end: usize, lang: ExecLang) -> bool {
+    if chunk_is_incomplete(&text[start..end], lang) {
+        return true;
+    }
+    match lang {
+        ExecLang::Python => python_suite_continues(text, start, end),
+        ExecLang::R => next_nontrivia_line(text, end).is_some_and(|(line_start, line_end)| {
+            line_starts_with_keyword(&text[line_start..line_end], "else")
+        }),
+        ExecLang::Generic => false,
+    }
+}
+
+fn python_suite_continues(text: &str, start: usize, end: usize) -> bool {
+    let Some((next_start, next_end)) = next_nontrivia_line(text, end) else {
+        return false;
+    };
+    let start_indent = line_indent(text, start);
+    let next_indent = line_indent(text, next_start);
+    let next_line = &text[next_start..next_end];
+    if python_suite_continuer(next_line) && next_indent <= start_indent {
+        return true;
+    }
+    next_indent > start_indent && python_chunk_has_block(&text[start..end])
+}
+
+fn python_chunk_has_block(chunk: &str) -> bool {
+    chunk.split('\n').any(python_opens_block)
+}
+
+fn python_opens_block(line: &str) -> bool {
+    let scan = scan_chunk(line, ExecLang::Python);
+    !scan.unbalanced && scan.ends_with_colon
+}
+
+fn python_suite_continuer(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    line_starts_with_keyword(trimmed, "else")
+        || line_starts_with_keyword(trimmed, "elif")
+        || line_starts_with_keyword(trimmed, "except")
+        || line_starts_with_keyword(trimmed, "finally")
+}
+
+fn line_starts_with_keyword(line: &str, keyword: &str) -> bool {
+    let trimmed = line.trim_start();
+    let Some(rest) = trimmed.strip_prefix(keyword) else {
+        return false;
+    };
+    rest.is_empty()
+        || rest.starts_with(|ch: char| ch.is_whitespace() || ch == ':' || ch == '(' || ch == '#')
+}
+
+fn chunk_is_incomplete(code: &str, lang: ExecLang) -> bool {
+    let scan = scan_chunk(code, lang);
+    if scan.unbalanced || scan.trailing_continuation {
+        return true;
+    }
+    match lang {
+        ExecLang::R => ends_with_r_control(code),
+        ExecLang::Python => scan.ends_with_colon,
+        ExecLang::Generic => false,
+    }
+}
+
+struct ChunkScan {
+    unbalanced: bool,
+    trailing_continuation: bool,
+    ends_with_colon: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StringKind {
+    None,
+    Single,
+    Double,
+    Backtick,
+    TripleSingle,
+    TripleDouble,
+}
+
+fn scan_chunk(code: &str, lang: ExecLang) -> ChunkScan {
+    let chars: Vec<char> = code.chars().collect();
+    let mut parens = 0i32;
+    let mut brackets = 0i32;
+    let mut braces = 0i32;
+    let mut string = StringKind::None;
+    let mut escape = false;
+    let mut line_sig = String::new();
+    let mut last_sig = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        if string != StringKind::None {
+            if escape {
+                escape = false;
+                i += 1;
+                continue;
+            }
+            let triple = matches!(string, StringKind::TripleSingle | StringKind::TripleDouble);
+            if ch == '\\' && !triple {
+                escape = true;
+                i += 1;
+                continue;
+            }
+            if triple {
+                let q = if string == StringKind::TripleDouble {
+                    '"'
+                } else {
+                    '\''
+                };
+                if ch == q && chars.get(i + 1) == Some(&q) && chars.get(i + 2) == Some(&q) {
+                    string = StringKind::None;
+                    line_sig.push('"');
+                    i += 3;
+                    continue;
+                }
+            } else if matches_string_close(string, ch) {
+                string = StringKind::None;
+                line_sig.push('"');
+            }
+            i += 1;
+            continue;
+        }
+        if ch == '#' {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '\n' {
+            if !line_sig.is_empty() {
+                last_sig.clone_from(&line_sig);
+            }
+            line_sig.clear();
+            i += 1;
+            continue;
+        }
+        if ch == '\'' || ch == '"' || (ch == '`' && lang == ExecLang::R) {
+            if lang == ExecLang::Python {
+                let q = ch;
+                if chars.get(i + 1) == Some(&q) && chars.get(i + 2) == Some(&q) {
+                    string = if q == '"' {
+                        StringKind::TripleDouble
+                    } else {
+                        StringKind::TripleSingle
+                    };
+                    i += 3;
+                    continue;
+                }
+            }
+            string = match ch {
+                '\'' => StringKind::Single,
+                '`' => StringKind::Backtick,
+                _ => StringKind::Double,
+            };
+            i += 1;
+            continue;
+        }
+        match ch {
+            '(' => parens += 1,
+            ')' => parens -= 1,
+            '[' => brackets += 1,
+            ']' => brackets -= 1,
+            '{' => braces += 1,
+            '}' => braces -= 1,
+            _ => {}
+        }
+        if !ch.is_whitespace() {
+            line_sig.push(ch);
+        }
+        i += 1;
+    }
+    if !line_sig.is_empty() {
+        last_sig = line_sig;
+    }
+    ChunkScan {
+        unbalanced: string != StringKind::None || parens > 0 || brackets > 0 || braces > 0,
+        trailing_continuation: line_has_continuation(&last_sig, lang),
+        ends_with_colon: last_sig.ends_with(':'),
+    }
+}
+
+fn matches_string_close(kind: StringKind, ch: char) -> bool {
+    match kind {
+        StringKind::Single => ch == '\'',
+        StringKind::Double => ch == '"',
+        StringKind::Backtick => ch == '`',
+        StringKind::None | StringKind::TripleSingle | StringKind::TripleDouble => false,
+    }
+}
+
+fn line_has_continuation(sig: &str, lang: ExecLang) -> bool {
+    let t = sig.trim_end();
+    if t.is_empty() {
+        return false;
+    }
+    if lang == ExecLang::Python && t.ends_with('\\') {
+        return true;
+    }
+    if t.ends_with('%') {
+        return true;
+    }
+    const MULTI: &[&str] = &[
+        "%>%", "%<>%", "%T>%", "%$%", "->>", "<<-", "<-", "->", ":::", "::", "&&", "||", "==",
+        "!=", "<=", ">=", "**", "//",
+    ];
+    if MULTI.iter().any(|op| t.ends_with(op)) {
+        return true;
+    }
+    match t.chars().last() {
+        Some(
+            ',' | '+' | '*' | '/' | '^' | '~' | '$' | '@' | '&' | '|' | '=' | '<' | '>' | '!' | '-',
+        ) => true,
+        Some(':') => lang != ExecLang::Python,
+        Some('.') => lang == ExecLang::Python && python_dot_continuation(t),
+        _ => false,
+    }
+}
+
+fn python_dot_continuation(t: &str) -> bool {
+    let Some(before) = t.strip_suffix('.') else {
+        return false;
+    };
+    before.chars().last().is_some_and(|ch| {
+        ch.is_ascii_alphabetic() || ch == '_' || ch == ')' || ch == ']' || ch == '}'
+    })
+}
+
+fn ends_with_r_control(code: &str) -> bool {
+    let skeleton = r_skeleton(code);
+    let s = skeleton.trim_end();
+    if s.is_empty() {
+        return false;
+    }
+    if keyword_suffix(s, "repeat") || keyword_suffix(s, "else") {
+        return true;
+    }
+    if !s.ends_with(')') {
+        return false;
+    }
+    let Some(open) = matching_open_paren(s) else {
+        return false;
+    };
+    let before = s[..open].trim_end();
+    keyword_suffix(before, "if")
+        || keyword_suffix(before, "for")
+        || keyword_suffix(before, "while")
+        || keyword_suffix(before, "function")
+}
+
+fn keyword_suffix(s: &str, keyword: &str) -> bool {
+    let Some(prefix) = s.strip_suffix(keyword) else {
+        return false;
+    };
+    prefix.is_empty()
+        || prefix
+            .chars()
+            .last()
+            .is_some_and(|ch| !ch.is_ascii_alphanumeric() && ch != '.' && ch != '_')
+}
+
+fn matching_open_paren(s: &str) -> Option<usize> {
+    if !s.ends_with(')') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (i, ch) in s.char_indices().rev() {
+        match ch {
+            ')' => depth += 1,
+            '(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn r_skeleton(code: &str) -> String {
+    let chars: Vec<char> = code.chars().collect();
+    let mut out = String::new();
+    let mut string = None;
+    let mut escape = false;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        if let Some(quote) = string {
+            if escape {
+                escape = false;
+                i += 1;
+                continue;
+            }
+            if ch == '\\' {
+                escape = true;
+                i += 1;
+                continue;
+            }
+            if ch == quote {
+                string = None;
+                out.push('"');
+            }
+            i += 1;
+            continue;
+        }
+        if ch == '#' {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' || ch == '`' {
+            string = Some(ch);
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        out.push(ch);
+        i += 1;
+    }
+    out
+}
+
+/// R/Python source selections keep the runtime-centric popup (run, ask AI,
+/// quote, explain). Literature research and review notes belong on papers
+/// and chat, not on executable source.
+pub(crate) fn is_runtime_code_selection(source: Option<&str>) -> bool {
+    source.and_then(runtime_language).is_some()
 }
 
 pub(crate) fn file_kind(path: &str) -> Option<&'static str> {
@@ -1534,9 +2434,10 @@ pub(crate) fn fasta_seq_count(text: &str) -> usize {
 mod md_catalog_tests {
     use super::{
         code_lang, decode_href, fence_identifier_line_runs, file_kind, format_bytes,
-        md_document_to_html, md_inline_to_html, md_to_html, parent_path, parse_notebook,
-        pretty_json, push_nb_output, runtime_language, strip_ansi, tool_card_label,
-        user_message_presentation, NbOutput, MAX_NB_OUTPUT_BYTES, MAX_NB_TOTAL_OUTPUT_BYTES,
+        is_runtime_code_selection, md_document_to_html, md_inline_to_html, md_to_html, parent_path,
+        parse_notebook, pretty_json, preview_code_lang, push_nb_output, runtime_language,
+        source_execution, source_selection, strip_ansi, tool_card_label, user_message_presentation,
+        NbOutput, MAX_NB_OUTPUT_BYTES, MAX_NB_TOTAL_OUTPUT_BYTES,
     };
 
     #[test]
@@ -1599,6 +2500,66 @@ mod md_catalog_tests {
             ),
             "{html}"
         );
+    }
+
+    #[test]
+    fn renders_strong_when_cjk_punct_sits_against_the_closer() {
+        // CommonMark: a closer preceded by punctuation and followed by a letter
+        // is not right-flanking, so `**对得上。**两份` stays literal asterisks.
+        let html = md_to_html("**对得上。**两份调研在模块 b/c/d/f 的主路径上完全一致。");
+        assert!(
+            html.contains(
+                r#"<p class="md-lead-strong"><strong>对得上。</strong>两份调研在模块 b/c/d/f 的主路径上完全一致。</p>"#
+            ),
+            "{html}"
+        );
+
+        let html = md_to_html("结论：**注意：**后面还有正文");
+        assert!(
+            html.contains("<p>结论：<strong>注意：</strong>后面还有正文</p>"),
+            "{html}"
+        );
+
+        let html = md_to_html("**Hello.**World");
+        assert!(
+            html.contains(r#"<p class="md-lead-strong"><strong>Hello.</strong>World</p>"#),
+            "{html}"
+        );
+
+        let html = md_to_html("已完成 ~~删除。~~继续");
+        assert!(
+            html.contains("<p>已完成 <del>删除。</del>继续</p>"),
+            "{html}"
+        );
+
+        // Same paragraph as the chat screenshot: lead-in bold, then an inline path.
+        let html = md_to_html(
+            "**对得上。**两份调研一致；另一处是真出入（Cwa 输入文件不在 `test_full/h5ad/` ）。",
+        );
+        assert!(
+            html.contains("<strong>对得上。</strong>两份调研一致"),
+            "{html}"
+        );
+        assert!(html.contains("<code>test_full/h5ad/</code>"), "{html}");
+    }
+
+    #[test]
+    fn leaves_working_emphasis_and_code_alone() {
+        // Closer already right-flanking: space / punctuation / end of paragraph.
+        let html = md_to_html("**对得上。** 两份");
+        assert!(
+            html.contains(r#"<p class="md-lead-strong"><strong>对得上。</strong> 两份</p>"#),
+            "{html}"
+        );
+        let html = md_to_html("「**点**」");
+        assert!(html.contains("<p>「<strong>点</strong>」</p>"), "{html}");
+
+        // Fences and inline code must keep the asterisks as data.
+        let html = md_to_html("```\n**对得上。**两份\n```\n");
+        assert_eq!(html, "<pre><code>**对得上。**两份\n</code></pre>\n");
+        let html = md_to_html("看 `**对得上。**两份`");
+        assert!(html.contains("<code>**对得上。**两份</code>"), "{html}");
+        assert!(!html.contains("<strong>"), "{html}");
     }
 
     #[test]
@@ -1772,6 +2733,49 @@ mod md_catalog_tests {
     }
 
     #[test]
+    fn rewrites_windows_clipboard_image_tags_to_clickable_links() {
+        let src = r#"<image name="clipboard-preview.png" path="C:\Users\Alice\AppData\Local\Temp\clipboard-preview.png"></image>"#;
+        let html = md_to_html(src);
+        assert!(html.contains("clipboard-preview.png"), "{html}");
+        assert!(html.contains("<a href="), "{html}");
+        assert!(!html.contains("<image"), "{html}");
+    }
+
+    #[test]
+    fn rewrites_codex_file_citations_to_clickable_links() {
+        let src = concat!(
+            r#":codex-file-citation{path="E:/cross-species-root/root-cap/results/rootcap_reviewed_analysis_20260831/rotated_pdf_20260921/original_microscopy_panels.pdf" purpose="output"}"#,
+            "\n",
+            r#":codex-file-citation{path="E:/cross-species-root/root-cap/results/rootcap_reviewed_analysis_20260831/rotated_pdf_20260921/panel_index.csv" purpose="output"}"#,
+        );
+        let html = md_to_html(src);
+        assert!(
+            html.contains(
+                r#"<a href="E:/cross-species-root/root-cap/results/rootcap_reviewed_analysis_20260831/rotated_pdf_20260921/original_microscopy_panels.pdf">original_microscopy_panels.pdf</a>"#
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                r#"<a href="E:/cross-species-root/root-cap/results/rootcap_reviewed_analysis_20260831/rotated_pdf_20260921/panel_index.csv">panel_index.csv</a>"#
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("codex-file-citation"), "{html}");
+        assert!(!html.contains("purpose="), "{html}");
+
+        let html = md_to_html(
+            r#"see ::codex-file-citation{path='results/layout_audit.json' purpose="output"} later"#,
+        );
+        assert!(
+            html.contains(r#"<a href="results/layout_audit.json">layout_audit.json</a>"#),
+            "{html}"
+        );
+        assert!(html.contains("see "), "{html}");
+        assert!(html.contains(" later"), "{html}");
+    }
+
+    #[test]
     fn renders_dollar_math_as_math_spans() {
         let html = md_to_html("质能方程 $E = mc^2$ 成立。\n\n$$\\int_0^1 x^2 dx$$\n");
         assert!(
@@ -1851,6 +2855,22 @@ mod md_catalog_tests {
         assert_eq!(code_lang("a.py"), Some("python"));
         assert_eq!(code_lang("pixi.toml"), Some("ini"));
         assert_eq!(code_lang("notes.txt"), None);
+        assert_eq!(
+            preview_code_lang(
+                "artifact-version:resource-version-python",
+                Some("random_walk_demo.py")
+            ),
+            "python"
+        );
+        assert_eq!(
+            preview_code_lang("artifact-version:resource-version-r", Some("plot.R")),
+            "r"
+        );
+        assert_eq!(preview_code_lang("scripts/regulon2gmt.py", None), "python");
+        assert_eq!(
+            preview_code_lang("artifact-version:resource-version-txt", Some("notes.txt")),
+            "plaintext"
+        );
         // Rmd/qmd are Markdown with chunks — the Markdown preview already
         // highlights fenced code, so they must not fall into the code branch.
         assert_eq!(file_kind("analysis.Rmd"), Some("markdown"));
@@ -2004,6 +3024,147 @@ mod md_catalog_tests {
         assert_eq!(runtime_language("main.rs"), None);
         assert_eq!(runtime_language("notes.md"), None);
         assert_eq!(runtime_language("Makefile"), None);
+    }
+
+    #[test]
+    fn runtime_code_selections_skip_literature_and_review_actions() {
+        assert!(is_runtime_code_selection(Some(
+            "analysis/scripts/mathys2019_umap.R"
+        )));
+        assert!(is_runtime_code_selection(Some("qc.py")));
+        assert!(!is_runtime_code_selection(Some("notes.md")));
+        assert!(!is_runtime_code_selection(Some("paper.pdf")));
+        assert!(!is_runtime_code_selection(Some("artifact:art-markdown")));
+        assert!(!is_runtime_code_selection(None));
+    }
+
+    #[test]
+    fn source_selection_maps_utf16_offsets_and_reports_selected_lines() {
+        let text = "第一行\nplot(1:3)\n🙂 done\n";
+        let start = "第一行\n".encode_utf16().count() as u32;
+        let end = "第一行\nplot(1:3)\n".encode_utf16().count() as u32;
+        let selection = source_selection(text, start, end);
+        assert_eq!(selection.before, "第一行\n");
+        assert_eq!(selection.selected, "plot(1:3)\n");
+        assert_eq!(selection.after, "🙂 done\n");
+        assert_eq!((selection.start_line, selection.end_line), (2, 2));
+
+        // The emoji occupies two UTF-16 code units but remains one Rust char.
+        let emoji_start = "第一行\nplot(1:3)\n".encode_utf16().count() as u32;
+        let emoji_end = emoji_start + "🙂".encode_utf16().count() as u32;
+        assert_eq!(
+            source_selection(text, emoji_start, emoji_end).selected,
+            "🙂"
+        );
+    }
+
+    #[test]
+    fn source_execution_runs_selection_or_current_line_and_advances() {
+        let text = "x <- 1\n绘图 <- x + 1\nprint(绘图)\n";
+        let selected_start = "x <- 1\n".encode_utf16().count() as u32;
+        let selected_end = selected_start + "绘图 <- x + 1".encode_utf16().count() as u32;
+        assert_eq!(
+            source_execution(text, selected_start, selected_end, "r"),
+            Some(super::SourceExecution {
+                code: "绘图 <- x + 1".into(),
+                next_caret_utf16: None,
+            })
+        );
+
+        let caret = selected_start + 2;
+        assert_eq!(
+            source_execution(text, caret, caret, "r"),
+            Some(super::SourceExecution {
+                code: "绘图 <- x + 1".into(),
+                next_caret_utf16: Some("x <- 1\n绘图 <- x + 1\n".encode_utf16().count() as u32),
+            })
+        );
+    }
+
+    #[test]
+    fn source_execution_runs_complete_r_and_python_statements() {
+        let r = "sce <- FindVariableFeatures(sce,\n  verbose = FALSE)\nplot(1)\n";
+        let expected = "sce <- FindVariableFeatures(sce,\n  verbose = FALSE)";
+        let next = "sce <- FindVariableFeatures(sce,\n  verbose = FALSE)\n"
+            .encode_utf16()
+            .count() as u32;
+        assert_eq!(
+            source_execution(r, 0, 0, "r"),
+            Some(super::SourceExecution {
+                code: expected.into(),
+                next_caret_utf16: Some(next),
+            })
+        );
+        let continuation = "sce <- FindVariableFeatures(sce,\n  "
+            .encode_utf16()
+            .count() as u32;
+        assert_eq!(
+            source_execution(r, continuation, continuation, "r").map(|execution| execution.code),
+            Some(expected.into())
+        );
+
+        let piped = "df %>%\n  filter(x > 1)\nnext <- 1\n";
+        assert_eq!(
+            source_execution(piped, 0, 0, "r").map(|execution| execution.code),
+            Some("df %>%\n  filter(x > 1)".into())
+        );
+
+        let if_else = "if (x)\n  y\nelse\n  z\nplot(1)\n";
+        assert_eq!(
+            source_execution(if_else, 0, 0, "r").map(|execution| execution.code),
+            Some("if (x)\n  y\nelse\n  z".into())
+        );
+        let else_body = "if (x)\n  y\nelse\n  ".encode_utf16().count() as u32;
+        assert_eq!(
+            source_execution(if_else, else_body, else_body, "r").map(|execution| execution.code),
+            Some("if (x)\n  y\nelse\n  z".into())
+        );
+
+        // An explicit one-line selection is still sent as-is, even if incomplete.
+        let first_line = "sce <- FindVariableFeatures(sce,".encode_utf16().count() as u32;
+        assert_eq!(
+            source_execution(r, 0, first_line, "r").map(|execution| execution.code),
+            Some("sce <- FindVariableFeatures(sce,".into())
+        );
+
+        let py = "def foo():\n    if x:\n        return 1\n    return 2\nx = 1\n";
+        assert_eq!(
+            source_execution(py, 0, 0, "python").map(|execution| execution.code),
+            Some("def foo():\n    if x:\n        return 1\n    return 2".into())
+        );
+        let inner = "def foo():\n    if x:\n        ".encode_utf16().count() as u32;
+        assert_eq!(
+            source_execution(py, inner, inner, "python").map(|execution| execution.code),
+            Some("def foo():\n    if x:\n        return 1\n    return 2".into())
+        );
+        let if_else_py = "if x:\n    y\nelse:\n    z\nnext = 1\n";
+        assert_eq!(
+            source_execution(if_else_py, 0, 0, "python").map(|execution| execution.code),
+            Some("if x:\n    y\nelse:\n    z".into())
+        );
+
+        let with_blank = "def foo():\n    x = 1\n\n    y = 2\nnext = 1\n";
+        let y_caret = "def foo():\n    x = 1\n\n    ".encode_utf16().count() as u32;
+        assert_eq!(
+            source_execution(with_blank, y_caret, y_caret, "python")
+                .map(|execution| execution.code),
+            Some("def foo():\n    x = 1\n\n    y = 2".into())
+        );
+
+        let with_comment = "x <- 1\n# skip\ny <- 2\n";
+        assert_eq!(
+            source_execution(with_comment, 0, 0, "r"),
+            Some(super::SourceExecution {
+                code: "x <- 1".into(),
+                next_caret_utf16: Some("x <- 1\n# skip\n".encode_utf16().count() as u32),
+            })
+        );
+
+        let assigned = "in_dir <- \"data\"\nplot(1)\n";
+        assert_eq!(
+            source_execution(assigned, 0, 0, "r").map(|execution| execution.code),
+            Some("in_dir <- \"data\"".into())
+        );
     }
 
     #[test]

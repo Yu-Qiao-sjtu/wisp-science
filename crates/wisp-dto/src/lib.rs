@@ -11,6 +11,35 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+pub mod native_conversations;
+pub mod native_settings;
+pub mod project_browser;
+
+mod mcp_app_child;
+pub use mcp_app_child::*;
+
+/// Identifies a stopped ACP turn in persisted errors and invoke rejections.
+/// The UI must not offer native HTTP transcript recovery for these errors.
+pub const ACP_TURN_ERROR_PREFIX: &str = "ACP turn failed: ";
+
+/// Bounded numeric renderer diagnostics. Never includes user or plugin content.
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct UiHealthSnapshot {
+    pub timer_lag_ms: u32,
+    pub long_tasks: u32,
+    pub longest_task_ms: u32,
+    pub script_errors: u32,
+    pub unhandled_rejections: u32,
+    pub active_apps: u32,
+    pub parked_apps: u32,
+    pub app_messages: u32,
+    pub drag_overlays: u32,
+    pub media_blob_urls: u32,
+    pub media_blob_bytes: u64,
+    pub media_owners: u32,
+}
+
 #[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 pub struct ContextUsage {
     #[serde(default)]
@@ -190,6 +219,10 @@ pub enum AgentEvent {
     User {
         frame_id: String,
         text: String,
+        /// Queue identity for a follow-up or queued cut-in. Ordinary user
+        /// messages and guidance sent directly from the composer omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queue_id: Option<u64>,
     },
     MessageBoundary {
         frame_id: String,
@@ -227,6 +260,18 @@ pub enum AgentEvent {
         presentation_kind: String,
         payload: serde_json::Value,
     },
+    AppContextUpdate {
+        frame_id: String,
+        context_id: String,
+        instance_id: String,
+        app_name: String,
+        #[serde(default)]
+        update_mode: String,
+        state: String,
+        summary: String,
+        #[serde(default)]
+        structured_preview: Option<String>,
+    },
     Usage {
         frame_id: String,
         input: u64,
@@ -245,6 +290,15 @@ pub enum AgentEvent {
         before: usize,
         after: usize,
         strategy: String,
+        /// Context epoch the compacted working set was persisted as. `None`
+        /// while a mid-turn compaction has not been persisted yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        epoch: Option<u64>,
+    },
+    /// The head context epoch was rolled back to its parent.
+    CompactionUndone {
+        frame_id: String,
+        epoch: u64,
     },
     CompactionStarted {
         frame_id: String,
@@ -406,13 +460,20 @@ pub enum ChatItem {
         max_context: usize,
         context_usage: ContextUsage,
     },
-    /// Persistent timeline marker emitted whenever the model context is
-    /// rewritten. `strategy == "auto"` distinguishes the default 80%
-    /// threshold path from an explicit `/compact`.
+    /// Persistent timeline marker emitted whenever a context epoch opens.
+    /// `strategy == "auto"` distinguishes the default 80% threshold path
+    /// from an explicit `/compact`. `epoch` is the new head epoch once
+    /// persisted (`None` for a mid-turn flag that has not been linked yet).
     Compaction {
         before: usize,
         after: usize,
         strategy: String,
+        epoch: Option<u64>,
+        checkpoint: Option<String>,
+        kept_from_user_index: Option<usize>,
+        undone: bool,
+        can_undo: bool,
+        undo_reason: Option<String>,
     },
     /// A visible handoff between the main agent and the independent reviewer.
     ReviewTransition {
@@ -420,11 +481,75 @@ pub enum ChatItem {
         model: Option<String>,
     },
     Review(ReviewReport),
+    /// A non-agent, persisted notice that an MCP App updated the live model
+    /// context. This is deliberately separate from user/assistant messages:
+    /// updating App context never starts a turn.
+    AppContextNotice(AppContextNotice),
     Plan(PlanCard),
     Question(QuestionCard),
+    /// Folded system prompt shown only in the model-context view.
+    System(String),
+    /// Compaction checkpoint user row shown only in the model-context view.
+    Checkpoint(String),
 }
 
-#[derive(Deserialize, Clone, PartialEq, Eq)]
+/// Prefix of archive-backed tool tombstones written into the model context.
+/// Keep in lockstep with `wisp_core::context::TOMBSTONE_PREFIX`.
+pub const CONTEXT_TOMBSTONE_PREFIX: &str = "[compacted;";
+
+/// Archive pointer inside a tool tombstone, when the standard compact wording
+/// is present.
+pub fn context_tombstone_archive_ref(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix(CONTEXT_TOMBSTONE_PREFIX)?;
+    let rest = rest
+        .trim_start()
+        .strip_prefix("full content archived at ")?;
+    rest.split(" — ")
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+impl ChatItem {
+    pub fn is_context_tombstone(&self) -> bool {
+        match self {
+            Self::Tool { output, .. } => output.starts_with(CONTEXT_TOMBSTONE_PREFIX),
+            Self::Assistant { text, .. } => text.starts_with(CONTEXT_TOMBSTONE_PREFIX),
+            _ => false,
+        }
+    }
+
+    pub fn compaction(
+        before: usize,
+        after: usize,
+        strategy: impl Into<String>,
+        epoch: Option<u64>,
+    ) -> Self {
+        Self::Compaction {
+            before,
+            after,
+            strategy: strategy.into(),
+            epoch,
+            checkpoint: None,
+            kept_from_user_index: None,
+            undone: false,
+            can_undo: false,
+            undo_reason: None,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AppContextNotice {
+    pub context_id: String,
+    pub app_name: String,
+    pub state: String,
+    pub summary: String,
+    pub structured_preview: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SideChatEvidence {
     pub source_id: String,
@@ -439,9 +564,11 @@ pub struct SideChatEvidence {
     pub relevance: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SideChatResponse {
+    #[serde(default)]
+    pub session_id: Option<String>,
     pub answer: String,
     pub snapshot_version: i64,
     #[serde(default)]
@@ -614,11 +741,46 @@ impl ChatItem {
                 before,
                 after,
                 strategy,
-            } => (13u8, before, after, strategy).hash(&mut h),
+                epoch,
+                checkpoint,
+                kept_from_user_index,
+                undone,
+                can_undo,
+                undo_reason,
+            } => (
+                13u8,
+                before,
+                after,
+                strategy,
+                epoch,
+                checkpoint,
+                kept_from_user_index,
+                undone,
+                can_undo,
+                undo_reason,
+            )
+                .hash(&mut h),
             Self::ReviewTransition { phase, model } => (11u8, phase, model).hash(&mut h),
             Self::Review(report) => (5u8, report).hash(&mut h),
             Self::Plan(plan) => (7u8, plan).hash(&mut h),
             Self::Question(question) => (12u8, question).hash(&mut h),
+            Self::AppContextNotice(notice) => (
+                16u8,
+                &notice.context_id,
+                &notice.app_name,
+                &notice.state,
+                &notice.summary,
+                &notice.structured_preview,
+            )
+                .hash(&mut h),
+            Self::System(s) => {
+                17u8.hash(&mut h);
+                hash_text_sampled(&mut h, s);
+            }
+            Self::Checkpoint(s) => {
+                18u8.hash(&mut h);
+                hash_text_sampled(&mut h, s);
+            }
         }
         h.finish()
     }
@@ -693,6 +855,26 @@ mod fingerprint_tests {
             ChatItem::User(a).fingerprint(),
             ChatItem::User(b).fingerprint()
         );
+    }
+
+    #[test]
+    fn context_tombstone_detects_archived_tool_bodies() {
+        let text = "[compacted; full content archived at wisp-history:abc — retrieve only narrow ranges with read/grep; do not load the whole archive back into context]";
+        assert_eq!(
+            context_tombstone_archive_ref(text),
+            Some("wisp-history:abc")
+        );
+        assert!(ChatItem::Tool {
+            name: "attempt_completion".into(),
+            ok: Some(true),
+            input: String::new(),
+            output: text.into(),
+            started_at_ms: None,
+            duration_ms: None,
+        }
+        .is_context_tombstone());
+        assert!(assistant(text.into()).is_context_tombstone());
+        assert!(!assistant("kept answer".into()).is_context_tombstone());
     }
 }
 
@@ -983,6 +1165,24 @@ mod question_card_tests {
     }
 
     #[test]
+    fn parses_unicode_question_card_without_loss() {
+        let payload = serde_json::json!({
+            "question": "肝癌中的 GPX4 与 α/β？🧬",
+            "options": [{ "label": "继续🧪", "description": "检查 γ 信号" }],
+            "allow_freeform": true,
+            "source": "native"
+        });
+        let encoded = serde_json::to_vec(&payload).unwrap();
+        let decoded: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        let card = parse_question_card(&decoded);
+
+        assert_eq!(card.question, "肝癌中的 GPX4 与 α/β？🧬");
+        assert!(!card.question.is_empty());
+        assert_eq!(card.options[0].label, "继续🧪");
+        assert_eq!(card.options[0].description, "检查 γ 信号");
+    }
+
+    #[test]
     fn parses_the_acp_reload_row() {
         let card = parse_question_card(&serde_json::json!({
             "question": "Deploy now?",
@@ -1156,9 +1356,15 @@ mod session_context_window_tests {
             max_tokens: 8_192,
             context_window,
             reasoning_effort: String::new(),
+            service_tier: String::new(),
+            user_agent: String::new(),
+            send_user_agent: true,
+            send_session_id: None,
+            session_header_name: String::new(),
             supports_vision: false,
             use_for_vision: false,
             use_for_image_generation: false,
+            image_generation_capable: false,
             image_size: String::new(),
             image_quality: String::new(),
             image_aspect_ratio: String::new(),
@@ -1265,7 +1471,7 @@ pub struct ArtifactInfo {
 
 /// Immutable item in the app-global library database. Source names are
 /// snapshots, so this remains useful after its project or session is deleted.
-#[derive(Deserialize, Clone, PartialEq)]
+#[derive(Deserialize, Serialize, Clone, PartialEq)]
 pub struct LibraryItem {
     pub id: String,
     pub kind: String,
@@ -1625,6 +1831,10 @@ pub struct Settings {
     #[serde(default = "default_auto_compact")]
     pub auto_compact: bool,
     #[serde(default)]
+    pub semantic_compact_on_model_switch: bool,
+    #[serde(default = "default_semantic_compact_idle_hours")]
+    pub semantic_compact_idle_hours: u64,
+    #[serde(default)]
     pub auto_continue: bool,
     #[serde(default = "default_auto_continue_limit")]
     pub auto_continue_limit: u64,
@@ -1636,6 +1846,16 @@ pub struct Settings {
     pub max_tokens: u64,
     #[serde(default)]
     pub reasoning_effort: String,
+    #[serde(default)]
+    pub service_tier: String,
+    #[serde(default)]
+    pub user_agent: String,
+    #[serde(default = "default_true")]
+    pub send_user_agent: bool,
+    #[serde(default)]
+    pub send_session_id: Option<bool>,
+    #[serde(default)]
+    pub session_header_name: String,
     #[serde(default)]
     pub proxy_url: String,
     #[serde(default)]
@@ -1674,6 +1894,117 @@ pub struct BrowserUrlFilters {
     pub prefer: Vec<BrowserUrlFilterRule>,
 }
 
+/// One tab Wisp opened during a conversation turn, offered for cleanup.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserTabCleanupItem {
+    #[serde(default)]
+    pub session: String,
+    pub tab_id: i64,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub initial_url: String,
+}
+
+/// Prompt to close tabs Wisp opened in one turn. `tab_id` stays valid across
+/// in-tab navigations; only this turn's ids are included.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserTabCleanupPrompt {
+    pub turn_id: String,
+    pub frame_id: String,
+    #[serde(default)]
+    pub tabs: Vec<BrowserTabCleanupItem>,
+}
+
+/// A tab whose current page needs the user to complete a human-verification
+/// challenge before browser automation may continue.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserNeedsHumanTab {
+    #[serde(default)]
+    pub session: String,
+    pub tab_id: i64,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub frame_id: String,
+    #[serde(default)]
+    pub turn_id: String,
+}
+
+/// Live set of tabs waiting on human verification. Replaces the previous
+/// snapshot each time it is emitted.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserNeedsHumanPrompt {
+    #[serde(default)]
+    pub tabs: Vec<BrowserNeedsHumanTab>,
+}
+
+/// Result of re-scanning tabs the user marked as completed.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserNeedsHumanConfirmResult {
+    #[serde(default)]
+    pub still_required: Vec<BrowserNeedsHumanTab>,
+    #[serde(default)]
+    pub cleared: Vec<BrowserNeedsHumanTab>,
+}
+
+/// Reply of `open_browser_extension_page`: managed extension path and whether
+/// a browser was launched on its extension-manager page.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserExtensionSetup {
+    #[serde(default)]
+    pub extension_path: Option<String>,
+    #[serde(default)]
+    pub opened: bool,
+}
+
+/// Compatibility and integrity state of the shared-browser extension.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserExtensionStatus {
+    #[serde(default)]
+    pub connected: bool,
+    #[serde(default)]
+    pub current_version: Option<String>,
+    #[serde(default)]
+    pub bundled_version: Option<String>,
+    #[serde(default)]
+    pub current_protocol: i64,
+    #[serde(default)]
+    pub required_protocol: i64,
+    #[serde(default)]
+    pub update_required: bool,
+    #[serde(default)]
+    pub automatic_reload_available: bool,
+    #[serde(default)]
+    pub extension_path: Option<String>,
+    #[serde(default)]
+    pub extension_path_verified: bool,
+    #[serde(default)]
+    pub integrity_verified: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Result of preparing the bundled browser extension and attempting to reload
+/// it. `outcome` is `updated`, `manual_reload_required`, or `error`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserExtensionUpdateResult {
+    #[serde(default)]
+    pub outcome: String,
+    #[serde(default)]
+    pub status: BrowserExtensionStatus,
+    #[serde(default)]
+    pub opened: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 fn default_sync_backend() -> String {
     "relay".into()
 }
@@ -1684,6 +2015,10 @@ fn default_notifications_enabled() -> bool {
 
 fn default_auto_compact() -> bool {
     true
+}
+
+fn default_semantic_compact_idle_hours() -> u64 {
+    24
 }
 
 fn default_auto_continue_limit() -> u64 {
@@ -1716,6 +2051,10 @@ pub struct ChannelsStatus {
     pub feishu_state: String,
     #[serde(default)]
     pub feishu_detail: String,
+    #[serde(default)]
+    pub feishu_owner_open_id: String,
+    #[serde(default)]
+    pub feishu_pending_owner_open_id: String,
     #[serde(default)]
     pub weixin_enabled: bool,
     #[serde(default)]
@@ -1777,6 +2116,8 @@ impl Default for DeviceBridgeStatus {
 pub struct WeixinBindStart {
     pub qrcode: String,
     pub qr_image: String,
+    #[serde(default)]
+    pub qr_content: String,
 }
 
 /// Mirrors the opaque Feishu OAuth device-flow DTOs from `src-tauri`.
@@ -1784,6 +2125,8 @@ pub struct WeixinBindStart {
 pub struct FeishuBindStart {
     pub flow_id: String,
     pub qr_image: String,
+    #[serde(default)]
+    pub qr_content: String,
     pub expires_in_seconds: u64,
 }
 
@@ -1810,12 +2153,19 @@ impl Default for Settings {
             workspace_dir: String::new(),
             max_iter: default_max_iter(),
             auto_compact: true,
+            semantic_compact_on_model_switch: false,
+            semantic_compact_idle_hours: default_semantic_compact_idle_hours(),
             auto_continue: false,
             auto_continue_limit: default_auto_continue_limit(),
             follow_up_questions: true,
             resume_last_session: true,
             max_tokens: 8192,
             reasoning_effort: String::new(),
+            service_tier: String::new(),
+            user_agent: String::new(),
+            send_user_agent: true,
+            send_session_id: None,
+            session_header_name: String::new(),
             proxy_url: String::new(),
             supports_vision: false,
             sync_backend: "relay".into(),
@@ -1922,6 +2272,17 @@ pub struct QueuedTurnActionArgs {
     pub message: Option<String>,
 }
 
+/// Live lifecycle update for an optimistic queued follow-up. The frontend
+/// uses the id instead of matching user-visible text, which remains ambiguous
+/// when two messages share a body but carry different attachments.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedTurnStateEvent {
+    pub session_id: String,
+    pub id: u64,
+    pub state: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AcpAgentProfile {
     pub id: String,
@@ -1950,6 +2311,8 @@ pub struct AcpAuthMethod {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default, rename = "type")]
+    pub kind: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1961,7 +2324,7 @@ pub struct AcpSessionUpdate {
     pub payload: serde_json::Value,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcpSessionState {
     pub frame_id: String,
@@ -2278,8 +2641,20 @@ pub struct LoadedItem {
     pub resources: Vec<MessageResource>,
 }
 
+/// A live native tool approval, restored independently of persisted messages.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PendingToolApproval {
+    pub approval_id: String,
+    pub frame_id: String,
+    pub message: String,
+    pub tool: String,
+    pub preview: String,
+}
+
 #[derive(Deserialize)]
 pub struct LoadedSessionPage {
+    #[serde(default)]
+    pub archived: bool,
     pub items: Vec<LoadedItem>,
     pub next_before_seq: Option<i64>,
     pub user_offset: usize,
@@ -2291,9 +2666,77 @@ pub struct LoadedSessionPage {
     pub branches: Vec<SessionBranchLink>,
     #[serde(default)]
     pub branch_state: Option<String>,
+    #[serde(default)]
+    pub pending_approvals: Vec<PendingToolApproval>,
+    #[serde(default)]
+    pub context_epochs: Vec<ContextEpochDto>,
+    #[serde(default)]
+    pub head_epoch: u64,
+    /// Visual user index where the head-epoch retained tail starts.
+    /// `None` when the session has no compaction or `first_kept_seq` is unknown.
+    #[serde(default)]
+    pub in_context_from_user_index: Option<usize>,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+/// Current compaction metadata, refreshed without loading or replacing history.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SessionContextState {
+    pub head_epoch: u64,
+    pub context_epochs: Vec<ContextEpochDto>,
+    pub in_context_from_user_index: Option<usize>,
+    pub compactions: Vec<ContextCompactionDto>,
+    pub undone_epochs: Vec<u64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ContextCompactionDto {
+    pub epoch: u64,
+    pub before: usize,
+    pub after: usize,
+    pub strategy: String,
+    pub checkpoint: Option<String>,
+    pub kept_from_user_index: Option<usize>,
+    pub can_undo: bool,
+    pub undo_reason: Option<String>,
+}
+
+impl ContextCompactionDto {
+    pub fn into_chat(self) -> ChatItem {
+        ChatItem::Compaction {
+            before: self.before,
+            after: self.after,
+            strategy: self.strategy,
+            epoch: Some(self.epoch),
+            checkpoint: self.checkpoint,
+            kept_from_user_index: self.kept_from_user_index,
+            undone: false,
+            can_undo: self.can_undo,
+            undo_reason: self.undo_reason,
+        }
+    }
+}
+
+/// One persisted context epoch, as returned by `load_session`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ContextEpochDto {
+    pub epoch: u64,
+    pub parent_epoch: u64,
+    pub strategy: String,
+    pub kind: String,
+    pub before_tokens: u64,
+    pub after_tokens: u64,
+    pub initial_head_seq: i64,
+    #[serde(default)]
+    pub first_kept_seq: Option<i64>,
+    #[serde(default)]
+    pub checkpoint_seq: Option<i64>,
+    #[serde(default)]
+    pub ui_event_seq: Option<i64>,
+    #[serde(default)]
+    pub has_new_turns: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SessionOutlineItem {
     pub user_index: usize,
     #[serde(default)]
@@ -2317,14 +2760,18 @@ pub struct LoadedPresentation {
 pub struct TranscriptPageState {
     pub next_before_seq: Option<i64>,
     pub user_offset: usize,
-    pub loading: bool,
+    /// Identity of the active UI paging request; replacement pages clear it.
+    pub loading_request: Option<u64>,
     pub window_user_start: usize,
 }
 
 impl LoadedItem {
     pub fn into_chat(self) -> ChatItem {
         match self.role.as_str() {
+            "user" if self.kind.as_deref() == Some("checkpoint") => ChatItem::Checkpoint(self.text),
             "user" => ChatItem::User(self.text),
+            "system" => ChatItem::System(self.text),
+            "checkpoint" => ChatItem::Checkpoint(self.text),
             "branch_merge" => ChatItem::BranchMerge {
                 text: self.text,
                 branch_id: self.input,
@@ -2350,6 +2797,13 @@ impl LoadedItem {
                 .unwrap_or_else(|_| ChatItem::Assistant {
                     text: self.text,
                     model: None,
+                    resources: self.resources,
+                }),
+            "app_context" => serde_json::from_str(&self.text)
+                .map(ChatItem::AppContextNotice)
+                .unwrap_or_else(|_| ChatItem::Assistant {
+                    text: self.text,
+                    model: self.model_name,
                     resources: self.resources,
                 }),
             "acp_tool" => ChatItem::AcpTool {
@@ -2402,6 +2856,27 @@ impl LoadedItem {
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("manual")
                         .to_string(),
+                    epoch: value.get("epoch").and_then(serde_json::Value::as_u64),
+                    checkpoint: value
+                        .get("checkpoint")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    kept_from_user_index: value
+                        .get("kept_from_user_index")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|index| index as usize),
+                    undone: value
+                        .get("undone")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    can_undo: value
+                        .get("can_undo")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    undo_reason: value
+                        .get("undo_reason")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
                 }
             }
             _ => ChatItem::Assistant {
@@ -2460,6 +2935,8 @@ pub struct DirEntry {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
+    #[serde(default)]
+    pub modified_unix_millis: Option<u64>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -2507,8 +2984,10 @@ pub struct ProjectInfo {
     pub memory_file_count: usize,
 }
 
-#[derive(Clone, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProjectSummary {
+    #[serde(default)]
+    pub starred: bool,
     pub id: String,
     pub name: String,
     #[serde(default)]
@@ -2531,6 +3010,33 @@ pub struct ProjectSummary {
     pub last_synced_at: Option<i64>,
 }
 
+/// Read-only scan result shown before an orphaned workspace is registered and
+/// its `.wisp/history` context archives are imported.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WorkspaceSessionRecoveryPreview {
+    pub workspace_dir: String,
+    pub suggested_name: String,
+    pub archive_count: usize,
+    pub valid_archive_count: usize,
+    pub recoverable_session_count: usize,
+    pub message_count: usize,
+    pub invalid_archive_count: usize,
+    pub duplicate_archive_count: usize,
+    pub earliest_message_at: Option<i64>,
+    pub latest_message_at: Option<i64>,
+}
+
+/// Result of the transactional workspace-session recovery import.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WorkspaceSessionRecoveryResult {
+    pub project_id: String,
+    pub project_name: String,
+    pub recovered_session_count: usize,
+    pub message_count: usize,
+    pub invalid_archive_count: usize,
+    pub duplicate_archive_count: usize,
+}
+
 /// Editable project settings (Project Settings modal). `agent_context` is the
 /// project's `.wisp/WISP.md`, injected into every seeded system prompt.
 #[derive(Clone, Deserialize, Default)]
@@ -2541,6 +3047,10 @@ pub struct ProjectSettings {
     pub description: String,
     #[serde(default)]
     pub agent_context: String,
+    /// Specialist automatically attached to future conversations in this
+    /// project. Existing conversations retain their frozen Specialist.
+    #[serde(default)]
+    pub default_specialist_id: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2601,11 +3111,23 @@ pub struct ModelProfile {
     #[serde(default)]
     pub reasoning_effort: String,
     #[serde(default)]
+    pub service_tier: String,
+    #[serde(default)]
+    pub user_agent: String,
+    #[serde(default = "default_true")]
+    pub send_user_agent: bool,
+    #[serde(default)]
+    pub send_session_id: Option<bool>,
+    #[serde(default)]
+    pub session_header_name: String,
+    #[serde(default)]
     pub supports_vision: bool,
     #[serde(default)]
     pub use_for_vision: bool,
     #[serde(default)]
     pub use_for_image_generation: bool,
+    #[serde(default)]
+    pub image_generation_capable: bool,
     #[serde(default)]
     pub image_size: String,
     #[serde(default)]
@@ -2624,9 +3146,8 @@ pub struct ModelProfile {
     pub video_resolution: Option<String>,
 }
 
-/// Raster image-generation model IDs. Gateway `vendor/model` ids match on the
-/// last path segment. Exact IDs only — a shorter family id must not absorb a
-/// longer sibling.
+/// Known image IDs used for automatic hints, never as an acceptance allowlist.
+/// Explicit image capability also supports custom IDs; catalog matching stays exact.
 pub fn is_image_generation_model(model: &str) -> bool {
     let model = model.trim();
     let tail = model.rsplit('/').next().unwrap_or(model);
@@ -2667,7 +3188,10 @@ pub const VIDEO_DURATION_DEFAULT_SECS: u32 = 5;
 
 impl ModelProfile {
     pub fn is_chat_model(&self) -> bool {
-        !is_image_generation_model(&self.model) && !is_video_generation_model(&self.model)
+        !(self.image_generation_capable
+            || self.use_for_image_generation
+            || is_image_generation_model(&self.model))
+            && !is_video_generation_model(&self.model)
     }
 }
 
@@ -2736,7 +3260,7 @@ pub struct ReviewerBackendTestResult {
     pub summary: String,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RecentSession {
     pub id: String,
     pub project_id: String,
@@ -2764,6 +3288,73 @@ pub struct SkillRow {
     pub dir: String,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct SkillFileContent {
+    pub path: String,
+    pub content: String,
+}
+
+/// Public directory metadata is separate from the controlled SKILL.md YAML.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct CommunitySkillEntry {
+    pub name: String,
+    pub description: String,
+    pub author: String,
+    pub license: String,
+    pub tags: Vec<String>,
+    pub repository: String,
+    pub git_ref: String,
+    pub package_path: String,
+    pub responsibilities: String,
+    pub when_to_use: String,
+    pub inputs: String,
+    pub outputs: String,
+    pub out_of_scope: String,
+    pub required_dependencies: Vec<String>,
+    pub optional_dependencies: Vec<String>,
+    pub operation_boundary: String,
+    pub supported_wisp: String,
+    pub verified_wisp: Option<String>,
+    pub known_limits: String,
+    pub feedback_url: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct SkillInstallSource {
+    pub repository: String,
+    pub source_url: String,
+    pub git_ref: String,
+    pub commit: String,
+    pub package_path: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct SkillStoreCandidate {
+    pub name: String,
+    pub description: String,
+    pub tags: Vec<String>,
+    pub source: SkillInstallSource,
+    pub markdown: String,
+    pub format_errors: Vec<String>,
+    pub resource_errors: Vec<String>,
+    pub warnings: Vec<String>,
+    pub conflict: Option<String>,
+    pub installed_source: Option<SkillInstallSource>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct CommunitySkillCatalog {
+    pub entries: Vec<CommunitySkillEntry>,
+    pub notice: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct SkillInstallResult {
+    pub name: String,
+    pub directory: String,
+    pub notice: Option<String>,
+}
+
 #[derive(Clone, serde::Deserialize, PartialEq)]
 pub struct PluginRow {
     pub id: String,
@@ -2788,6 +3379,85 @@ pub struct PluginRow {
     pub runtime_errors: Vec<String>,
 }
 
+/// Named HTTP header or stdio env slot. List/persist payloads include only
+/// `name` and `has_value`; `value` is write-only from the editor.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct McpSecretEntry {
+    pub name: String,
+    pub value: Option<String>,
+    pub has_value: bool,
+    /// True when the client explicitly sent `has_value: false` with no new value.
+    pub clear: bool,
+}
+
+impl McpSecretEntry {
+    pub fn plaintext(name: impl Into<String>, value: impl Into<String>) -> Self {
+        let value = value.into();
+        let has_value = !value.is_empty();
+        Self {
+            name: name.into(),
+            value: Some(value),
+            has_value,
+            clear: false,
+        }
+    }
+
+    pub fn redacted(name: impl Into<String>, has_value: bool) -> Self {
+        Self {
+            name: name.into(),
+            value: None,
+            has_value,
+            clear: false,
+        }
+    }
+}
+
+impl Serialize for McpSecretEntry {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("McpSecretEntry", 2)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("has_value", &self.has_value)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for McpSecretEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Pair(String, String),
+            Name(String),
+            Obj {
+                name: String,
+                #[serde(default)]
+                value: Option<String>,
+                #[serde(default)]
+                has_value: Option<bool>,
+            },
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Pair(name, value) => Ok(Self::plaintext(name, value)),
+            Raw::Name(name) => Ok(Self::redacted(name, false)),
+            Raw::Obj {
+                name,
+                value,
+                has_value,
+            } => {
+                let inferred = value.as_deref().is_some_and(|v| !v.trim().is_empty());
+                let clear = has_value == Some(false) && !inferred;
+                Ok(Self {
+                    name,
+                    value,
+                    has_value: inferred || has_value.unwrap_or(false),
+                    clear,
+                })
+            }
+        }
+    }
+}
+
 #[derive(Clone, serde::Deserialize)]
 pub struct ConnRow {
     pub id: String,
@@ -2802,11 +3472,15 @@ pub enum ConnTransport {
         command: String,
         #[serde(default)]
         args: Vec<String>,
+        #[serde(default)]
+        env: Vec<McpSecretEntry>,
+        #[serde(default)]
+        cwd: Option<String>,
     },
     Http {
         url: String,
         #[serde(default)]
-        headers: Vec<(String, String)>,
+        headers: Vec<McpSecretEntry>,
         #[serde(default)]
         auth: String,
     },
@@ -2820,15 +3494,24 @@ pub struct ConnView {
 fn default_tool_mode() -> String {
     "allow".into()
 }
-#[derive(Clone, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConnectorTool {
     pub name: String,
     #[serde(default = "default_tool_mode")]
     pub mode: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default, alias = "inputSchema")]
+    pub input_schema: Option<serde_json::Value>,
+    #[serde(default, alias = "outputSchema")]
+    pub output_schema: Option<serde_json::Value>,
 }
-#[derive(Clone, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct ConnectorLink {
+    pub label: String,
+    pub url: String,
+}
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConnectorInfo {
     pub key: String,
     pub name: String,
@@ -2839,12 +3522,24 @@ pub struct ConnectorInfo {
     pub subtitle: String,
     #[serde(default)]
     pub auth: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub description_zh: String,
+    #[serde(default)]
+    pub maintainer: String,
+    #[serde(default)]
+    pub links: Vec<ConnectorLink>,
     pub tools: Vec<ConnectorTool>,
 }
-#[derive(Clone, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConnectorsView {
     pub connectors: Vec<ConnectorInfo>,
-    /// Global approval scope: "full" | "auto" | "ask".
+    /// This window's project approval scope, or its inherited global default.
     pub scope: String,
 }
 
@@ -2860,7 +3555,34 @@ pub struct ApprovalGrantRow {
     pub label: String,
 }
 
-// Simple flat form state (kind + raw text fields; args/env/headers entered as text, parsed on save).
+/// Editor row for a header or env secret. `value` is the typed replacement;
+/// empty keeps the stored secret when `has_value` is true.
+///
+/// `row_id` is UI-only (keyed list identity). It is not serialized.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ConnSecretField {
+    pub row_id: u64,
+    pub name: String,
+    pub value: String,
+    pub has_value: bool,
+}
+
+impl ConnSecretField {
+    pub fn from_entry(entry: &McpSecretEntry) -> Self {
+        Self {
+            row_id: 0,
+            name: entry.name.clone(),
+            value: String::new(),
+            has_value: entry.has_value
+                || entry
+                    .value
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty()),
+        }
+    }
+}
+
+// Flat form state. Secret values are write-only; listed keys arrive as has_value.
 #[derive(Clone, Default)]
 pub struct ConnForm {
     pub id: Option<String>,
@@ -2869,9 +3591,22 @@ pub struct ConnForm {
     pub command: String,
     pub args: String,
     pub url: String,
-    pub headers: String,
+    pub headers: Vec<ConnSecretField>,
+    pub env: Vec<ConnSecretField>,
     pub auth: String,
     pub enabled: bool,
+}
+
+impl ConnForm {
+    pub fn new_connection() -> Self {
+        Self {
+            kind: "stdio".into(),
+            enabled: true,
+            headers: vec![ConnSecretField::default()],
+            env: vec![ConnSecretField::default()],
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -2914,9 +3649,15 @@ mod image_generation_model_tests {
             max_tokens: 0,
             context_window: 128_000,
             reasoning_effort: String::new(),
+            service_tier: String::new(),
+            user_agent: String::new(),
+            send_user_agent: true,
+            send_session_id: None,
+            session_header_name: String::new(),
             supports_vision: false,
             use_for_vision: false,
             use_for_image_generation: false,
+            image_generation_capable: false,
             image_size: String::new(),
             image_quality: String::new(),
             image_aspect_ratio: String::new(),
@@ -2926,6 +3667,23 @@ mod image_generation_model_tests {
             video_aspect_ratio: None,
             video_resolution: None,
         }
+    }
+
+    #[test]
+    fn custom_image_capability_does_not_depend_on_the_current_assignment() {
+        let mut p = profile("gpt-image-2.5");
+        assert!(p.is_chat_model());
+        p.use_for_image_generation = true;
+        assert!(!p.is_chat_model());
+        p.image_generation_capable = true;
+        p.use_for_image_generation = false;
+        assert!(!p.is_chat_model());
+        let form = super::ModelForm {
+            model: p.model,
+            image_generation_capable: true,
+            ..Default::default()
+        };
+        assert!(form.is_image_model());
     }
 
     #[test]
@@ -2966,9 +3724,15 @@ mod video_generation_model_tests {
             max_tokens: 0,
             context_window: 128_000,
             reasoning_effort: String::new(),
+            service_tier: String::new(),
+            user_agent: String::new(),
+            send_user_agent: true,
+            send_session_id: None,
+            session_header_name: String::new(),
             supports_vision: false,
             use_for_vision: false,
             use_for_image_generation: false,
+            image_generation_capable: false,
             image_size: String::new(),
             image_quality: String::new(),
             image_aspect_ratio: String::new(),
@@ -3032,9 +3796,15 @@ pub struct ModelForm {
     pub max_tokens: u64,
     pub context_window: u64,
     pub reasoning_effort: String,
+    pub service_tier: String,
+    pub user_agent: String,
+    pub send_user_agent: bool,
+    pub send_session_id: Option<bool>,
+    pub session_header_name: String,
     pub supports_vision: bool,
     pub use_for_vision: bool,
     pub use_for_image_generation: bool,
+    pub image_generation_capable: bool,
     pub image_size: String,
     pub image_quality: String,
     pub image_aspect_ratio: String,
@@ -3046,6 +3816,14 @@ pub struct ModelForm {
     /// Used only when adding a provider (`id` is `None`): one row per model
     /// that should be created with the shared API URL and key.
     pub entries: Vec<ModelFormEntry>,
+}
+
+impl ModelForm {
+    pub fn is_image_model(&self) -> bool {
+        self.image_generation_capable
+            || self.use_for_image_generation
+            || is_image_generation_model(&self.model)
+    }
 }
 
 /// `model_catalog_lookup` projection of one baked catalog entry.
@@ -3122,15 +3900,24 @@ pub struct TurnMemoryProposal {
     pub global_memories: Vec<GlobalMemory>,
 }
 
-#[derive(Deserialize, Clone)]
+/// Paths found without launching interpreters or installing packages.
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub struct LocalEnvironmentStatus {
+    pub paths: std::collections::BTreeMap<String, String>,
+    pub warning: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct BootstrapStatus {
     pub skills_loaded: usize,
     pub python_ok: bool,
     #[serde(default)]
-    pub python_initializing: bool,
+    pub local_environment: Option<LocalEnvironmentStatus>,
     pub mcp_catalog: usize,
     pub uv_ok: bool,
     pub node_ok: bool,
+    #[serde(default)]
+    pub npm_ok: bool,
     pub sci_ok: bool,
     pub pixi_ok: bool,
     pub app_version: String,
@@ -3223,6 +4010,27 @@ pub struct PublicationInfo {
     pub project_id: String,
     pub title: String,
     pub description: String,
+}
+
+/// A bounded, project-scoped source choice. File choices name an immutable
+/// ArtifactVersion; message previews start at byte zero of persisted text.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct PublicationSourceChoice {
+    pub kind: String,
+    pub id: String,
+    pub title: String,
+    pub detail: String,
+    pub text: Option<String>,
+    #[serde(default)]
+    pub text_sha256: Option<String>,
+    pub frame_id: Option<String>,
+    pub message_seq: Option<i64>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PublicationSourcePage {
+    pub sources: Vec<PublicationSourceChoice>,
+    pub has_more: bool,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -3346,6 +4154,12 @@ pub struct PublicationLineageInfo {
     pub checksum: Option<String>,
     pub capture_timing: Option<String>,
     pub producing_run_id: Option<String>,
+    #[serde(default)]
+    pub producing_run_title: Option<String>,
+    #[serde(default)]
+    pub input_labels: Vec<String>,
+    #[serde(default)]
+    pub code_labels: Vec<String>,
     pub run_input_count: usize,
     pub run_output_count: usize,
     pub code_snapshot_count: usize,
@@ -3479,7 +4293,7 @@ pub struct QuickActionRun {
     pub started: bool,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AgentWorkflowSnapshot {
     pub workflow: AgentWorkflow,
     pub delegation_enabled: bool,
@@ -3590,7 +4404,7 @@ pub struct RunActivityProposal {
     pub max_cost_microunits: u64,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RunActivitySpec {
     pub activity: String,
     pub context_id: String,
@@ -3626,6 +4440,9 @@ pub struct DynamicAgentTaskProposal {
     pub model_id: Option<String>,
     pub executor: Option<AgentExecutorSelection>,
     pub budget: Option<AgentBudgetProposal>,
+    /// Omit to inherit policy, use zero for unlimited, or set seconds.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -3644,12 +4461,30 @@ pub struct SkillPortfolioTaskSummary {
     pub depends_on: Vec<String>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillPortfolioRequest {
+    pub request: String,
+    pub model_id: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub source_skill_ids: Vec<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_template_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_workflow_id: Option<String>,
+}
+
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PortfolioPlanSummary {
     pub planner_model_id: String,
     pub planner_model_label: String,
     pub rationale: String,
     pub tasks: Vec<SkillPortfolioTaskSummary>,
+    #[serde(default)]
+    pub source_sha256: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -3658,20 +4493,65 @@ pub struct SkillPortfolioDraft {
     pub proposal: DynamicAgentWorkflowProposal,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+/// Actual conversion stages, reported by the host rather than estimated percentages.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowConversionStage {
+    Preparing,
+    SelectingSources,
+    ReadingSources,
+    Generating,
+    Validating,
+    Repairing,
+    Saving,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowConversionProgress {
+    pub conversion_id: String,
+    pub stage: WorkflowConversionStage,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AgentExecutorSummary {
     pub kind: String,
     pub profile_id: Option<String>,
     pub model_id: Option<String>,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AgentApprovalReasonSummary {
     pub task_id: String,
     pub message: String,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ResearchProgressSnapshot {
+    pub schema_version: u32,
+    pub phase: String,
+    #[serde(default)]
+    pub facets_completed: u32,
+    pub facets_total: Option<u32>,
+    #[serde(default)]
+    pub queries_completed: u32,
+    pub queries_total: Option<u32>,
+    #[serde(default)]
+    pub candidate_sources: u32,
+    #[serde(default)]
+    pub screened_sources: u32,
+    #[serde(default)]
+    pub accepted_sources: u32,
+    #[serde(default)]
+    pub claims_covered: u32,
+    pub claims_total: Option<u32>,
+    #[serde(default)]
+    pub unresolved_gaps: Vec<String>,
+    pub current_query: Option<String>,
+    pub note: Option<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AgentResultSummary {
     pub status: String,
     pub summary: Option<String>,
@@ -3681,12 +4561,18 @@ pub struct AgentResultSummary {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub tool_calls: i64,
+    #[serde(default)]
+    pub activity_messages: i64,
+    #[serde(default)]
+    pub last_activity_at: Option<i64>,
+    #[serde(default)]
+    pub research_progress: Option<ResearchProgressSnapshot>,
     pub cost_microunits: i64,
     pub duration_secs: Option<i64>,
     pub full_result_available: bool,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedAgentTaskSummary {
     pub id: String,
     pub stored_step_id: String,
@@ -3717,7 +4603,7 @@ pub struct ResolvedAgentTaskSummary {
     pub result: Option<AgentResultSummary>,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AgentSkillBinding {
     pub id: String,
     pub name: String,
@@ -3730,7 +4616,7 @@ pub struct AgentSkillBinding {
     pub package_source: Option<String>,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct DynamicAgentWorkflowSummary {
     pub schema_version: u32,
     pub approval_policy: AgentApprovalPolicy,
@@ -3739,7 +4625,7 @@ pub struct DynamicAgentWorkflowSummary {
     pub approval_reasons: Vec<AgentApprovalReasonSummary>,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AgentWorkflowResultDetail {
     pub workflow_id: String,
     pub step_id: String,
@@ -3748,7 +4634,7 @@ pub struct AgentWorkflowResultDetail {
     pub response: serde_json::Value,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AgentWorkflow {
     pub id: String,
     #[serde(default)]
@@ -3769,7 +4655,7 @@ pub struct AgentWorkflow {
     pub updated_at: i64,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionContext {
     pub id: String,
     pub kind: String,
@@ -3968,15 +4854,19 @@ pub struct TerminalSessionSummary {
     pub running: bool,
 }
 
-#[derive(Deserialize, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeKeyDto {
     pub project_id: String,
     pub context_id: String,
     pub language: String,
+    #[serde(default)]
+    pub scope_key: String,
+    #[serde(default)]
+    pub session_id: String,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeInfo {
     pub runtime_id: String,
@@ -3992,7 +4882,7 @@ pub struct RuntimeInfo {
     pub last_error: Option<String>,
 }
 
-#[derive(Deserialize, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeObject {
     pub name: String,
@@ -4001,7 +4891,7 @@ pub struct RuntimeObject {
     pub size_bytes: Option<u64>,
 }
 
-#[derive(Deserialize, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeObjectList {
     pub objects: Vec<RuntimeObject>,
@@ -4013,6 +4903,16 @@ pub struct RuntimeObjectState {
     pub loading: bool,
     pub snapshot: Option<RuntimeObjectList>,
     pub error: Option<String>,
+}
+
+/// One user-driven `execute_runtime` result: console text as the agent tools
+/// would render it, plus the plots the cell produced as base64-encoded PNGs.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeExecutionSummary {
+    pub text: String,
+    #[serde(default)]
+    pub plots: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -4031,7 +4931,7 @@ pub struct RuntimeSlot {
 /// the always-NULL `script_path`). No blanket `allow(dead_code)`: an unread
 /// field here means the UI is dropping data again, and the warning is the
 /// whole point.
-#[derive(Deserialize, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct RunRecord {
     pub id: String,
     pub frame_id: Option<String>,
@@ -4063,7 +4963,7 @@ pub struct RunRecord {
     pub cleanup_error: Option<String>,
 }
 
-#[derive(Deserialize, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct RunSummary {
     pub id: String,
     pub frame_id: Option<String>,
@@ -4262,6 +5162,9 @@ pub struct MethodSearchProgressView {
 
 #[derive(Deserialize, Clone)]
 pub struct RunProgress {
+    /// The transport cannot report byte-level progress for this phase.
+    #[serde(default)]
+    pub indeterminate: bool,
     pub phase: String,
     pub direction: String,
     pub completed_bytes: u64,
@@ -4447,6 +5350,10 @@ pub struct TrajectoryCellDto {
     /// Tool cells: full result text; assistant cells: full text.
     #[serde(default)]
     pub detail_output: Option<String>,
+    /// Complete structured MCP evidence, kept separate from the bounded
+    /// human-readable result preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<serde_json::Value>,
     #[serde(default)]
     pub ok: Option<bool>,
     #[serde(default)]
@@ -4489,4 +5396,86 @@ pub struct TrajectoryStatsDto {
     /// output_tokens / (llm_ms / 1000); `None` when llm_ms is zero.
     #[serde(default)]
     pub tokens_per_sec: Option<f64>,
+}
+
+#[cfg(test)]
+mod mcp_secret_entry_tests {
+    use super::McpSecretEntry;
+    use serde_json::json;
+
+    #[test]
+    fn serialize_omits_secret_values() {
+        let entry = McpSecretEntry::plaintext("Authorization", "secret-value");
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json, json!({"name": "Authorization", "has_value": true}));
+        assert!(json.get("value").is_none());
+        assert!(!json.to_string().contains("secret-value"));
+    }
+
+    #[test]
+    fn deserialize_legacy_pair_keeps_value_for_migration() {
+        let entry: McpSecretEntry =
+            serde_json::from_value(json!(["Authorization", "secret-value"])).unwrap();
+        assert_eq!(entry.name, "Authorization");
+        assert_eq!(entry.value.as_deref(), Some("secret-value"));
+        assert!(entry.has_value);
+        assert!(!entry.clear);
+    }
+
+    #[test]
+    fn deserialize_omitted_value_keeps_existing_secret() {
+        let entry: McpSecretEntry =
+            serde_json::from_value(json!({"name": "Authorization"})).unwrap();
+        assert_eq!(entry.name, "Authorization");
+        assert_eq!(entry.value, None);
+        assert!(!entry.has_value);
+        assert!(!entry.clear);
+    }
+
+    #[test]
+    fn deserialize_explicit_has_value_false_clears() {
+        let entry: McpSecretEntry =
+            serde_json::from_value(json!({"name": "Authorization", "has_value": false})).unwrap();
+        assert!(entry.clear);
+        assert!(!entry.has_value);
+    }
+
+    #[test]
+    fn deserialize_non_empty_value_sets_even_if_has_value_false() {
+        let entry: McpSecretEntry = serde_json::from_value(json!({
+            "name": "Authorization",
+            "value": "secret-value",
+            "has_value": false
+        }))
+        .unwrap();
+        assert!(!entry.clear);
+        assert_eq!(entry.value.as_deref(), Some("secret-value"));
+        assert!(entry.has_value);
+    }
+}
+/// Independently saved network preferences. Empty proxies inherit platform /
+/// environment defaults; `none` forces direct connections. Mirrors are agent
+/// installation guidance, not a network access policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetworkSettings {
+    pub model_proxy_url: String,
+    pub mcp_proxy_url: String,
+    pub command_proxy_url: String,
+    pub conda_mirror_url: String,
+    pub pip_index_url: String,
+    pub ca_bundle_path: String,
+}
+
+mod research_journey;
+pub use research_journey::*;
+mod research_archive;
+pub use research_archive::*;
+/// Host-authored logical binding. Never accepts an iframe-supplied connector.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpAppBinding {
+    pub version: u32,
+    pub project_id: String,
+    pub frame_id: String,
+    pub connector_id: String,
 }

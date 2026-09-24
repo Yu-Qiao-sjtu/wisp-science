@@ -31,8 +31,9 @@ class KernelWorkerTests(unittest.TestCase):
         self.assertEqual(ready.get("type"), "ready")
         return worker
 
-    def _exec(self, worker, code, rid="cell"):
-        worker.stdin.write(json.dumps({"type": "execute", "id": rid, "code": code}) + "\n")
+    def _exec(self, worker, code, rid="cell", **request_fields):
+        request = {"type": "execute", "id": rid, "code": code, **request_fields}
+        worker.stdin.write(json.dumps(request) + "\n")
         worker.stdin.flush()
         while True:
             line = worker.stdout.readline()
@@ -41,6 +42,21 @@ class KernelWorkerTests(unittest.TestCase):
             response = json.loads(line)
             if response.get("type") == "result" and response.get("id") == rid:
                 return response
+
+    def _configure_write_scope(self, worker, root, skip_dirs=None):
+        request = {
+            "type": "configure",
+            "id": "configure-write-scope",
+            "write_scope": {
+                "root": str(root),
+                "skip_dirs": skip_dirs
+                or [".git", ".venv", "node_modules", ".wisp", "uploads", "__pycache__"],
+            },
+        }
+        worker.stdin.write(json.dumps(request) + "\n")
+        worker.stdin.flush()
+        response = json.loads(worker.stdout.readline())
+        self.assertEqual(response, {"type": "configured", "id": request["id"]})
 
     def _close(self, worker):
         if worker.poll() is None:
@@ -128,6 +144,97 @@ class KernelWorkerTests(unittest.TestCase):
             if not worker.stdin.closed:
                 worker.stdin.close()
             worker.stdout.close()
+
+    def test_required_objects_guard_execution_and_source_name_labels_tracebacks(self):
+        worker = self._spawn()
+        try:
+            loaded = self._exec(worker, "sce = object(); counter = 0", rid="load")
+            self.assertIsNone(loaded.get("error"), loaded.get("error"))
+
+            guarded = self._exec(
+                worker,
+                "counter += 1",
+                rid="guarded",
+                required_objects=["sce"],
+                source_name="analysis/scripts/de.py",
+            )
+            self.assertIsNone(guarded.get("error"), guarded.get("error"))
+
+            missing = self._exec(
+                worker,
+                "counter = 99",
+                rid="missing",
+                required_objects=["not_loaded"],
+                source_name="analysis/scripts/de.py",
+            )
+            self.assertIn("required runtime objects are missing: not_loaded", missing["error"])
+            counter = self._exec(worker, "counter", rid="counter")
+            self.assertEqual(counter["stdout"].strip(), "1")
+
+            traced = self._exec(
+                worker,
+                "raise RuntimeError('boom')",
+                rid="trace",
+                source_name="analysis/scripts/de.py",
+            )
+            self.assertIn("analysis/scripts/de.py", traced["error"])
+        finally:
+            self._close(worker)
+
+    def test_saved_script_uses_file_relative_inputs_and_successful_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            (root / "data.csv").write_text("title\nfirst\nsecond\n", encoding="utf-8")
+            source = (
+                "import csv, sys\n"
+                "from pathlib import Path\n"
+                "root = Path(__file__).resolve().parent.parent\n"
+                "with (root / 'data.csv').open(encoding='utf-8') as f:\n"
+                "    rows = list(csv.DictReader(f))\n"
+                "(root / 'browse.html').write_text(str(len(rows)), encoding='utf-8')\n"
+                "sys.exit(0)\n"
+                "raise AssertionError('unreachable')\n"
+            )
+            (root / "scripts" / "build.py").write_text(source, encoding="utf-8")
+            worker = self._spawn(cwd=tmp)
+            try:
+                result = self._exec(worker, source, source_name="scripts/build.py")
+                self.assertIsNone(result.get("error"), result.get("error"))
+                self.assertEqual((root / "browse.html").read_text(encoding="utf-8"), "2")
+                following = self._exec(worker, "print(len(rows), '__file__' in globals())")
+                self.assertEqual(following["stdout"].strip(), "2 False")
+            finally:
+                self._close(worker)
+
+    def test_saved_script_restores_file_identity_after_exit_or_error(self):
+        worker = self._spawn()
+        try:
+            self._exec(worker, "__file__ = 'previous.py'; counter = 0")
+            for exit_code, succeeds in [(None, True), (0, True), (2, False), ("failed", False), (0.0, False)]:
+                with self.subTest(exit_code=exit_code):
+                    result = self._exec(
+                        worker,
+                        f"import sys\ncounter += 1\nsys.exit({exit_code!r})\ncounter = -1",
+                        source_name="scripts/step.py",
+                    )
+                    if succeeds:
+                        self.assertIsNone(result.get("error"), result.get("error"))
+                    else:
+                        self.assertIn("SystemExit", result["error"])
+                        self.assertIn("scripts/step.py", result["error"])
+                    restored = self._exec(worker, "print(__file__)")
+                    self.assertEqual(restored["stdout"].strip(), "previous.py")
+            failed = self._exec(worker, "raise ValueError('boom')", source_name="other.py")
+            self.assertIn("ValueError: boom", failed["error"])
+            restored = self._exec(worker, "print(counter, __file__)")
+            self.assertEqual(restored["stdout"].strip(), "5 previous.py")
+            # Inline cells keep their original behavior; only named scripts
+            # interpret SystemExit(0) as successful script completion.
+            inline = self._exec(worker, "raise SystemExit(0)")
+            self.assertIn("SystemExit", inline["error"])
+        finally:
+            self._close(worker)
 
     def test_computed_name_write_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -313,6 +420,7 @@ class KernelWorkerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             worker = self._spawn(cwd=tmp)
             try:
+                self._configure_write_scope(worker, tmp)
                 response = self._exec(
                     worker,
                     "for i in range(513):\n    open(f'f{i}.txt', 'w').write('x')",
@@ -320,6 +428,7 @@ class KernelWorkerTests(unittest.TestCase):
                 )
                 self.assertIsNone(response.get("error"), response.get("error"))
                 self.assertNotIn("files_written", response)
+                self.assertNotIn("files_written_base", response)
             finally:
                 self._close(worker)
 
@@ -351,6 +460,7 @@ class KernelWorkerTests(unittest.TestCase):
                 Path(tmp, f"mod_{index}.py").write_text(f"V = {index}\n", encoding="utf-8")
             worker = self._spawn(cwd=tmp)
             try:
+                self._configure_write_scope(worker, tmp)
                 response = self._exec(
                     worker,
                     "\n".join(
@@ -370,6 +480,103 @@ class KernelWorkerTests(unittest.TestCase):
                 written = response.get("files_written")
                 self.assertIsNotNone(written, "300 discarded .pyc paths exhausted the cap")
                 self.assertEqual(len(written), 250, written)
+                self.assertEqual(response.get("files_written_base"), "project")
+                self.assertTrue(all(path.startswith("results/") for path in written), written)
+            finally:
+                self._close(worker)
+
+    def test_all_host_skipped_directories_are_filtered_before_the_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._spawn(cwd=tmp)
+            try:
+                self._configure_write_scope(worker, tmp)
+                response = self._exec(
+                    worker,
+                    "\n".join(
+                        [
+                            "import os",
+                            "for directory in ['.git', '.venv', 'node_modules', '.wisp', 'uploads']:",
+                            "    os.makedirs(directory, exist_ok=True)",
+                            "    for i in range(120):",
+                            "        open(os.path.join(directory, f'noise_{i}.txt'), 'w').write('x')",
+                            "os.makedirs('results', exist_ok=True)",
+                            "for i in range(250):",
+                            "    open(f'results/out_{i}.csv', 'w').write('x')",
+                        ]
+                    ),
+                    rid="all-skipped-cap",
+                )
+                self.assertIsNone(response.get("error"), response.get("error"))
+                written = response.get("files_written")
+                self.assertEqual(len(written or []), 250, written)
+                self.assertTrue(all(path.startswith("results/") for path in written), written)
+            finally:
+                self._close(worker)
+
+    def test_outside_project_writes_do_not_consume_the_cap(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as outside:
+            worker = self._spawn(cwd=tmp)
+            try:
+                self._configure_write_scope(worker, tmp)
+                response = self._exec(
+                    worker,
+                    "\n".join(
+                        [
+                            "import os",
+                            f"outside = {outside!r}",
+                            "for i in range(600):",
+                            "    open(os.path.join(outside, f'noise_{i}.txt'), 'w').write('x')",
+                            "os.makedirs('results', exist_ok=True)",
+                            "for i in range(250):",
+                            "    open(f'results/out_{i}.csv', 'w').write('x')",
+                        ]
+                    ),
+                    rid="outside-cap",
+                )
+                self.assertIsNone(response.get("error"), response.get("error"))
+                written = response.get("files_written")
+                self.assertEqual(len(written or []), 250, written)
+                self.assertTrue(all(path.startswith("results/") for path in written), written)
+            finally:
+                self._close(worker)
+
+    def test_unchanged_intent_candidates_do_not_consume_the_report_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for index in range(600):
+                Path(tmp, f"existing_{index}.txt").write_text("x", encoding="utf-8")
+            worker = self._spawn(cwd=tmp)
+            try:
+                self._configure_write_scope(worker, tmp)
+                response = self._exec(
+                    worker,
+                    "\n".join(
+                        [
+                            "import os",
+                            "for i in range(600):",
+                            "    open(f'existing_{i}.txt', 'a').close()",
+                            "os.makedirs('results', exist_ok=True)",
+                            "for i in range(250):",
+                            "    open(f'results/out_{i}.csv', 'w').write('x')",
+                        ]
+                    ),
+                    rid="unchanged-candidates",
+                )
+                self.assertIsNone(response.get("error"), response.get("error"))
+                written = response.get("files_written")
+                self.assertEqual(len(written or []), 250, written)
+                self.assertTrue(all(path.startswith("results/") for path in written), written)
+            finally:
+                self._close(worker)
+
+    def test_leaf_named_like_a_skipped_directory_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._spawn(cwd=tmp)
+            try:
+                self._configure_write_scope(worker, tmp)
+                response = self._exec(worker, "open('uploads', 'w').write('x')", rid="skip-leaf")
+                self.assertIsNone(response.get("error"), response.get("error"))
+                self.assertEqual(response.get("files_written"), ["uploads"])
+                self.assertEqual(response.get("files_written_base"), "project")
             finally:
                 self._close(worker)
 

@@ -1,0 +1,527 @@
+# DepMap Agent
+
+## MCP result retention
+
+Remote MCP queries keep two separate representations in the conversation
+trajectory: a bounded `content` preview for the interface and the complete
+`structured_content` JSON returned by the provider. Large result previews may
+be shortened without shortening the structured evidence used for audit and
+replay. New records use the `wisp.mcp-tool-result.v1` envelope; the trajectory
+reader also supports the two historical forms (a JSON object or one
+JSON-encoded string containing that object) without recursive decoding.
+
+Scientific values retain their stored numeric precision through the Reader,
+API, MCP, and persisted evidence layers. Positive p-values and adjusted
+p-values must never become numeric zero because of JSON display rounding. The
+R knowledge reader uses jsonlite lossless numeric serialization; presentation
+may render scientific notation, while thresholds always use the structured
+machine-readable value.
+
+中文远程数据、目录索引、MCP 和模型解释的完整链路见
+[DepMap Agent 远程数据桥接技术路线](depmap-remote-mcp-architecture.zh-CN.md)。
+
+> **Architecture note:** The normative Agent-first orchestration, execution
+> levels, Evidence Ledger, MCP boundary, and Workflow escalation policy are
+> defined in [depmap-agent-engineering-framework.md](depmap-agent-engineering-framework.md).
+> Registered Workflows remain available for durable multi-stage work, but an
+> ordinary DepMap query or initial topic exploration should be handled by the
+> conversational Agent first.
+
+wisp-depmap includes a selectable **DepMap Agent** Specialist. It owns the
+project-level scientific workflow: understand the question, route to validated
+precomputed evidence or a new R analysis, monitor the Run, enforce QA, load
+stage-specific Skills, and preserve provenance. The knowledge base is an
+evidence backend and cache; it is not the Agent itself.
+
+A versioned `specialists/depmap_r_agent.v1.json` describes that Specialist's
+identity, required Skills, connector capabilities, native tool sets, and output
+contracts. Desktop, CLI, and eval must assemble it through
+`wisp_core::specialist_manifest`: host capabilities and user policy can only reduce what
+the manifest names. The companion `specialists/depmap_r_agent.intent.v1.json`
+catalog is the typed semantic bridge: the model may propose a `ScientificIntent`,
+and the deterministic `BridgePlanner` in `wisp-core` decides whether that
+canonical meaning maps to exactly one capability, needs clarification, is
+unsupported, or hits a coverage, provider, policy, or missing-tool boundary.
+Desktop, CLI, eval, delegated, and resumed paths call the same
+`plan_scientific_intent` contract and install the `plan_scientific_intent`
+tool after MCP/native tools are registered. An execute grant is the planned
+capability only. Global mutation events `damaging`/`hotspot` canonicalize to
+`damaging_mutation`/`hotspot_mutation` before schema validation. Pair-backed
+capabilities bind MCP `source`/`target` and omit unsupported `limit`. The planner does not grant the model
+authority, does not treat a proposed coverage claim as data, and does not
+select an unvalidated raw execution path. Planned calls are checked against
+the discovered MCP input schema and omit absent optional fields instead of
+sending `null`. The manifest is not an MCP server and cannot embed
+credentials or executable plugins. Existing conversations keep a frozen
+identity plus `manifest_version`; a newer file does not rewrite them.
+
+## Project layout
+
+The writable research project, read-only knowledge base, and read-only raw data
+are separate roots. A project can point to local assets without being the data
+directory itself:
+
+```text
+<project>/
+├── .wisp/
+│   └── depmap-agent.json
+└── analysis/
+    └── depmap-agent/
+```
+
+`depmap-agent.json` records a local `knowledge_root`, `data_root`, and
+`analysis_root`, or a versioned remote `knowledge.provider`, `endpoint`, and
+`release`. Environment overrides support portable development and deployment.
+The server contract is documented in the bundled DepMap knowledge-query Skill.
+Credentials and remote tokens belong in the system keyring, never this file. A legacy
+project-local `data/`, `tm00-script/`, and `knowledge/` layout remains
+recognizable but is not the product contract.
+
+The DepMap Agent and local DepMap/TCGA MCP do not create SSH sessions or
+tunnels. Users connect research servers through wisp-depmap's ordinary
+ExecutionContext UI. The knowledge query layer accepts local files or an
+already reachable HTTPS/loopback endpoint only; a project containing
+`knowledge.tunnel` is rejected with an explicit configuration error. This keeps
+server access separate from scientific evidence retrieval.
+
+The Agent never changes raw data, the knowledge base, or canonical reference scripts. It writes
+task-specific R source, manifests, JSON summaries, tables, figures, and logs
+under `analysis/depmap-agent/`.
+
+Plain-language requests to remove genes that every cell needs are interpreted
+as an explicit common-essential exclusion request. This is not interchangeable
+with the lineage `selective` ranking: `selective` tests whether one lineage is
+more dependent than the rest and does not prove that a housekeeping or
+common-essential filter was applied. If the active result has no validated
+exclusion field, the Agent reports that limitation instead of relabeling a
+selective or unfiltered ranking. Housekeeping and common-essential annotations
+remain separate.
+
+When the user explicitly selects the remote DepMap MCP, the Agent uses the
+matching remote MCP evidence tool. A missing project-local `knowledge/`
+directory must not be reported as a backend outage when that enabled remote
+provider can serve the same bounded query.
+
+That selection is also a turn-scoped execution boundary. The Agent may use
+only bounded read-only tools from that MCP connection plus interpretation of
+their results. Deferred-tool discovery is filtered by the active route grant,
+so schemas from unrelated MCP connections are not exposed in that turn. A
+coverage gap or request for a statistic that the MCP does not
+expose returns `COMPUTE_NOT_EXPOSED`; it never falls back to `run_in_context`,
+remote-file tools, shell, local configuration, or a saved SSH host. A future
+hosted computation capability must be an explicit authenticated MCP job API
+with its own submit/status/cancel contract.
+
+Before those remote scientific tools are enabled, the desktop calls
+`depmap_status` and verifies the server's query-contract version and deployment
+identities. An old, missing, or future incompatible contract is a typed
+`STALE_CONTRACT` / `INCOMPATIBLE_PROVIDER` boundary; only the status diagnostic
+remains registered until the server is redeployed, its index rebuilt, and the
+service restarted.
+
+Every planned remote call is validated locally against the exact discovered
+MCP input schema before transport dispatch. Routes use canonical provider field
+names and omit absent optional selectors instead of serializing `null`. A stale
+or invented field returns `MCP_SCHEMA_MISMATCH` with `request not sent`; the
+Agent does not retry with guessed aliases.
+
+## Starting a session
+
+Open **Settings → Specialists → DepMap Agent**, then choose **Start specialist
+session**. This creates a new conversation already bound to the DepMap Agent;
+type the biological question normally, for example “分析 ESR1 的共依赖，并给出可复现图表”.
+
+For persistent project behavior, open **Project settings → Default Agent** and
+select **DepMap Agent**. Every future conversation in that project inherits the
+Agent automatically. Existing conversations keep their frozen identity, and a
+conversation branch inherits the source conversation's Agent.
+
+Each DepMap conversation is Agent-first and chooses the smallest bounded entry
+point needed:
+
+1. `depmap_agent_route` records one typed, host-validated L1/L2/L3/L4 decision
+   for each new request; the route is observable control data, never scientific
+   evidence;
+2. ordinary query, comparison, interpretation, and initial topic-exploration
+   requests use the bounded query tools directly; semantic similarity to a
+   registered Workflow does not by itself start that Workflow;
+3. a registered Workflow is proposed only when the user explicitly requests
+   it or the task requires durable multi-stage execution, independent review,
+   or formal artifacts. The Agent creates an approval draft before those tasks
+   execute, and a blocked launch never triggers manual reconstruction;
+4. `depmap_project_runs` is used only when the user asks to continue, inspect,
+   validate, or create computation; query-only turns do not load Run history.
+5. for a cancer-only availability question,
+   `depmap_query(mode=lineage_catalog)` inventories canonical lineage manifests
+   without inventing an anchor gene; for a cancer-only dependency-gene ranking,
+   `depmap_query(mode=lineage_dependency)` reads the existing lineage-vs-rest
+   dependency-gene ranking. `depmap_query(mode=lineage_directions)` reads the
+   bounded multi-family topic candidates for a cancer-only direction request;
+   the two modes are not interchangeable, and both query completed results
+   instead of starting a Run;
+6. for a gene-plus-cancer question, `depmap_evidence` verifies the configured
+   local or remote provider and assembles the requested evidence in one tool
+   call; `depmap_query(mode=status)` remains available for provider-only tasks;
+7. successful query and evidence calls persist a stable `evidence_ref` in the
+   project SQLite ledger. `depmap_evidence_history` can recover the exact
+   evidence in the current conversation without treating model memory as data.
+
+The user-facing path has a separate interpretation layer:
+
+```text
+user intent → directory index → bounded remote data query → structured result
+→ model interpretation → result-first user answer
+```
+
+The directory index chooses the validated result source; it is not normally the
+answer. Except for explicit inventory questions, the Agent must lead with the
+returned genes, cohorts, estimates, sample counts, direction, and adjusted
+significance, explain their biological meaning and limits, and place release and
+provenance last. A `depmap://` location is supporting traceability metadata and
+must never replace an available scientific result.
+
+This provides multi-session inheritance of identity and work state without
+copying old chat transcripts into the model context.
+
+The equivalent one-session path is **New session → Agent menu → Specialist →
+DepMap Agent**. Specialist selection is locked after the first message so its
+instructions and resource boundary remain stable.
+
+The Specialist always has `depmap-knowledge-query` and `depmap-coding-agent`
+available even when the project's ordinary Skill subset excludes them. When the
+knowledge source reports PASS, it first loads `depmap-knowledge-query` and
+retrieves only bounded rows from the on-disk matrices. It loads
+`depmap-coding-agent` only after a coverage gap explicitly transitions to new
+or recomputed analysis, then
+loads other Skills needed for the current biological question or output stage. Literature, evidence-audit,
+figure, manuscript, and grant-writing Skills are not preloaded into every
+analysis turn.
+
+The harness covers the original aggregate modules and the newer sparse
+lineage modules. In addition to core, pair, top, mutation-lineage, pathway, and
+pan-cancer drug queries, it retrieves cancer-lineage correlation and
+co-dependency networks (including reciprocal pairs), CNV
+amplification-to-dependency results, PRISM AUC associations, and Hallmark,
+Reactome 2023.2, or DoRothEA enrichment rows.
+
+The low-level query tool uses a flat model-compatible JSON schema with `mode`
+required. Runtime validation still enforces every mode-specific field. This
+avoids empty tool calls from models that cannot reliably serialize a large
+`oneOf` schema.
+
+The native `depmap_evidence(gene, lineage, sections, limit)` tool is the middle
+layer between natural-language questions and stored modules. It performs at
+most 13 bounded subqueries with concurrency capped at three, returns no more
+than 10 retained rows per subquery, caps the assembled payload, and preserves
+the exact query, release, result provenance, scope, and coverage state. Core and
+pan-cancer mutation scans are explicitly distinguished from lineage-scoped
+network, CNV, drug, enrichment, and TCGA expression-survival evidence. It never
+starts computation.
+Its compact `focus.core` field puts the current gene and requested-lineage
+descriptive summaries before the large section payload, and explicitly carries
+no lineage-vs-rest test, rank, subtype, or causal interpretation.
+Canonical lineage labels are DepMap model-grouping proxies, not exact clinical
+histologies or patient cohorts. Topic design keeps that proxy distinct from the
+user's disease wording and does not add control lineages or named cell lines
+without current metadata.
+The maintained Chinese alias table covers all 34 canonical lineage groups and
+common disease-name variants at the desktop and MCP query boundaries. The
+canonical lineage recorded in returned evidence is authoritative for storage
+lookup; an unknown or clinically ambiguous future synonym remains a reported
+scope gap rather than being guessed.
+Natural-language lineage handling is exposed as a separate read-only resolver.
+Exact aliases select a canonical proxy; broad terms return an explicit candidate
+set; model-proposed candidates are vocabulary-validated but remain unconfirmed.
+Lineage evidence must not run until the resolver has produced a selected label
+or the user has explicitly supplied one of the candidates.
+Each entry also names its metric semantics: mutation and CNV values are group
+mean differences, while network values are correlations. The Agent must not
+relabel one as the other.
+
+Sparse queries return `FOUND`, `NOT_RETAINED`, `INELIGIBLE`, `NOT_COMPUTED`,
+or `MODULE_UNAVAILABLE`. These states prevent a missing retained row from
+being reported as a biological negative. A gene evidence view is assembled
+from several bounded results at request time; a full gene-by-lineage evidence
+card corpus is not required.
+
+The 26Q1 local and server knowledge stores contain two QA-complete analysis
+modules exposed through dedicated bounded MCP tools:
+
+- `coamplification_dependency`: observed double-amplification catalogs,
+  exhaustive high-confidence target scans, and a lineage-adjusted layer;
+- `subtype_dependency`: 27 eligible OncoTree subtype contrasts and 6 frozen
+  model-feature contrasts, each with complete 18,531-target coverage.
+
+`depmap_subtype_evidence` uses only eligible catalog entries and exact frozen
+contrast identifiers. `depmap_coamplification_evidence` uses only constrained
+high-confidence directional pairs. Both preserve manifest/file provenance and
+coverage states; neither scans raw matrices, starts computation, or invents a
+subtype/pair outside the stored contract.
+
+## Execution and context
+
+Large CSV and knowledge-matrix files remain on disk. The model receives paths,
+metadata, small bounded samples, structured result summaries, and Artifact
+references. A normal knowledge query does not start a heavy Run. New or changed
+analysis uses a persisted Run instead of an interactive shell
+timeout. By default the Agent submits only one heavy DepMap matrix Run at a
+time; independent literature or read-only review can be delegated separately
+when delegation is enabled for the conversation.
+
+The bundled read-only resolver validates the project and all 21 reverse-audited
+script capabilities without loading matrix rows:
+
+```powershell
+Rscript <bundled-skill-path>\scripts\inspect_depmap_project.R `
+  --project-root . `
+  --output analysis\depmap-agent\project-inspection.json
+```
+
+The exact bundled path is listed when the Agent loads the Skill.
+
+It does not declare the whole 35+ GiB directory to be one input. For a selected
+capability, run it again with `--capability <id>`. The result is one of:
+
+- `ready`: the capability's direct inputs exist;
+- `preprocessing_required`: raw sources exist, and the ordered plan identifies
+  which audited R operations must create task-local derived objects first;
+- `missing_inputs`: a true raw or user-supplied input is absent, blocking only
+  that capability.
+
+The selected plan supplies the exact `input_paths` for the persisted Run. R
+reads those files from disk and writes compact JSON, tables, figures, and logs;
+the model never receives the large matrices themselves.
+
+Numerical claims in a DepMap answer must come from a successful query response
+in the current turn. The answer preserves release, manifest, sample counts,
+retention rule, and provenance, and separates returned facts from biological
+interpretation and hypotheses. If the provider is blocked, the Agent stops
+instead of filling in plausible-looking statistics.
+
+## Orchestration
+
+The main DepMap Agent owns question classification, dependency resolution, the
+analysis specification, Run submission and monitoring, validation, and the
+final answer. Ordered preprocessing and calculation execute in one deterministic
+R Run when possible. Independent literature retrieval or result review may use
+child Agents, which receive only the question and compact result package.
+Biological, literature, figure, manuscript, and grant Skills remain hot-loadable
+from the project's enabled Skill catalog and are loaded only for their current
+stage.
+
+The routing lifecycle is explicit:
+
+```text
+precomputed_query
+  |-- covered --> bounded query --> validated answer
+  `-- not covered --> coverage_gap --> new_analysis_proposed
+                                      --> new_analysis_authorized
+                                      --> persisted R Run
+                                      --> run_validated
+                                      --> interpretation / knowledge update
+```
+
+### Natural-language routing and ambiguity
+
+The configured chat model proposes a typed intent and extracts only entities
+present in the user's message. Model quality affects first-pass recall, but it
+does not authorize a scientific query: the host validates the closed schema,
+required entities, lineage vocabulary, and ambiguity state. The remote MCP
+publishes `depmap_capabilities`, a lightweight catalog of supported intents,
+representative Chinese wording, required fields, confusable directions, and
+the bounded tool for each capability. Reading it does not scan result matrices.
+
+When mutation-to-dependency and dependency-to-mutation (or another material
+scientific direction) both remain plausible, the router returns
+`decision=clarify`. The Agent asks one short question and does not query
+evidence until the direction is resolved. A model-generated confidence number
+is not treated as a calibrated probability. Missing optional display fields
+may use documented defaults; missing or ambiguous scientific direction may not.
+
+The route includes a native `ask_user` card payload for missing critical fields
+or direction ambiguity. A critical mutation/dependency direction shows two
+plain-language cards: fix the mutation and query dependency targets, or fix the
+dependency target and query associated mutations. An out-of-scope expression
+causes the Agent to read the lightweight MCP capability catalog and offer only
+the two to four nearest supported modules. Selecting a card becomes the next
+user message, so the normal typed route runs again with the clarified intent.
+The route result uses a batch-stopping control boundary: if the model emitted
+an evidence query beside an ambiguous route in the same tool-call batch, that
+query is skipped and the model must present the clarification card first.
+
+The `depmap_synthetic_lethal_evidence` tool remains pan-cancer when `lineage`
+is omitted. When the user names a cancer, pass `lineage` so the same tool
+reads the completed lineage official Gene Effect mutation-positive versus
+matrix-negative analysis instead of the pan-cancer observational catalog.
+Exact mutation-anchor eligibility uses `depmap_mutation_anchor_evidence` with
+`gene`; Mut/WT counts and rejection reasons come from the lineage mutation
+menu, never from absence in a retained candidate shortlist.
+
+The product contract therefore does not depend on enumerating every synonym.
+Examples and aliases improve recall, while closed schemas, deterministic
+validation, clarification, and regression cases prevent silent execution of a
+misunderstood request.
+
+The native `depmap_validate_run` gate requires `RunStatus=succeeded`, exit code
+0, declared `run_manifest.json`/`result.json`/`qc.json` outputs, R language,
+release and target identity, coherent cohort counts, and passing QC. A file on
+disk is not treated as a validated result merely because it exists.
+
+A missing path, unavailable service, or unsupported cohort is reported as such.
+The installed `tcga_expression_survival` mode is an explicit, precomputed
+patient-cohort module; its use is not a silent substitution. Other TCGA
+analyses, arbitrary Python analysis, and untracked scans of raw matrices remain
+outside this permission boundary.
+
+## TCGA expression and survival bridge
+
+The first TCGA integration stage maps the exact 18,531 DepMap CRISPR target
+genes to all 33 TCGA projects without copying the large public dataset into a
+Wisp project. Raw files remain remote references under `/refdir/database`; the
+knowledge root contains only compact Parquet associations, manifests, and QA.
+
+For each project the builder aligns genes by Ensembl gene ID with an explicit
+gene-symbol fallback, selects primary-tumour sample type `01` (or LAML primary
+blood-derived cancer type `03`), retains one sample per patient, transforms TPM
+to `log2(TPM+1)`, and links the patient
+barcode to OS, DSS, DFI, and PFI. Each gene/endpoint uses a univariate Breslow
+Cox score test at beta zero when at least 30 patients and 10 events are
+available. BH FDR is calculated within one project and endpoint. Positive score
+z means higher expression is associated with higher event hazard; it is not a
+hazard ratio, a multivariable estimate, or evidence of causality. DepMap cell
+lines and TCGA patient samples are never joined; the bridge is gene- and
+cancer-label-centric.
+
+Mutation and CNV are deliberately outside this first stage and remain visible
+future coverage rather than being inferred from the expression-survival rows.
+
+## Scientific boundary
+
+Reference scripts define capabilities and established analysis patterns; their
+example genes and historical release labels are not automatically copied into
+new conclusions. Generated analyses must record the active release, exact
+inputs, cohort and sample counts, statistical methods, correction rules,
+software versions, reference scripts, and validation warnings. Observational
+associations and screen-derived candidates remain hypotheses until supported by
+independent experimental evidence.
+
+## Gene-to-cancer topic workflow
+
+The built-in **DepMap gene-to-cancer topics** Workflow turns one resolved gene
+and an optional cancer scope into a ranked, reviewable topic report. Run it by
+name from a DepMap Agent conversation, for example:
+
+```text
+Run the DepMap gene-to-cancer topics workflow for KRAS in lung cancer.
+```
+
+The graph keeps large data in the query layer and executes eight bounded tasks:
+
+1. the DepMap Specialist inventories which analysis families are actually
+   eligible in the requested cancer scope;
+2. the DepMap Specialist queries validated project evidence and records exact
+   numbers, sample sizes, release provenance, limitations, and coverage gaps;
+3. an independent literature task maps established, contested, and open claims;
+4. a synthesis task proposes three to six falsifiable cancer topics;
+5. an innovation reviewer checks prior-art collision, mechanistic novelty, and
+   whether the DepMap angle is genuinely differentiating;
+6. a feasibility reviewer scores data coverage, statistics, experiments, cost,
+   reproducibility, and failure modes;
+7. a clinical-translation reviewer independently scores biomarkers,
+   stratification, actionability, models, and translational barriers;
+8. a final task ranks the topics and returns a figure plan, manuscript-section
+   blueprint, caveats, and the few questions needed for the next conversation.
+
+The literature task keeps a claim ledger. Search snippets, AI summaries, title
+matches, and reference-list mentions remain candidate leads until the primary
+abstract or full text and a stable PMID, PMCID, DOI, or publisher URL verify
+them. Later corrections mark the old claim contradicted or retracted so it
+cannot flow into topic generation. Search depth remains adaptive: evidence
+saturation, unresolved claim classes, and explicit coverage gaps determine when
+the node stops, not a hard-coded call count. A negative search is reported only
+as “not found within the searched scope”; it is never proof that nobody has done
+the work or that a gap is unique.
+
+For requests that ask which existing data support a proposed study, the Agent
+uses the `study_support_mapping` route and a bounded cancer catalog query. Each
+study claim is separated into direct precomputed evidence, new computation from
+available inputs, missing data/coverage, or literature-only/unverified support.
+This inventory never falls back to shell, an SSH Run, or guessed filesystem
+paths. Installed modules show availability, not that a proposed TF-high
+subgroup, drug combination, mechanism, or cross-platform integration has
+already been analyzed.
+
+The evidence nodes use the policy-scoped `depmap_read` capability. It grants
+the delegated DepMap Specialist only the bounded `depmap_evidence` and
+`depmap_query` tools; it does
+not grant raw matrix reads, project writes, or code execution.
+The DepMap specialist's required `depmap-knowledge-query` Skill participates in
+Workflow resource discovery even if the project's ordinary enabled-Skill subset
+is empty, so the main Agent and delegated evidence nodes see the same bounded
+provider capability.
+
+### Custom research modules and command phrases
+
+Built-in Workflows provide a tested default, but they are not the only allowed
+research implementation. Duplicate a built-in Workflow in Workflow Studio, then
+replace its literature node with any enabled project Skill or configured
+literature/external-research connector. The approved run snapshots the resolved
+Skill, connector, model, capabilities, and task graph for reproducibility.
+
+A custom Workflow's exact saved name is also a natural-language command phrase.
+For example, after saving a module named `谷歌浏览器调研`, the user can say
+`使用谷歌浏览器调研调查 PTK7 与肝癌` without adding the word `Workflow`. Wisp
+requires an execution verb and one exact template name; mentioning a name while
+asking what it does does not start it, and ambiguous or partial matches fail
+closed.
+
+An explicit request to use the user's real Chrome/Chromium session can be handled
+either by the main Agent or by a Native Workflow node with the separately
+approved **Real browser research** (`browser_research`) capability. That grant
+exposes only browser setup, tab opening, page scanning, bounded page JavaScript,
+plus host-persisted structured research-progress checkpoints. Browser actions
+continue to use the same persistent bridge, URL block/preference rules,
+provenance log, and task budget. The capability is never inherited from
+`literature_search` or `external_research`, is not granted by default, and is not
+available to ACP/external executors that cannot share the in-process browser
+bridge. Neither browser text nor model memory becomes literature evidence until
+publication identifiers are verified and returned with the claim.
+
+Native `literature_search`, `external_research`, and `browser_research` tasks
+all expose host-persisted phase and evidence-coverage checkpoints in the Agents
+panel. This progress contract does not grant Chrome access to ordinary
+literature or external-research tasks.
+
+This first-stage Workflow proposes and audits topics. After the user selects a
+topic, run the built-in **DepMap selected-topic report** Workflow with the exact
+gene, cancer scope, topic id, and output language (`zh` or `en`). It re-queries
+and freezes the bounded evidence, creates evidence-backed figures and captions,
+writes Results and Methods, then assembles `report.md` and `report.html` under
+`analysis/depmap-agent/reports/`. Report generation requires explicit approval
+because it writes project files and may execute the configured Python or R
+visualization runtime. Missing or unvalidated evidence remains a visible
+limitation; the Workflow must not fill it with plausible prose.
+
+For a breast-cancer direction, the intended conversation is:
+
+1. supply a resolved gene plus `breast cancer` to **DepMap gene-to-cancer
+   topics**;
+2. review the cancer data inventory and three independent topic scores;
+3. refine or select one topic over subsequent turns;
+4. run **DepMap selected-topic report** in Chinese or English;
+5. inspect the returned files and figures before publication use.
+
+If the user supplies only a cancer type, the Agent may inventory available
+analysis families, but it must request a resolved gene before claiming that a
+gene-specific topic has been evaluated.
+# Client reliability
+
+Wisp keeps the configured DepMap MCP identity when a transient HTTP failure
+invalidates its transport. A later read-only catalog request reconnects and
+restores tool discovery automatically. Calls with possible side effects are
+never replayed after an ambiguous disconnect. The Connections page reports
+disconnected, reconnecting, and ready states and retains the latest error for
+diagnosis.
+
+Clarification cards, trajectory exports, and local Python workers use UTF-8
+end to end, including on Windows systems whose console code page is GBK.

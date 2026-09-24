@@ -145,6 +145,63 @@ async fn roundtrip() {
 }
 
 #[tokio::test]
+async fn load_messages_keeps_readable_rows_when_history_is_damaged() {
+    let tmp = std::env::temp_dir().join(format!(
+        "wisp_store_bad_history_{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let store = Store::open(&tmp).await.unwrap();
+    store.create_project("p1", "proj", "").await.unwrap();
+    store
+        .create_frame("f1", "p1", "OPERON", "m3")
+        .await
+        .unwrap();
+    store
+        .append_message("f1", 0, &Message::user("hello"))
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO messages(id,frame_id,seq,role,content,tool_calls,ts) VALUES(?,?,?,?,?,?,?)",
+    )
+    .bind("bad-json")
+    .bind("f1")
+    .bind(1i64)
+    .bind("assistant")
+    .bind("not-json")
+    .bind("{")
+    .bind(1i64)
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO messages(id,frame_id,seq,role,content,ts) VALUES(?,?,?,?,?,?)")
+        .bind("bad-seq")
+        .bind("f1")
+        .bind("oops")
+        .bind("user")
+        .bind("\"skipped\"")
+        .bind(1i64)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    store
+        .append_message("f1", 3, &Message::user("still here"))
+        .await
+        .unwrap();
+
+    let msgs = store.load_messages("f1").await.unwrap();
+    assert_eq!(
+        msgs.iter()
+            .map(|message| message.content.as_text())
+            .collect::<Vec<_>>(),
+        ["hello", "", "still here"]
+    );
+    assert_eq!(msgs[1].role, wisp_llm::Role::Assistant);
+    assert!(msgs[1].tool_calls.is_empty());
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[tokio::test]
 async fn named_draft_is_listable_but_not_resumable() {
     let tmp = std::env::temp_dir().join(format!(
         "wisp_store_named_draft_{}.sqlite",
@@ -718,11 +775,20 @@ async fn frame_reasoning_effort_is_session_scoped_and_nullable() {
         .set_frame_reasoning_effort("first", "p", Some("high"))
         .await
         .unwrap();
+    store
+        .set_frame_service_tier("first", "p", Some("priority"))
+        .await
+        .unwrap();
     assert_eq!(
         store.frame_reasoning_effort("first").await.unwrap(),
         Some("high".into())
     );
     assert_eq!(store.frame_reasoning_effort("second").await.unwrap(), None);
+    assert_eq!(
+        store.frame_service_tier("first").await.unwrap(),
+        Some("priority".into())
+    );
+    assert_eq!(store.frame_service_tier("second").await.unwrap(), None);
 
     sqlx::query("INSERT INTO messages(id,frame_id,seq,role,ts) VALUES('msg','first',1,'user',1)")
         .execute(&store.pool)
@@ -736,6 +802,11 @@ async fn frame_reasoning_effort_is_session_scoped_and_nullable() {
         store.frame_reasoning_effort("exploration").await.unwrap(),
         Some("high".into()),
         "an exploration branch must preserve the conversation override"
+    );
+    assert_eq!(
+        store.frame_service_tier("exploration").await.unwrap(),
+        Some("priority".into()),
+        "an exploration branch must preserve the Fast override"
     );
 
     assert!(store
@@ -757,6 +828,21 @@ async fn frame_reasoning_effort_is_session_scoped_and_nullable() {
         .await
         .unwrap();
     assert_eq!(store.frame_reasoning_effort("first").await.unwrap(), None);
+
+    store
+        .set_frame_service_tier("first", "p", Some(""))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.frame_service_tier("first").await.unwrap(),
+        Some(String::new()),
+        "explicit Fast-off must differ from inheritance"
+    );
+    store
+        .set_frame_service_tier("first", "p", None)
+        .await
+        .unwrap();
+    assert_eq!(store.frame_service_tier("first").await.unwrap(), None);
 
     store.pool.close().await;
     let _ = std::fs::remove_file(tmp);
@@ -1417,7 +1503,7 @@ async fn nested_agent_fanout_lineage_survives_restart_and_root_cancel() {
         max_tokens: 1_000,
         max_tool_calls: 20,
         max_cost_microunits: 1_000,
-        wall_time_secs: 300,
+        wall_time_secs: Some(300),
     };
     let parent = create_running_nested_test_root(&store, limits.clone(), true, 100).await;
 
@@ -1831,6 +1917,184 @@ async fn branched_from_survives_listing() {
     store.set_session_pinned("fork", "p", true).await.unwrap();
     let pinned = store.list_pinned_sessions("p").await.unwrap();
     assert_eq!(pinned[0].4.as_deref(), Some("main"));
+    let _ = std::fs::remove_file(tmp);
+}
+
+#[tokio::test]
+async fn moving_session_moves_persisted_branch_subtree() {
+    let tmp =
+        std::env::temp_dir().join(format!("wisp_move_family_{}.sqlite", uuid::Uuid::new_v4()));
+    let store = Store::open(&tmp).await.unwrap();
+    for project in ["p", "other-project"] {
+        store.create_project(project, project, "").await.unwrap();
+    }
+    for folder in ["d1", "d2"] {
+        store.create_folder(folder, "p", folder).await.unwrap();
+    }
+    for (id, project, source) in [
+        ("main", "p", None),
+        ("branch", "p", Some("main")),
+        ("nested", "p", Some("branch")),
+        ("sibling", "p", Some("main")),
+        ("unrelated", "p", None),
+        ("foreign", "other-project", Some("main")),
+    ] {
+        store
+            .create_frame(id, project, "OPERON", "m")
+            .await
+            .unwrap();
+        store.rename_session(id, project, id).await.unwrap();
+        if let Some(source) = source {
+            store.set_session_branched_from(id, source).await.unwrap();
+        }
+    }
+    store
+        .set_session_pinned("sibling", "p", true)
+        .await
+        .unwrap();
+    // Moving a branch affects its descendants, but not its parent or siblings.
+    store
+        .move_session_to_folder("branch", "p", Some("d2"))
+        .await
+        .unwrap();
+    for row in store.list_sessions("p").await.unwrap() {
+        let expected = matches!(row.0.as_str(), "branch" | "nested").then_some("d2");
+        assert_eq!(row.3.as_deref(), expected, "{}", row.0);
+    }
+    // Mainline moves reunite all descendants, including previously moved branches.
+    for folder in [Some("d1"), Some("d2"), None] {
+        store
+            .move_session_to_folder("main", "p", folder)
+            .await
+            .unwrap();
+        let reopened = Store::open(&tmp).await.unwrap();
+        for row in reopened.list_sessions("p").await.unwrap() {
+            let expected = if row.0 == "unrelated" { None } else { folder };
+            assert_eq!(row.3.as_deref(), expected, "{}", row.0);
+        }
+        assert_eq!(
+            reopened.list_pinned_sessions("p").await.unwrap()[0]
+                .3
+                .as_deref(),
+            folder
+        );
+        assert!(reopened.list_sessions("other-project").await.unwrap()[0]
+            .3
+            .is_none());
+        reopened.pool.close().await;
+    }
+    assert!(store
+        .move_session_to_folder("main", "p", Some("missing"))
+        .await
+        .is_err());
+    assert!(store
+        .move_session_to_folder("missing", "p", None)
+        .await
+        .is_err());
+    assert!(store
+        .move_session_to_folder("main", "other-project", None)
+        .await
+        .is_err());
+    // Malformed legacy cycles must not hang recursive traversal.
+    store
+        .set_session_branched_from("main", "nested")
+        .await
+        .unwrap();
+    store
+        .move_session_to_folder("main", "p", Some("d1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .list_sessions("p")
+            .await
+            .unwrap()
+            .iter()
+            .filter(|row| row.3.as_deref() == Some("d1"))
+            .count(),
+        4
+    );
+    store.pool.close().await;
+    let _ = std::fs::remove_file(tmp);
+}
+
+#[tokio::test]
+async fn conversation_branches_inherit_source_folder_at_creation() {
+    let tmp = std::env::temp_dir().join(format!(
+        "wisp_branch_folder_{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let store = Store::open(&tmp).await.unwrap();
+    store.create_project("p", "proj", "").await.unwrap();
+    store.create_folder("d1", "p", "Research").await.unwrap();
+    for (source, folder) in [("grouped", Some("d1")), ("ungrouped", None)] {
+        store
+            .create_frame(source, "p", "OPERON", "m")
+            .await
+            .unwrap();
+        store.rename_session(source, "p", source).await.unwrap();
+        store
+            .move_session_to_folder(source, "p", folder)
+            .await
+            .unwrap();
+        for kind in ["before_user", "after_response"] {
+            let branch = format!("{source}-{kind}");
+            store
+                .create_frame(&branch, "p", "OPERON", "m")
+                .await
+                .unwrap();
+            // A branch before the first user message is listed by its title.
+            store.rename_session(&branch, "p", &branch).await.unwrap();
+            store
+                .set_session_branch_point(&branch, source, 0, kind)
+                .await
+                .unwrap();
+        }
+    }
+
+    store.pool.close().await;
+    let store = Store::open(&tmp).await.unwrap();
+    let listed = store.list_sessions("p").await.unwrap();
+    assert_eq!(listed.len(), 6);
+    for (source, folder) in [("grouped", Some("d1")), ("ungrouped", None)] {
+        for kind in ["before_user", "after_response"] {
+            let branch = format!("{source}-{kind}");
+            let row = listed.iter().find(|row| row.0 == branch).unwrap();
+            assert_eq!(row.3.as_deref(), folder, "folder for {branch}");
+            assert_eq!(row.4.as_deref(), Some(source));
+        }
+    }
+
+    store
+        .set_session_pinned("grouped-after_response", "p", true)
+        .await
+        .unwrap();
+    let pinned = store.list_pinned_sessions("p").await.unwrap();
+    assert_eq!(pinned[0].3.as_deref(), Some("d1"));
+    assert_eq!(pinned[0].4.as_deref(), Some("grouped"));
+
+    // Inheritance happens at creation; users can still move a branch separately.
+    store
+        .move_session_to_folder("grouped-before_user", "p", None)
+        .await
+        .unwrap();
+    let listed = store.list_sessions("p").await.unwrap();
+    assert!(listed
+        .iter()
+        .find(|row| row.0 == "grouped-before_user")
+        .unwrap()
+        .3
+        .is_none());
+    assert_eq!(
+        listed
+            .iter()
+            .find(|row| row.0 == "grouped")
+            .unwrap()
+            .3
+            .as_deref(),
+        Some("d1")
+    );
+    store.pool.close().await;
     let _ = std::fs::remove_file(tmp);
 }
 
@@ -2439,6 +2703,137 @@ async fn transcript_pages_keep_complete_user_turns_and_matching_events() {
 }
 
 #[tokio::test]
+async fn outline_keeps_legacy_prefix_and_uses_each_repeated_questions_event_time() {
+    let tmp = std::env::temp_dir().join(format!("wisp_outline_{}.sqlite", uuid::Uuid::new_v4()));
+    let store = Store::open(&tmp).await.unwrap();
+    store.create_project("p", "proj", "").await.unwrap();
+    store.create_frame("f", "p", "OPERON", "m").await.unwrap();
+    for (seq, message) in [
+        Message::user("legacy"),
+        Message::assistant("old answer"),
+        Message::user("again"),
+        Message::assistant("answer"),
+        Message::user("again"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        store
+            .append_message("f", seq as i64 + 1, message)
+            .await
+            .unwrap();
+    }
+    for (seq, json) in [
+        r#"{"kind":"User","frame_id":"f","text":"again"}"#,
+        r#"{"kind":"MessageBoundary","frame_id":"f","seq":3}"#,
+        r#"{"kind":"Text","frame_id":"f","delta":"answer"}"#,
+        r#"{"kind":"MessageBoundary","frame_id":"f","seq":4}"#,
+        r#"{"kind":"User","frame_id":"f","text":"again"}"#,
+        r#"{"kind":"MessageBoundary","frame_id":"f","seq":5}"#,
+    ]
+    .iter()
+    .enumerate()
+    {
+        store
+            .append_session_ui_event("f", seq as i64 + 1, json)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE session_ui_events SET created_at=(1000+seq)*1000 WHERE frame_id='f'")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let outline = store.load_session_outline("f").await.unwrap();
+    assert_eq!(
+        outline
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<Vec<_>>(),
+        ["legacy", "again", "again"]
+    );
+    assert_eq!(outline[1].sent_at, Some(1001));
+    assert_eq!(outline[1].response_at, Some(1003));
+    assert_eq!(outline[2].sent_at, Some(1005));
+    assert_eq!(outline[2].response_at, None);
+    let latest = store
+        .load_session_transcript_page("f", None, 1)
+        .await
+        .unwrap();
+    assert_eq!(latest.user_offset, 2);
+    assert_eq!(latest.event_message_prefix_len, Some(0));
+    let full = store
+        .load_session_transcript_page("f", None, 20)
+        .await
+        .unwrap();
+    assert_eq!(full.user_offset, 0);
+    assert_eq!(full.event_message_prefix_len, Some(2));
+}
+
+#[tokio::test]
+async fn max_message_seq_uses_max_not_count_when_seqs_have_gaps() {
+    let tmp = std::env::temp_dir().join(format!(
+        "wisp_store_max_seq_gap_{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let store = Store::open(&tmp).await.unwrap();
+    store.create_project("p", "proj", "").await.unwrap();
+    store.create_frame("f", "p", "OPERON", "m").await.unwrap();
+    assert_eq!(store.max_message_seq("f").await.unwrap(), 0);
+    store
+        .append_message("f", 1, &Message::user("first"))
+        .await
+        .unwrap();
+    store
+        .append_message("f", 3, &Message::assistant("third"))
+        .await
+        .unwrap();
+    assert_eq!(store.message_count("f").await.unwrap(), 2);
+    assert_eq!(store.max_message_seq("f").await.unwrap(), 3);
+    let page = store
+        .load_session_transcript_page("f", None, 20)
+        .await
+        .unwrap();
+    assert_eq!(page.latest_seq, 3);
+    let _ = std::fs::remove_file(tmp);
+}
+
+#[tokio::test]
+async fn frame_message_activity_reports_live_delegated_progress() {
+    let tmp = std::env::temp_dir().join(format!(
+        "wisp_store_frame_activity_{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let store = Store::open(&tmp).await.unwrap();
+    store.create_project("p", "proj", "").await.unwrap();
+    store
+        .create_frame("child", "p", "Agent", "m")
+        .await
+        .unwrap();
+    store
+        .append_message("child", 1, &Message::user("search"))
+        .await
+        .unwrap();
+    store
+        .append_message(
+            "child",
+            2,
+            &Message::tool("call-1", "literature_search", "ok"),
+        )
+        .await
+        .unwrap();
+    store
+        .append_message("child", 3, &Message::assistant("continue"))
+        .await
+        .unwrap();
+
+    let (messages, tools, last_activity_at) = store.frame_message_activity("child").await.unwrap();
+    assert_eq!(messages, 3);
+    assert_eq!(tools, 1);
+    assert!(last_activity_at.is_some());
+    let _ = std::fs::remove_file(tmp);
+}
+
+#[tokio::test]
 async fn recent_turn_preview_messages_are_turn_and_content_bounded() {
     let tmp = std::env::temp_dir().join(format!(
         "wisp_store_recent_turns_{}.sqlite",
@@ -2809,6 +3204,61 @@ async fn session_ui_events_keep_insertion_order() {
 }
 
 #[tokio::test]
+async fn mcp_app_snapshots_roundtrip_without_rewriting_the_ui_event_log() {
+    let tmp = std::env::temp_dir().join(format!(
+        "wisp_mcp_app_snapshot_{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let store = Store::open(&tmp).await.unwrap();
+    store.create_project("p", "P", "").await.unwrap();
+    store.create_frame("f", "p", "OPERON", "m").await.unwrap();
+    let presentation = r#"{"kind":"ToolPresentation","frame_id":"f","presentation_id":"motif-1","presentation_kind":"mcp_app","payload":{"tool":{"name":"motif_open_workbench"}}}"#;
+    store
+        .append_session_ui_event("f", 1, presentation)
+        .await
+        .unwrap();
+
+    let snapshot_v1 = r#"{"schema":"wisp.mcp-app-snapshot.v1","result":{"records":["a"]}}"#;
+    store
+        .save_mcp_app_snapshot("f", "motif-1", "motif_open_workbench", snapshot_v1)
+        .await
+        .unwrap();
+    let saved = store
+        .load_mcp_app_snapshot("f", "motif-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.app_kind, "motif_open_workbench");
+    assert_eq!(saved.snapshot_json, snapshot_v1);
+    assert_eq!(
+        store.load_session_ui_events("f").await.unwrap(),
+        vec![presentation]
+    );
+    assert_eq!(
+        store
+            .load_mcp_app_presentation_event("f", "motif-1")
+            .await
+            .unwrap(),
+        Some(presentation.into())
+    );
+
+    let snapshot_v2 = r#"{"schema":"wisp.mcp-app-snapshot.v1","result":{"records":["b"]}}"#;
+    store
+        .save_mcp_app_snapshot("f", "motif-1", "motif_open_workbench", snapshot_v2)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .load_mcp_app_snapshot("f", "motif-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .snapshot_json,
+        snapshot_v2
+    );
+}
+
+#[tokio::test]
 async fn session_ui_events_timed_roundtrip() {
     let tmp = std::env::temp_dir().join(format!(
         "wisp_ui_events_timed_{}.sqlite",
@@ -2900,6 +3350,102 @@ async fn session_ui_events_created_at_backfill_is_idempotent() {
 }
 
 #[tokio::test]
+async fn interrupted_replace_keeps_the_previous_transcript_and_seq_anchored_rows() {
+    let tmp = std::env::temp_dir().join(format!(
+        "wisp_replace_atomic_{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let store = Store::open(&tmp).await.unwrap();
+    store.create_project("p", "P", "").await.unwrap();
+    store.create_frame("f", "p", "OPERON", "m").await.unwrap();
+    store
+        .append_message("f", 1, &Message::user("keep me"))
+        .await
+        .unwrap();
+    store
+        .append_message("f", 2, &Message::assistant("kept answer"))
+        .await
+        .unwrap();
+    store
+        .save_turn_file_undo(
+            "f",
+            1,
+            "src/main.rs",
+            true,
+            None,
+            Some("before"),
+            Some("after"),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO message_resource_links(\
+         id,frame_id,message_seq,ordinal,original_reference,display_name,\
+         resource_kind,mime_type,status,created_at) \
+         VALUES('l1','f',1,0,'@r.csv','r.csv','file','text/csv','linked',1)",
+    )
+    .execute(&store.pool)
+    .await
+    .unwrap();
+
+    // Simulate a crash mid-replace: the deletes and half the inserts ran, but
+    // the transaction is dropped without commit.
+    {
+        let mut tx = store.begin_write().await.unwrap();
+        Store::replace_message_rows_for_test(
+            &mut tx,
+            "f",
+            &[Message::system("half-written checkpoint")],
+        )
+        .await
+        .unwrap();
+    }
+
+    let msgs = store.load_messages("f").await.unwrap();
+    assert_eq!(msgs.len(), 2, "old transcript must survive an interruption");
+    assert_eq!(msgs[0].content.as_text(), "keep me");
+    assert_eq!(msgs[1].content.as_text(), "kept answer");
+    assert_eq!(
+        store.list_turn_file_undo("f", 1).await.unwrap().len(),
+        1,
+        "undo rows must survive an interrupted replace"
+    );
+    assert_eq!(
+        store
+            .list_message_resource_links("f", 1, None)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "resource links must survive an interrupted replace"
+    );
+
+    // A committed replace applies wholesale and drops the seq-anchored rows,
+    // whose anchors the renumbering invalidated.
+    store
+        .replace_messages(
+            "f",
+            &[Message::system("checkpoint"), Message::user("recent tail")],
+        )
+        .await
+        .unwrap();
+    let msgs = store.load_messages("f").await.unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0].content.as_text(), "checkpoint");
+    assert_eq!(msgs[1].content.as_text(), "recent tail");
+    assert!(store.list_turn_file_undo("f", 1).await.unwrap().is_empty());
+    assert!(store
+        .list_message_resource_links("f", 1, None)
+        .await
+        .unwrap()
+        .is_empty());
+    store.pool.close().await;
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[tokio::test]
 async fn side_chat_snapshot_survives_compaction_and_stops_at_completed_boundary() {
     let tmp = std::env::temp_dir().join(format!(
         "wisp_side_snapshot_{}.sqlite",
@@ -2926,13 +3472,24 @@ async fn side_chat_snapshot_survives_compaction_and_stops_at_completed_boundary(
         .append_message("f", 1, &Message::user("old decision"))
         .await
         .unwrap();
+    let compacted = [
+        Message::system("compacted checkpoint"),
+        Message::user("recent tail"),
+    ];
     store
-        .replace_messages(
+        .open_context_epoch(
             "f",
-            &[
-                Message::system("compacted checkpoint"),
-                Message::user("recent tail"),
-            ],
+            OpenContextEpoch {
+                messages: &compacted,
+                strategy: "manual",
+                kind: "semantic",
+                before_tokens: 10,
+                after_tokens: 4,
+                checkpoint_index: None,
+                first_kept_seq: None,
+                archive_ref: None,
+                ui_event_seq: None,
+            },
         )
         .await
         .unwrap();
@@ -3010,6 +3567,640 @@ async fn project_crud_and_listing() {
     assert!(store.get_project("b").await.unwrap().is_some());
     assert_eq!(store.load_messages("f2").await.unwrap().len(), 1);
 
+    let _ = std::fs::remove_file(&tmp);
+}
+
+async fn count_bound(store: &Store, sql: &str, bind: &str) -> i64 {
+    sqlx::query_scalar(sql)
+        .bind(bind)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn delete_project_clears_later_child_tables_and_ignores_orphan_schedules() {
+    let tmp = std::env::temp_dir().join(format!(
+        "wisp_store_delete_project_cascade_{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let store = Store::open(&tmp).await.unwrap();
+    store
+        .create_project("gone", "Gone", "/tmp/gone")
+        .await
+        .unwrap();
+    store
+        .create_project("keep", "Keep", "/tmp/keep")
+        .await
+        .unwrap();
+    store
+        .create_frame("gone-main", "gone", "OPERON", "m")
+        .await
+        .unwrap();
+    store
+        .create_frame("gone-explore", "gone", "OPERON", "m")
+        .await
+        .unwrap();
+    store
+        .create_frame("keep-main", "keep", "OPERON", "m")
+        .await
+        .unwrap();
+    store
+        .append_message("gone-main", 1, &Message::user("seed"))
+        .await
+        .unwrap();
+
+    let sha = "a".repeat(64);
+    store
+        .create_workspace_snapshot(&WorkspaceSnapshotRecord {
+            id: "gone-snap".into(),
+            project_id: "gone".into(),
+            manifest_json: "{}".into(),
+            manifest_sha256: sha.clone(),
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .create_context_archive(&ContextArchiveRecord {
+            id: "gone-archive".into(),
+            project_id: "gone".into(),
+            frame_id: "gone-main".into(),
+            storage_path: ".wisp/history/gone.json".into(),
+            checksum: sha.clone(),
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .create_exploration_family(&ExplorationFamily {
+            id: "gone-family".into(),
+            project_id: "gone".into(),
+            root_frame_id: "gone-main".into(),
+            mainline_frame_id: "gone-main".into(),
+            generation: 0,
+            created_at: 1,
+            updated_at: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .create_exploration_checkpoint(&ExplorationCheckpoint {
+            id: "gone-checkpoint".into(),
+            family_id: "gone-family".into(),
+            project_id: "gone".into(),
+            source_frame_id: "gone-main".into(),
+            source_message_seq: 1,
+            source_frame_head_seq: 1,
+            source_ui_event_seq: 0,
+            source_ui_event_head_seq: 0,
+            source_family_generation: 0,
+            source_state_generation: 0,
+            workspace_snapshot_id: "gone-snap".into(),
+            context_archive_id: "gone-archive".into(),
+            guard_hash: sha.clone(),
+            entity_hash: "b".repeat(64),
+            isolation_summary_json: "{}".into(),
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .create_exploration(&Exploration {
+            id: "gone-explore-id".into(),
+            checkpoint_id: "gone-checkpoint".into(),
+            frame_id: "gone-explore".into(),
+            name: "Alt path".into(),
+            status: ExplorationStatus::Creating,
+            workspace_dir: "/tmp/gone-explore".into(),
+            workspace_backend: "copy".into(),
+            scope_generation: 0,
+            warnings_json: "[]".into(),
+            created_at: 2,
+            updated_at: 2,
+        })
+        .await
+        .unwrap();
+    store
+        .record_exploration_baseline_entity(&ExplorationBaselineEntity {
+            checkpoint_id: "gone-checkpoint".into(),
+            entity_kind: "decision".into(),
+            entity_id: "gone-decision".into(),
+            version_id: None,
+            fingerprint: sha.clone(),
+        })
+        .await
+        .unwrap();
+    let version_id = store
+        .save_artifact_version(&ArtifactVersionDraft {
+            version_id: Some("gone-version".into()),
+            artifact_id: "gone-artifact".into(),
+            project_id: "gone".into(),
+            root_frame_id: "gone-main".into(),
+            filename: "result.txt".into(),
+            content_type: "text/plain".into(),
+            storage_path: "result.txt".into(),
+            logical_key: Some("path:result.txt".into()),
+            size_bytes: Some(1),
+            checksum: Some(sha.clone()),
+            producing_run_id: None,
+            env_snapshot_hash: None,
+            materialization: ArtifactMaterialization::Snapshot,
+            capture_timing: ArtifactCaptureTiming::AtCreation,
+        })
+        .await
+        .unwrap();
+    store
+        .record_exploration_baseline_artifact_head(&ExplorationBaselineArtifactHead {
+            checkpoint_id: "gone-checkpoint".into(),
+            logical_key: "path:result.txt".into(),
+            artifact_id: "gone-artifact".into(),
+            artifact_version_id: version_id.clone(),
+            fingerprint: sha.clone(),
+        })
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO exploration_effects(\
+           id,exploration_id,effect_kind,recoverability,target_summary,metadata_json,created_at\
+         ) VALUES('gone-effect','gone-explore-id','run','local_reversible','local','{}',1)",
+    )
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    store
+        .create_exploration_promotion(&ExplorationPromotion {
+            id: "gone-promo".into(),
+            exploration_id: "gone-explore-id".into(),
+            expected_guard_hash: sha.clone(),
+            status: ExplorationPromotionStatus::Prepared,
+            diff_json: "{}".into(),
+            journal_path: None,
+            error: None,
+            started_at: 3,
+            committed_at: None,
+        })
+        .await
+        .unwrap();
+    assert!(store
+        .create_project_state_revision(&ProjectStateRevision {
+            id: "gone-rev".into(),
+            project_id: "gone".into(),
+            frame_id: "gone-main".into(),
+            turn_index: 0,
+            message_seq: 1,
+            ui_event_seq: 0,
+            parent_revision_id: None,
+            workspace_snapshot_id: "gone-snap".into(),
+            workspace_manifest_sha256: sha.clone(),
+            workspace_delta_json: "[]".into(),
+            artifact_heads_json: "[]".into(),
+            entities_json: "[]".into(),
+            run_ids_json: "[]".into(),
+            decision_ids_json: "[]".into(),
+            external_effects_json: "[]".into(),
+            context_archive_id: "gone-archive".into(),
+            state_generation: 0,
+            is_full: true,
+            created_at: 1,
+        })
+        .await
+        .unwrap());
+
+    let gone_schedule = ScheduleRecord {
+        id: "gone-sched".into(),
+        project_id: "gone".into(),
+        frame_id: Some("gone-main".into()),
+        name: "Daily".into(),
+        prompt: "Summarize".into(),
+        skill: None,
+        interval_secs: 60,
+        enabled: true,
+        next_run_at: 100,
+        last_run_at: None,
+        created_at: 1,
+        updated_at: 1,
+    };
+    store.create_schedule(&gone_schedule).await.unwrap();
+    store
+        .record_schedule_run(&ScheduleRunRecord {
+            id: "gone-run".into(),
+            schedule_id: "gone-sched".into(),
+            frame_id: Some("gone-main".into()),
+            status: "fired".into(),
+            error: None,
+            fired_at: 100,
+        })
+        .await
+        .unwrap();
+    store
+        .upsert_context_storage_prefs(&ContextStoragePrefs {
+            project_id: "gone".into(),
+            context_id: "local".into(),
+            remote_data_root: "~/data".into(),
+            remote_workdir_root: ".wisp-science/runs".into(),
+            local_results_dir: "results".into(),
+            created_at: 1,
+            updated_at: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .record_remote_staging(&RemoteStagingEntry {
+            id: "gone-staging".into(),
+            project_id: "gone".into(),
+            context_id: "local".into(),
+            run_id: None,
+            remote_path: "/tmp/staged".into(),
+            source: "transfer".into(),
+            checksum: None,
+            size_bytes: None,
+            created_at: 1,
+            removed_at: None,
+        })
+        .await
+        .unwrap();
+    let plugin = PluginInstallation {
+        plugin_id: "cascade-plugin".into(),
+        version: "1.0.0".into(),
+        display_name: "Cascade".into(),
+        description: String::new(),
+        author: String::new(),
+        license: "MIT".into(),
+        source_uri: "https://example.invalid/plugin.zip".into(),
+        install_root: "/plugins/cascade/1.0.0".into(),
+        archive_sha256: sha.clone(),
+        manifest_json: r#"{"schema":"wisp.plugin.v1"}"#.into(),
+        trust_state: "checksum_verified".into(),
+        installed_at: 1,
+        updated_at: 1,
+    };
+    store.replace_plugin_installation(&plugin).await.unwrap();
+    store
+        .set_project_plugin("gone", &plugin.plugin_id, &plugin.version, true, "{}")
+        .await
+        .unwrap();
+    store
+        .set_project_plugin("keep", &plugin.plugin_id, &plugin.version, true, "{}")
+        .await
+        .unwrap();
+    store
+        .insert_ask_user_request("gone-ask", "gone-main", r#"{"q":"ok?"}"#)
+        .await
+        .unwrap();
+    store
+        .record_session_import("gone-import", "gone-main", "/tmp/gone.json")
+        .await
+        .unwrap();
+    store
+        .record_codex_import("gone-codex", "gone-main", "/tmp/gone.jsonl")
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO session_branch_merges(\
+           id,source_frame_id,branch_frame_id,checkpoint_user_index,checkpoint_kind,\
+           summary_message_seq,guard_hash,created_at\
+         ) VALUES('gone-merge','gone-main','gone-explore',0,'before_user',1,?,1)",
+    )
+    .bind(&sha)
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    store
+        .insert_global_memory(&GlobalMemory {
+            id: "mem-gone".into(),
+            content: "from deleted project".into(),
+            source_frame_id: Some("gone-main".into()),
+            source_turn_index: Some(0),
+            created_at: 1,
+            updated_at: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .insert_global_memory(&GlobalMemory {
+            id: "mem-keep".into(),
+            content: "from kept project".into(),
+            source_frame_id: Some("keep-main".into()),
+            source_turn_index: Some(0),
+            created_at: 1,
+            updated_at: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .create_schedule(&ScheduleRecord {
+            id: "keep-sched".into(),
+            project_id: "keep".into(),
+            frame_id: Some("keep-main".into()),
+            name: "Keep daily".into(),
+            prompt: "Keep going".into(),
+            skill: None,
+            interval_secs: 60,
+            enabled: true,
+            next_run_at: 100,
+            last_run_at: None,
+            created_at: 1,
+            updated_at: 1,
+        })
+        .await
+        .unwrap();
+
+    assert!(!store.due_schedules(500).await.unwrap().is_empty());
+    store.delete_project("gone").await.unwrap();
+
+    for (sql, label) in [
+        (
+            "SELECT COUNT(*) FROM schedules WHERE project_id=?",
+            "schedules",
+        ),
+        (
+            "SELECT COUNT(*) FROM schedule_runs WHERE schedule_id='gone-sched'",
+            "schedule_runs",
+        ),
+        (
+            "SELECT COUNT(*) FROM context_storage_prefs WHERE project_id=?",
+            "context_storage_prefs",
+        ),
+        (
+            "SELECT COUNT(*) FROM remote_staging WHERE project_id=?",
+            "remote_staging",
+        ),
+        (
+            "SELECT COUNT(*) FROM project_state_counters WHERE project_id=?",
+            "project_state_counters",
+        ),
+        (
+            "SELECT COUNT(*) FROM project_state_revisions WHERE project_id=?",
+            "project_state_revisions",
+        ),
+        (
+            "SELECT COUNT(*) FROM workspace_snapshots WHERE project_id=?",
+            "workspace_snapshots",
+        ),
+        (
+            "SELECT COUNT(*) FROM context_archives WHERE project_id=?",
+            "context_archives",
+        ),
+        (
+            "SELECT COUNT(*) FROM exploration_families WHERE project_id=?",
+            "exploration_families",
+        ),
+        (
+            "SELECT COUNT(*) FROM exploration_checkpoints WHERE project_id=?",
+            "exploration_checkpoints",
+        ),
+        (
+            "SELECT COUNT(*) FROM explorations WHERE id='gone-explore-id'",
+            "explorations",
+        ),
+        (
+            "SELECT COUNT(*) FROM exploration_baseline_entities WHERE checkpoint_id='gone-checkpoint'",
+            "exploration_baseline_entities",
+        ),
+        (
+            "SELECT COUNT(*) FROM exploration_baseline_artifact_heads WHERE checkpoint_id='gone-checkpoint'",
+            "exploration_baseline_artifact_heads",
+        ),
+        (
+            "SELECT COUNT(*) FROM exploration_effects WHERE exploration_id='gone-explore-id'",
+            "exploration_effects",
+        ),
+        (
+            "SELECT COUNT(*) FROM exploration_promotions WHERE exploration_id='gone-explore-id'",
+            "exploration_promotions",
+        ),
+        (
+            "SELECT COUNT(*) FROM artifact_heads WHERE project_id=?",
+            "artifact_heads",
+        ),
+        (
+            "SELECT COUNT(*) FROM project_plugins WHERE project_id=?",
+            "project_plugins",
+        ),
+        (
+            "SELECT COUNT(*) FROM session_branch_merges WHERE id='gone-merge'",
+            "session_branch_merges",
+        ),
+        (
+            "SELECT COUNT(*) FROM ask_user_requests WHERE frame_id='gone-main'",
+            "ask_user_requests",
+        ),
+        (
+            "SELECT COUNT(*) FROM session_imports WHERE frame_id='gone-main'",
+            "session_imports",
+        ),
+        (
+            "SELECT COUNT(*) FROM codex_imports WHERE frame_id='gone-main'",
+            "codex_imports",
+        ),
+        (
+            "SELECT COUNT(*) FROM frames WHERE project_id=?",
+            "frames",
+        ),
+    ] {
+        let bind = if sql.contains('?') { "gone" } else { "" };
+        let count = if sql.contains('?') {
+            count_bound(&store, sql, bind).await
+        } else {
+            sqlx::query_scalar(sql)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap()
+        };
+        assert_eq!(count, 0, "orphan row remains in {label}");
+    }
+
+    assert!(store
+        .due_schedules(500)
+        .await
+        .unwrap()
+        .iter()
+        .all(|row| { row.project_id != "gone" && row.id != "gone-sched" }));
+    assert_eq!(
+        store
+            .due_schedules(500)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>(),
+        ["keep-sched"]
+    );
+    assert!(store.get_project("keep").await.unwrap().is_some());
+    assert_eq!(
+        count_bound(
+            &store,
+            "SELECT COUNT(*) FROM project_plugins WHERE project_id=?",
+            "keep"
+        )
+        .await,
+        1
+    );
+    assert!(store
+        .get_plugin_installation("cascade-plugin", "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
+    let memories = store.list_global_memories(10).await.unwrap();
+    let mem_gone = memories.iter().find(|m| m.id == "mem-gone").unwrap();
+    assert_eq!(mem_gone.source_frame_id, None);
+    let mem_keep = memories.iter().find(|m| m.id == "mem-keep").unwrap();
+    assert_eq!(mem_keep.source_frame_id.as_deref(), Some("keep-main"));
+
+    store.pool.close().await;
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[tokio::test]
+async fn delete_session_clears_later_frame_tables() {
+    let tmp = std::env::temp_dir().join(format!(
+        "wisp_store_delete_session_cascade_{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let store = Store::open(&tmp).await.unwrap();
+    store.create_project("p", "proj", "").await.unwrap();
+    store.create_frame("f", "p", "OPERON", "m").await.unwrap();
+    store
+        .create_frame("other", "p", "OPERON", "m")
+        .await
+        .unwrap();
+
+    let mut workflow = AgentWorkflow::new("wf", "p", "workspace", "Delivery").unwrap();
+    workflow.frame_id = Some("f".into());
+    let step = nested_test_step("step", "wf", false, 1);
+    store
+        .create_agent_workflow_plan(&workflow, &[step])
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO agent_workflow_deliveries(\
+           id,workflow_id,frame_id,generation,auto_resume,result_json,message_seq,delivered_at,\
+           resume_status,resume_error,presented_at,created_at,updated_at\
+         ) VALUES('delivery','wf','f',1,0,NULL,NULL,NULL,'disabled',NULL,NULL,1,1)",
+    )
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    store
+        .insert_ask_user_request("ask-1", "f", r#"{"q":"ok?"}"#)
+        .await
+        .unwrap();
+    store
+        .record_session_import("import-1", "f", "/tmp/session.json")
+        .await
+        .unwrap();
+    store
+        .record_codex_import("codex-1", "f", "/tmp/codex.jsonl")
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO session_branch_merges(\
+           id,source_frame_id,branch_frame_id,checkpoint_user_index,checkpoint_kind,\
+           summary_message_seq,guard_hash,created_at\
+         ) VALUES('merge-1','f','other',0,'before_user',1,'c',1)",
+    )
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    store
+        .insert_global_memory(&GlobalMemory {
+            id: "mem-session".into(),
+            content: "session sourced".into(),
+            source_frame_id: Some("f".into()),
+            source_turn_index: Some(0),
+            created_at: 1,
+            updated_at: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .create_schedule(&ScheduleRecord {
+            id: "sched-f".into(),
+            project_id: "p".into(),
+            frame_id: Some("f".into()),
+            name: "After session".into(),
+            prompt: "Keep firing".into(),
+            skill: None,
+            interval_secs: 60,
+            enabled: true,
+            next_run_at: 100,
+            last_run_at: None,
+            created_at: 1,
+            updated_at: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .record_schedule_run(&ScheduleRunRecord {
+            id: "sched-run-f".into(),
+            schedule_id: "sched-f".into(),
+            frame_id: Some("f".into()),
+            status: "fired".into(),
+            error: None,
+            fired_at: 100,
+        })
+        .await
+        .unwrap();
+
+    store.delete_session("f", "p").await.unwrap();
+
+    for (sql, label) in [
+        (
+            "SELECT COUNT(*) FROM agent_workflow_deliveries WHERE frame_id='f'",
+            "agent_workflow_deliveries",
+        ),
+        (
+            "SELECT COUNT(*) FROM session_branch_merges WHERE id='merge-1'",
+            "session_branch_merges",
+        ),
+        (
+            "SELECT COUNT(*) FROM ask_user_requests WHERE frame_id='f'",
+            "ask_user_requests",
+        ),
+        (
+            "SELECT COUNT(*) FROM session_imports WHERE frame_id='f'",
+            "session_imports",
+        ),
+        (
+            "SELECT COUNT(*) FROM codex_imports WHERE frame_id='f'",
+            "codex_imports",
+        ),
+        ("SELECT COUNT(*) FROM frames WHERE id='f'", "frames"),
+    ] {
+        let count: i64 = sqlx::query_scalar(sql)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "orphan row remains in {label}");
+    }
+    assert!(store.get_agent_workflow("wf").await.unwrap().is_some());
+    assert_eq!(
+        store
+            .get_schedule("sched-f")
+            .await
+            .unwrap()
+            .unwrap()
+            .frame_id,
+        None
+    );
+    assert_eq!(
+        store.list_schedule_runs("sched-f", 10).await.unwrap()[0].frame_id,
+        None
+    );
+    assert_eq!(
+        store
+            .list_global_memories(10)
+            .await
+            .unwrap()
+            .iter()
+            .find(|m| m.id == "mem-session")
+            .unwrap()
+            .source_frame_id,
+        None
+    );
+
+    store.pool.close().await;
     let _ = std::fs::remove_file(&tmp);
 }
 
@@ -3578,6 +4769,70 @@ async fn execution_context_selection_is_isolated_per_session() {
 }
 
 #[tokio::test]
+async fn detaching_session_default_clears_the_conversation_snapshot() {
+    let tmp = std::env::temp_dir().join(format!(
+        "wisp_store_session_default_{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let store = Store::open(&tmp).await.unwrap();
+    store.create_project("p", "Project", "").await.unwrap();
+    store.create_frame("f1", "p", "OPERON", "m").await.unwrap();
+    store
+        .upsert_execution_context(&ExecutionContext::new("ssh:gpu", "GPU").unwrap())
+        .await
+        .unwrap();
+    store
+        .upsert_execution_context(&ExecutionContext::new("ssh:cpu", "CPU").unwrap())
+        .await
+        .unwrap();
+
+    store
+        .set_session_execution_context_enabled("f1", "ssh:gpu", true)
+        .await
+        .unwrap();
+    store
+        .set_session_execution_context_enabled("f1", "ssh:cpu", true)
+        .await
+        .unwrap();
+    store
+        .set_session_default_execution_context("f1", Some("ssh:gpu"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .session_default_execution_context("f1")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("ssh:gpu")
+    );
+
+    store
+        .set_session_execution_context_enabled("f1", "ssh:cpu", false)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .session_default_execution_context("f1")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("ssh:gpu")
+    );
+
+    store
+        .set_session_execution_context_enabled("f1", "ssh:gpu", false)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.session_default_execution_context("f1").await.unwrap(),
+        None
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[tokio::test]
 async fn store_open_records_migrations_and_seeds_local_context() {
     let tmp = std::env::temp_dir().join(format!(
         "wisp_store_migrations_{}.sqlite",
@@ -3590,8 +4845,13 @@ async fn store_open_records_migrations_and_seeds_local_context() {
         .await
         .unwrap()
         .is_some());
+    // The public list is chronological. When opening crosses a timestamp
+    // boundary, application order can differ from version order; this check
+    // verifies the recorded versions, independently of wall-clock timing.
+    let mut recorded_versions = store.schema_migrations().await.unwrap();
+    recorded_versions.sort();
     assert_eq!(
-        store.schema_migrations().await.unwrap(),
+        recorded_versions,
         vec![
             INITIAL_SCHEMA_MIGRATION.to_string(),
             CONTROL_PLANE_MIGRATION.to_string(),
@@ -3646,6 +4906,17 @@ async fn store_open_records_migrations_and_seeds_local_context() {
             RUN_LOG_PULL_MIGRATION.to_string(),
             ORPHAN_FILE_RETENTION_MIGRATION.to_string(),
             RUN_REVIEW_DISMISSED_MIGRATION.to_string(),
+            SESSION_SERVICE_TIER_MIGRATION.to_string(),
+            RESEARCH_JOURNAL_MIGRATION.to_string(),
+            EXPLORATION_HISTORY_MIGRATION.to_string(),
+            MCP_APP_SNAPSHOTS_MIGRATION.to_string(),
+            SCIENTIFIC_EVIDENCE_LEDGER_MIGRATION.to_string(),
+            PROJECT_STARS_MIGRATION.to_string(),
+            BRIDGE_CHECKPOINTS_MIGRATION.to_string(),
+            CLAIM_RECORDS_MIGRATION.to_string(),
+            RESEARCH_ARCHIVES_MIGRATION.to_string(),
+            CONTEXT_EPOCHS_MIGRATION.to_string(),
+            CONTEXT_EPOCH_IDENTITY_MIGRATION.to_string(),
         ]
     );
     let first_open_migrations = store.schema_migrations().await.unwrap();
@@ -3889,6 +5160,17 @@ async fn remote_staging_ledger_round_trips_and_counts_external_references() {
     let _ = std::fs::remove_file(&tmp);
 }
 
+#[test]
+fn auto_harvest_skip_and_lease_hold_are_pure_helpers() {
+    assert!(!skip_auto_harvest(None));
+    assert!(skip_auto_harvest(Some(1)));
+    assert!(require_lifecycle_hold(true, "ok").is_ok());
+    assert_eq!(
+        require_lifecycle_hold(false, "Run lifecycle lease was lost").unwrap_err(),
+        "Run lifecycle lease was lost"
+    );
+}
+
 #[tokio::test]
 async fn run_harvest_state_is_recorded_once_and_survives_reopen() {
     let tmp = std::env::temp_dir().join(format!(
@@ -3909,6 +5191,7 @@ async fn run_harvest_state_is_recorded_once_and_survives_reopen() {
         .harvested_at
         .is_none());
     assert!(store.mark_run_harvested("r").await.unwrap());
+    assert!(store.get_run("r").await.unwrap().unwrap().is_harvested());
     let harvested_at = store
         .get_run("r")
         .await
@@ -5036,6 +6319,7 @@ async fn run_manager_roundtrip_and_lifecycle() {
     run.output_specs_json = r#"[{"glob":"results/*.tsv","kind":"table"}]"#.into();
     run.timeout_secs = Some(900);
     run.progress_json = serde_json::to_string(&RunProgress {
+        indeterminate: false,
         phase: "uploading".into(),
         direction: "upload".into(),
         completed_bytes: 512,
@@ -5265,6 +6549,7 @@ async fn conditional_terminal_update_does_not_overwrite_winner() {
         .await
         .unwrap());
     let progress = RunProgress {
+        indeterminate: false,
         phase: "uploading".into(),
         direction: "upload".into(),
         completed_bytes: 4,
@@ -7280,6 +8565,7 @@ async fn create_exploration_checkpoint_fixture(store: &Store) {
             source_message_seq: 2,
             source_frame_head_seq: 2,
             source_ui_event_seq: 0,
+            source_ui_event_head_seq: 0,
             source_family_generation: 0,
             source_state_generation: 0,
             workspace_snapshot_id: "snapshot".into(),
@@ -7291,6 +8577,39 @@ async fn create_exploration_checkpoint_fixture(store: &Store) {
         })
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn exploration_history_migration_backfills_heads_and_is_idempotent() {
+    let (store, tmp) = exploration_store_fixture("history-migration").await;
+    create_exploration_checkpoint_fixture(&store).await;
+    sqlx::query("UPDATE exploration_checkpoints SET source_ui_event_seq=7")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE exploration_checkpoints DROP COLUMN source_ui_event_head_seq")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM wisp_schema_migrations WHERE version=?")
+        .bind(EXPLORATION_HISTORY_MIGRATION)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    store.pool.close().await;
+    for _ in 0..2 {
+        let reopened = Store::open(&tmp).await.unwrap();
+        let checkpoint = reopened
+            .get_exploration_checkpoint("checkpoint")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.source_ui_event_head_seq, 7);
+        assert_eq!(checkpoint.source_ui_event_seq, 7);
+        assert_eq!(checkpoint.source_message_seq, 2);
+        reopened.pool.close().await;
+    }
+    let _ = std::fs::remove_file(tmp);
 }
 
 #[tokio::test]
@@ -8133,6 +9452,7 @@ async fn exploration_checkpoint_rejects_stale_mainline_state() {
         source_message_seq: 2,
         source_frame_head_seq: 2,
         source_ui_event_seq: 0,
+        source_ui_event_head_seq: 0,
         source_family_generation: 0,
         source_state_generation: 0,
         workspace_snapshot_id: "snapshot".into(),
@@ -8432,6 +9752,185 @@ async fn exploration_schema_has_no_retained_discard_state() {
         assert!(error.to_string().contains("CHECK constraint failed"));
     }
 
+    store.pool.close().await;
+    let _ = std::fs::remove_file(tmp);
+}
+
+#[tokio::test]
+async fn research_journey_notes_follow_exploration_baseline_and_export() {
+    let (store, path) = exploration_store_fixture("journal").await;
+    create_exploration_checkpoint_fixture(&store).await;
+    let main = StateScope::mainline("p");
+    let input = wisp_dto::ResearchJournalInput {
+        title: "Baseline note".into(),
+        body: "Known before branching".into(),
+        category: "progress".into(),
+        occurred_at: 100,
+    };
+    let baseline = store
+        .add_research_journal_entry(&main, &input)
+        .await
+        .unwrap();
+    store
+        .capture_exploration_baseline_entities("checkpoint")
+        .await
+        .unwrap();
+    for (id, frame) in [("explore", "branch"), ("sibling", "sibling-frame")] {
+        if frame != "branch" {
+            store
+                .create_frame(frame, "p", "OPERON", "model")
+                .await
+                .unwrap();
+        }
+        store
+            .create_exploration(&Exploration {
+                id: id.into(),
+                checkpoint_id: "checkpoint".into(),
+                frame_id: frame.into(),
+                name: id.into(),
+                status: ExplorationStatus::Creating,
+                workspace_dir: format!("/tmp/{id}"),
+                workspace_backend: "snapshot".into(),
+                scope_generation: 0,
+                warnings_json: "[]".into(),
+                created_at: 2,
+                updated_at: 2,
+            })
+            .await
+            .unwrap();
+    }
+    let branch = StateScope::exploration("p", "explore");
+    let sibling = StateScope::exploration("p", "sibling");
+    let private = store
+        .add_research_journal_entry(
+            &branch,
+            &wisp_dto::ResearchJournalInput {
+                title: "Private note".into(),
+                ..input.clone()
+            },
+        )
+        .await
+        .unwrap();
+    let later = store
+        .add_research_journal_entry(
+            &main,
+            &wisp_dto::ResearchJournalInput {
+                title: "Later mainline note".into(),
+                ..input.clone()
+            },
+        )
+        .await
+        .unwrap();
+    let entries = store
+        .research_journey(&branch, 0, 86400)
+        .await
+        .unwrap()
+        .entries;
+    assert!(entries.iter().any(|e| e.source_id == baseline));
+    assert!(entries.iter().any(|e| e.source_id == private));
+    assert!(!entries.iter().any(|e| e.source_id == later));
+    assert!(!store
+        .research_journey(&sibling, 0, 86400)
+        .await
+        .unwrap()
+        .entries
+        .iter()
+        .any(|e| e.source_id == private));
+    assert!(!store
+        .research_journey(&main, 0, 86400)
+        .await
+        .unwrap()
+        .entries
+        .iter()
+        .any(|e| e.source_id == private));
+    let calendar = store
+        .research_calendar(&["p".into()], 0, 86400)
+        .await
+        .unwrap();
+    assert_eq!(
+        calendar[0].history,
+        store.research_journey(&main, 0, 86400).await.unwrap()
+    );
+    assert!(!calendar[0]
+        .history
+        .entries
+        .iter()
+        .any(|e| e.source_id == private));
+    assert!(calendar[0]
+        .history
+        .entries
+        .iter()
+        .any(|e| e.source_id == later));
+    let archive = path.with_extension("export.db");
+    let target_path = path.with_extension("target.db");
+    store.export_project_database("p", &archive).await.unwrap();
+    let target = Store::open(&target_path).await.unwrap();
+    target
+        .import_project_database(&archive, "p", std::path::Path::new("/tmp/imported-journal"))
+        .await
+        .unwrap();
+    assert_eq!(
+        target.research_journey(&main, 0, 86400).await.unwrap(),
+        store.research_journey(&main, 0, 86400).await.unwrap()
+    );
+    drop(target);
+    drop(store);
+    for file in [path, archive, target_path] {
+        let _ = std::fs::remove_file(file);
+    }
+}
+
+#[tokio::test]
+async fn project_star_persists_and_preserves_recency() {
+    let tmp = std::env::temp_dir().join(format!("wisp_star_{}.sqlite", uuid::Uuid::new_v4()));
+    let store = Store::open(&tmp).await.unwrap();
+    store.create_project("old", "Old", "").await.unwrap();
+    store.create_project("new", "New", "").await.unwrap();
+    sqlx::query("UPDATE projects SET updated_at=CASE id WHEN 'old' THEN 10 ELSE 20 END")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    assert!(store.starred_project_ids().await.unwrap().is_empty());
+    store.set_project_starred("old", true).await.unwrap();
+    store.set_project_starred("old", true).await.unwrap();
+    let rows = store.list_projects().await.unwrap();
+    assert_eq!(rows[0].0, "old");
+    assert_eq!(rows[0].4, 10);
+    store.set_project_starred("new", true).await.unwrap();
+    assert_eq!(store.list_projects().await.unwrap()[0].0, "new");
+    store.set_project_starred("new", false).await.unwrap();
+    store.pool.close().await;
+    let store = Store::open(&tmp).await.unwrap();
+    assert!(store.starred_project_ids().await.unwrap().contains("old"));
+    assert_eq!(store.list_projects().await.unwrap()[0].0, "old");
+    store.set_project_starred("old", false).await.unwrap();
+    assert_eq!(store.list_projects().await.unwrap()[0].0, "new");
+    assert!(store.set_project_starred("missing", true).await.is_err());
+    store
+        .create_project("scratch:test", "Scratch", "")
+        .await
+        .unwrap();
+    assert!(store
+        .set_project_starred("scratch:test", true)
+        .await
+        .is_err());
+    // Simulate an older database and rerun the idempotent migration.
+    sqlx::query("ALTER TABLE projects DROP COLUMN starred")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM wisp_schema_migrations WHERE version=?")
+        .bind(PROJECT_STARS_MIGRATION)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    store.pool.close().await;
+    let store = Store::open(&tmp).await.unwrap();
+    Store::migrate(&store.pool).await.unwrap();
+    assert!(store.starred_project_ids().await.unwrap().is_empty());
+    store.set_project_starred("old", true).await.unwrap();
+    store.delete_project("old").await.unwrap();
+    assert!(store.starred_project_ids().await.unwrap().is_empty());
     store.pool.close().await;
     let _ = std::fs::remove_file(tmp);
 }

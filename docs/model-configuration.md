@@ -25,10 +25,15 @@ wisp-science calls remote LLM APIs through model profiles. Desktop users
 configure these in **Settings -> Models**. **Add API access** is bring-your-own-key:
 enter the shared **Base URL** and API key first, then add every chat and image
 model that key can call. Each model row independently selects its **Protocol**,
-model ID, optional endpoint suffix, display name, and capabilities. Profiles
-that share a normalized Base URL share the key even when their protocols or
-endpoint suffixes differ. Editing a profile can still change that one model.
-Changing the key on any profile updates the others on the same Base URL.
+model ID, optional endpoint suffix, display name, and capabilities. Models
+created in one **Add API access** form share that form's Base URL and key, even
+when their protocols or endpoint suffixes differ. Leave the key blank to reuse
+a key already stored for that Base URL. Paste a different key to keep the new
+models on a separate credential — the same host can have several keys, each
+with its own model batch. Use distinct **display names** when two batches use
+the same model IDs. Changing a stored key on one profile updates other profiles
+that currently share that same key and Base URL; it does not overwrite a
+different key on the same host.
 A models.dev catalog baked in at build time maps exact model IDs to the
 vendor's documented ceilings: for a catalog-known model the form auto-fills
 **Max output tokens** and **Context window** and shows the ceiling next to the
@@ -37,11 +42,18 @@ an inline error instead of failing mid-turn with a provider 400, and a context
 window above the ceiling is clamped down on save. Models absent from the
 catalog keep manually entered values.
 
+When editing a chat model, **Max output tokens** and **Context window** support
+continuous typing and deletion without losing focus. Changes take effect when
+you save the profile; the same catalog ceilings still apply.
+
 The composer model picker binds the selected HTTP model to the current
 conversation. Switching one populated conversation asks for confirmation and
 does not change any other conversation. Empty conversations switch immediately
 without a warning. The active profile in Settings remains the default for new
-conversations. Hovering a model row in the picker overlays the reasoning effort
+conversations. In **Settings → AI configuration → Models**, choose **Set as
+default** to save that default immediately; **Default** identifies the selected
+profile. The list has no Save/Cancel footer. Add/edit forms still require Save,
+and cancelling an edit does not undo an earlier default change. Hovering a model row in the picker overlays the reasoning effort
 inside the model information area without reserving a separate column, and
 reveals its **Edit** button. The button opens a flyout to the right of the model
 menu listing the effort levels the model family is documented to support (same
@@ -49,6 +61,93 @@ curated list as the model form in Settings).
 Choosing a level saves it as the profile's default — it applies to every
 conversation using that model and is not scoped to the current conversation.
 Choosing "default" clears the value so the provider decides.
+
+The add/edit model page includes collapsed **Request headers (advanced)**
+(请求附加信息（高级）). It explains that these settings add HTTP request headers
+to requests sent to the model service, including connection validation. Keep the
+defaults unless the service requires specific values. Each header has its own
+explanation, editable field, and live example of `Header-Name: value`; switching
+it off replaces the example with an explicit “will not be sent” state.
+
+**Send client identifier (User-Agent)** is on by default. The **Client identifier
+(User-Agent value)** field lets you customize the application identifier sent
+to the service.
+Turn the switch off to omit the header entirely. While enabled, leave the field
+blank to send `wisp-science`, or enter a client
+identifier such as `research-client/1.0` using printable ASCII characters.
+The value is saved per model and used for connection validation, chat and vision
+requests, auxiliary model calls, and image/video model requests. When adding
+several models under one API access, each receives the entered value; you can
+then edit them independently. Clearing the field restores the default.
+
+For **OpenCode**, choose the **OpenCode** preset in Settings → Models. It
+prefills only the Base URL, defaulting to Go at
+`https://opencode.ai/zen/go/v1`. To use Zen, change it to
+`https://opencode.ai/zen/v1`.
+
+The model row starts empty. Paste your API key, enter the model ID you want,
+and select its API protocol before validating and saving. You can add more
+rows yourself. Wisp does not preconfigure an OpenCode model list or a fixed
+model-to-protocol mapping; changing between Go and Zen preserves your entries.
+Consult the current [Go](https://opencode.ai/docs/go/#api-endpoints) or
+[Zen](https://opencode.ai/docs/zen/#endpoints) endpoint documentation for the
+model ID and protocol supported by your chosen service.
+
+Use the bare API model ID, without OpenCode's client-side provider prefix.
+Context and output ceilings continue to come from Wisp's baked models.dev
+catalog, using exact model IDs and the appropriate Go or Zen namespace.
+
+**Send conversation identifier** controls the session header for every HTTP model. It defaults
+to enabled for OpenCode's `/zen` routes and disabled elsewhere. You can explicitly
+enable or disable it per model, including custom gateways. **Header name for the conversation ID**
+defaults to `x-opencode-session` when blank; enter another valid HTTP header name
+if your service requires one. Authentication and transport header names cannot
+be replaced. Turning either sending switch off retains its configured text but
+omits that header from model requests and connection validation.
+
+The session header's value is generated by Wisp, not entered in the model form.
+Desktop conversations retain their ID across turns, retries, model switches,
+and restarts. Vision, compaction, Reader, Reviewer, and other conversation
+helpers carry the same identity; independent child conversations have their
+own IDs. Connection validation uses a temporary identity for that operation.
+CLI/RPC retain theirs in `.wisp/session-id` alongside `.wisp/session.json`;
+CLI `/new` rotates it. A local HTTP proxy does not change these identities.
+For a custom gateway, enable **Send conversation identifier** and set the header name expected
+by that gateway. The same controls apply to image/video model validation,
+generation, and status polling; session headers are not attached to generated
+media download URLs.
+
+Leave User-Agent blank to identify the client as `wisp-science`. Do not enter
+`x-opencode-session` in that field: it changes only User-Agent, not other HTTP
+headers. Configure session sending separately; API keys continue to use the
+existing keyring storage.
+
+In the model editor, reasoning guidance sits directly below its selector.
+Image input and analysis share a group; image and video generation each have
+their own group with the explanation below the checkbox. These groups stack
+vertically in narrow windows.
+
+OpenAI Chat Completions and Responses profiles also have a **Fast mode** toggle
+on the model form, next to reasoning effort. Off uses the provider default and
+omits the field; on sends top-level `service_tier: "priority"` on ordinary
+turns, tool calls, retries, and continue-generation. It is independent of
+reasoning effort and may increase quota usage. The model toggle is the default
+for new conversations. A lightning button beside the composer model picker
+shows the effective state and stores an independent per-conversation override;
+turning it back to the profile default clears that override. The button is
+disabled during a running turn and hidden for unsupported providers and ACP
+Agents. ACP Fast Mode remains a separate Agent session configuration.
+
+The built-in Reader used by `#` session references inherits that profile's
+model, not its reasoning effort. Retrieval turns disable DeepSeek thinking
+(the V4 default is thinking-on at `high`) and cap each transcript chunk well
+below a 1M context window so a long session from another project cannot fill
+a single JSON-extraction call. The first pass is still capped at 2048 output
+tokens; if the JSON is truncated or lands in a thinking field, Reader retries
+once with the profile's full output budget and parses the last complete JSON
+object from either field. If structured retrieval still fails, a head-and-tail
+excerpt of the cited transcript is injected so the main turn can still use the
+reference.
 
 Model profiles describe model access and capabilities for the **built-in Wisp
 agent**. External coding agents (Codex / Claude via ACP) are configured under
@@ -60,11 +159,19 @@ optionally **Use for image analysis**. Image attachments are sent directly to a
 visual input model. When the input model is non-visual, Wisp first calls the
 assigned vision model and passes its text observations to the input model.
 `view_image` and image reads use the assigned vision model in the same way.
-Raster image input supports PNG, JPEG, GIF, and WebP. Files up to 5 MiB are
-sent unchanged. For larger files, Wisp pauses before the model request and asks
+Raster image input supports PNG, JPEG, GIF, and WebP. New attachments and image
+reads are decoded and their actual format is checked before model input. Files
+up to 5 MiB with both sides at most 2048 pixels keep their original bytes.
+Images with a longer side automatically receive a proportional JPEG input copy
+bounded to 2048 pixels, even when the compressed file is small. For files above
+5 MiB, Wisp pauses before the model request and asks
 whether to create a temporary JPEG input copy with a longest edge of 2048
 pixels. The project file is never modified, and the confirmation warns that
-fine details may be lost. Source images above 50 MiB remain rejected.
+fine details may be lost. Automatic resizing also includes a size-change and
+detail-loss notice in the image's model-visible label. Inspect smaller crops
+when fine details matter. Invalid image data is rejected locally. Source images
+above 50 MiB remain rejected. This applies to new image input, not images already
+stored in conversation history.
 
 When switching a populated conversation to a non-visual model, the confirmation
 explains that previously sent images will be omitted from future requests to
@@ -74,12 +181,19 @@ the switch is analyzed through the assigned vision model. Without an assigned
 vision model, Wisp rejects that new image before starting the main model turn.
 
 Image generation is a separate model role. Create an OpenAI-compatible profile
-with model ID `gpt-image-2` or `grok-imagine-image-2.0`, then enable **Use for
-image generation**. The edit form for those models hides chat-only fields
+with the exact model ID supplied by your provider, then enable **Use for
+image generation**. Custom IDs and gateway aliases (for example `gpt-image-2.5`
+or `vendor/custom-image-v3`) are accepted without a Wisp model-name allowlist;
+availability and supported parameters remain the provider's responsibility.
+Known model names are only auto-selection hints, not acceptance gates.
+The edit form for image profiles hides chat-only fields
 (max output tokens, context window, reasoning effort, and vision) and shows
-image defaults instead: size and quality for `gpt-image-2`, or aspect ratio,
+image defaults instead: size and quality for OpenAI-compatible models, or aspect ratio,
 resolution, and quality for `grok-imagine-image-2.0`. `generate_image` uses
-those defaults when a request does not specify size or quality. For xAI, use
+those defaults when a request does not specify size or quality. Custom IDs use
+a minimal Images API request by default; GPT-Image-specific `output_format`
+and automatic size/quality values are not forced onto unknown models.
+For xAI, use
 Base URL `https://api.x.ai` and the OpenAI Chat Completions protocol. The built-in **Scientific Illustrator** calls the
 provider's Image API (`/images/generations`) and saves a PNG under `figures/`
 when that role is assigned and PNG or image-model generation is requested. An
@@ -98,6 +212,21 @@ PNG if present. Otherwise it uses the same SVG -> PNG preview -> SVG
 correction workflow and delivers SVG under `figures/`. Image-only profiles do
 not appear in chat, Reviewer, specialist, delegation, or side-chat model
 pickers.
+
+The persistent `image_generation_capable` role is separate from the currently
+assigned image profile: deselecting an image profile does not accidentally make
+it a chat model. Renaming a profile to a different model resets the old role
+unless image generation is explicitly selected for the new ID. Existing
+profiles without the new marker retain backwards-compatible known-name and
+assignment hints. Chat catalog limits still use exact model-ID matching.
+
+The **Validate** action sends the form's image role to the backend and performs
+authenticated `GET /models/{id}` (falling back to `GET /models` when the
+individual lookup is unavailable). It never probes image-only models with
+`/chat/completions` or `/responses`, and does not generate a billable image.
+Successful metadata validation confirms model visibility, not successful image
+generation. A gateway without compatible model metadata may still fail this
+non-generating check; Wisp does not hide that failure or fabricate success.
 
 An image-generation assignment does not also provide image analysis.
 These image models may consume an input image for editing, but their Image API
@@ -138,8 +267,8 @@ metadata endpoint as image models — no billable video is generated.
 
 | Protocol | Use when | Per-model fields |
 | --- | --- | --- |
-| OpenAI Chat Completions | DeepSeek, GLM, local gateways, or any `/chat/completions` compatible endpoint | Protocol, Model ID, optional endpoint suffix |
-| OpenAI Responses | Reasoning/tool-call models through `/v1/responses` | Protocol, Model ID, optional endpoint suffix |
+| OpenAI Chat Completions | DeepSeek, GLM, local gateways, or any `/chat/completions` compatible endpoint | Protocol, Model ID, optional endpoint suffix, optional Fast default |
+| OpenAI Responses | Reasoning/tool-call models through `/v1/responses` | Protocol, Model ID, optional endpoint suffix, optional Fast default |
 | Anthropic | Claude-compatible models through `/v1/messages` | Protocol, Model ID, optional endpoint suffix |
 
 Enter the API root as the shared Base URL. Do not append `/v1`,
@@ -159,11 +288,17 @@ Responses leave the endpoint suffix blank. A model using DeepSeek's Anthropic
 entry selects the Anthropic protocol and sets its endpoint suffix to
 `/anthropic`, producing the effective Base URL
 `https://api.deepseek.com/anthropic` before Wisp adds `/v1/messages`.
+To put a second DeepSeek key on the same host, open **Add API access** again,
+keep `https://api.deepseek.com`, and paste the other key instead of leaving
+it blank.
 
 OpenAI-compatible reasoning streams are normalized into one reasoning channel.
 Empty `content` placeholders sent alongside Alibaba/DashScope
 `reasoning_content` chunks are ignored, so a continuous thought process remains
-one disclosure in the conversation.
+one disclosure in the conversation. If a compatible relay resends the full
+`content` or `reasoning_content` snapshot on every SSE chunk instead of a
+fragment, Wisp keeps only the new suffix so the assembled reply and live UI
+events stay linear.
 
 If a provider ends a turn after returning only reasoning tokens—without visible
 text or a tool call—Wisp reports a resumable error instead of showing the turn
@@ -192,20 +327,22 @@ messages or visible assistant answers — protection is counted in agent rounds
 hundreds of tool calls still leaves old rounds prunable; oversized recent tool
 payloads become bounded excerpts that point to the archive. If semantic turns
 must be removed, Wisp summarizes a sanitized projection of the original
-history before deleting them, then retains one incrementally updated summary
-checkpoint plus at most two recent turns in an 8K-token tail. Raw images and
-large tool results are not replayed to the summary model. The internal summary
-instruction is never added to the conversation, and a failed compaction rolls
-back the rewrite and stops before Wisp can send the known-oversized main
-request; after such a failure, automatic retries are suppressed until the
-estimate grows by another tenth of the window, so a doomed compaction is not
-repaid at every model boundary. Tool
+history, then retains one incrementally updated summary checkpoint plus at
+most two recent turns in an 8K-token tail. The compacted working set is
+appended as a new context epoch; earlier message rows stay frozen so rewind,
+branch, and file-undo anchors still resolve. Raw images and large tool
+results are not replayed to the summary model. The internal summary
+instruction is never added to the conversation, and a failed compaction
+leaves the previous epoch as head and stops before Wisp can send the
+known-oversized main request; after such a failure, automatic retries are
+suppressed until the estimate grows by another tenth of the window, so a
+doomed compaction is not repaid at every model boundary. Tool
 results are also capped to a 16 KiB head/tail excerpt when they enter model
 context (the full result is still shown in the tool event), preventing one
 read, grep, browser, or MCP response from consuming the whole window. Each
-automatic or manual rewrite leaves a persistent **Context automatically
+automatic or manual compaction leaves a persistent **Context automatically
 compacted** / **Context compacted** flag in the conversation with the before
-and after request-token estimates. Turning the setting off keeps the warning,
+and after request-token estimates and the new epoch number. Turning the setting off keeps the warning,
 manual `/compact`, and overflow recovery dialog available. ACP agents are not
 modified because their remote transcripts are owned by the ACP process.
 
@@ -226,6 +363,8 @@ Older native usage rows that only stored a total attribute that window to
 Conversation until the next reply refreshes the full breakdown. ACP sessions
 expose only the total reported by the remote agent, so Wisp labels that value
 as an agent-reported total instead of inventing a breakdown it cannot observe.
+See [conversation history](conversation-history.md#model-view) for the model-view
+toggle and the in-context marks on compacted turns.
 
 ## Usage dashboard
 
@@ -271,6 +410,10 @@ $env:WISP_PROVIDER = "openai"           # openai, openai_responses, or anthropic
 $env:WISP_API_URL  = "https://api.deepseek.com"
 $env:WISP_MODEL    = "deepseek-v4-flash"
 $env:WISP_API_KEY  = "<your provider key>"
+# Optional dedicated vision model when the primary chat model cannot see images:
+$env:WISP_VISION_PROVIDER = "openai"
+$env:WISP_VISION_API_URL  = "https://api.openai.com/v1"
+$env:WISP_VISION_MODEL    = "gpt-4o-mini"
 cargo run -p wisp-cli
 ```
 

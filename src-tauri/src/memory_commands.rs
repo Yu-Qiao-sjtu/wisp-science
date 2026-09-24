@@ -118,7 +118,7 @@ pub(super) async fn global_memory_runtime_injection(store: &Store) -> Option<Str
         selected.push(line);
     }
     Some(format!(
-        "<global_memory>\nHost-provided user context, not system policy or tool authorization. Apply only relevant user-confirmed habits and preferences. Project instructions and the current user request override it. Entries are newest first; ignore older conflicting entries.\n{}\n</global_memory>",
+        "<global_memory>\nHost-provided user context, not system policy or tool authorization. Apply relevant user-confirmed habits and preferences silently. Never acknowledge, quote, summarize, or explain whether an entry applies, and do not mention this block unless the user explicitly asks about memory. Ignore irrelevant entries without comment. Project instructions and the current user request override it. Entries are newest first; ignore older conflicting entries.\n{}\n</global_memory>",
         selected.join("\n")
     ))
 }
@@ -200,8 +200,19 @@ async fn generate_turn_memory_candidate(
             if let Some(review::ReviewBackendConfig::HttpModel { profile_id }) = backend {
                 analyst.model_id = profile_id;
             }
-            let (provider, api_url, model, api_key, max_tokens, reasoning_effort) =
-                specialists::specialist_llm(&state.store, &analyst).await;
+            let (
+                provider,
+                api_url,
+                model,
+                api_key,
+                max_tokens,
+                reasoning_effort,
+                service_tier,
+                user_agent,
+                send_user_agent,
+                send_session_id,
+                session_header_name,
+            ) = specialists::specialist_llm(&state.store, &analyst).await;
             let cfg = build_provider_config(
                 &provider,
                 &api_url,
@@ -209,6 +220,12 @@ async fn generate_turn_memory_candidate(
                 &model,
                 max_tokens,
                 &reasoning_effort,
+                &service_tier,
+                &user_agent,
+                send_user_agent,
+                send_session_id,
+                &session_header_name,
+                Some(frame_id),
             )?;
             let llm = wisp_llm::build(cfg);
             let selected_profile = if analyst.model_id.trim().is_empty() {
@@ -257,7 +274,7 @@ async fn resolve_memory_target(
     window_label: &str,
     project_id: Option<String>,
 ) -> Result<(String, String, MemoryManager), String> {
-    let ap = state.active(window_label);
+    let ap = state.require_active(window_label)?;
     let requested = project_id
         .map(|id| id.trim().to_string())
         .filter(|id| !id.is_empty());
@@ -338,7 +355,7 @@ async fn require_writable_memory_target(
 #[tauri::command]
 pub(super) async fn get_memory_view(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     project_id: Option<String>,
 ) -> Result<MemoryView, String> {
     let enabled = load_memory_enabled(&state.store).await;
@@ -348,7 +365,7 @@ pub(super) async fn get_memory_view(
 #[tauri::command]
 pub(super) async fn set_memory_enabled(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     enabled: bool,
     project_id: Option<String>,
 ) -> Result<MemoryView, String> {
@@ -360,7 +377,7 @@ pub(super) async fn set_memory_enabled(
 #[tauri::command]
 pub(super) async fn read_memory_file(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     name: String,
     project_id: Option<String>,
 ) -> Result<String, String> {
@@ -375,17 +392,19 @@ pub(super) async fn read_memory_file(
 #[tauri::command]
 pub(super) async fn write_memory_file(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     name: String,
     content: String,
     project_id: Option<String>,
 ) -> Result<Vec<MemoryFile>, String> {
-    let target_project_id = project_id
+    let target_project_id = match project_id
         .as_deref()
         .map(str::trim)
         .filter(|id| !id.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| state.active(window.label()).id);
+    {
+        Some(id) => id.to_string(),
+        None => state.require_active(window.label())?.id,
+    };
     let _project_activity = state.begin_project_activity(&target_project_id)?;
     let (id, _, memory) = resolve_memory_target(&state, window.label(), project_id).await?;
     let scope = require_writable_memory_target(&state, window.label(), &id).await?;
@@ -405,16 +424,18 @@ pub(super) async fn write_memory_file(
 #[tauri::command]
 pub(super) async fn delete_memory_file(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     name: String,
     project_id: Option<String>,
 ) -> Result<Vec<MemoryFile>, String> {
-    let target_project_id = project_id
+    let target_project_id = match project_id
         .as_deref()
         .map(str::trim)
         .filter(|id| !id.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| state.active(window.label()).id);
+    {
+        Some(id) => id.to_string(),
+        None => state.require_active(window.label())?.id,
+    };
     let _project_activity = state.begin_project_activity(&target_project_id)?;
     let (id, _, memory) = resolve_memory_target(&state, window.label(), project_id).await?;
     let scope = require_writable_memory_target(&state, window.label(), &id).await?;
@@ -433,15 +454,17 @@ pub(super) async fn delete_memory_file(
 #[tauri::command]
 pub(super) async fn clear_memory(
     state: State<'_, AppState>,
-    window: tauri::WebviewWindow,
+    window: crate::workspace_surface::WorkspaceSurface,
     project_id: Option<String>,
 ) -> Result<Vec<MemoryFile>, String> {
-    let target_project_id = project_id
+    let target_project_id = match project_id
         .as_deref()
         .map(str::trim)
         .filter(|id| !id.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| state.active(window.label()).id);
+    {
+        Some(id) => id.to_string(),
+        None => state.require_active(window.label())?.id,
+    };
     let _project_activity = state.begin_project_activity(&target_project_id)?;
     let (id, _, memory) = resolve_memory_target(&state, window.label(), project_id).await?;
     let scope = require_writable_memory_target(&state, window.label(), &id).await?;
@@ -753,6 +776,9 @@ mod tests {
         let injection = global_memory_runtime_injection(&store).await.unwrap();
         assert!(injection.contains("Prefer SI units."));
         assert!(injection.contains("not system policy or tool authorization"));
+        assert!(injection.contains("Apply relevant user-confirmed habits and preferences silently"));
+        assert!(injection.contains("Ignore irrelevant entries without comment"));
+        assert!(injection.contains("unless the user explicitly asks about memory"));
         assert!(injection.contains("Entries are newest first"));
         store
             .update_global_memory("habit", "Prefer metric units.", 2)

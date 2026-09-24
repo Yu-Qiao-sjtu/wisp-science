@@ -1,4 +1,7 @@
 // Tauri v2 shim + scientific preview mounts (single file so Trunk ships one snippet).
+import { highlight_root } from "./highlight.js";
+import { injectMcpAppCsp, injectMotifWispBridge } from "/mcp_app_protocol.js";
+import { isolatedApps, mountIsolatedApp, suspendIsolatedApp, closeIsolatedApp, isolatedAction, useIsolatedHost } from "/mcp_app_isolated.js";
 
 function tauriCore() {
   return window.__TAURI__?.core;
@@ -6,6 +9,58 @@ function tauriCore() {
 
 function tauriEvent() {
   return window.__TAURI__?.event;
+}
+
+let uiHealthStarted = false;
+let reportUiHealth = () => {};
+const uiHealth = { timerLagMs: 0, longTasks: 0, longestTaskMs: 0, scriptErrors: 0, unhandledRejections: 0, appMessages: 0 };
+const boundedHealthCount = (value) => Math.min(1_000_000, Math.max(0, Math.round(value) || 0));
+
+export function report_ui_health() { void reportUiHealth(); }
+
+/** Numeric diagnostics only. The heartbeat is driven by the WASM app timer,
+ * so a broken WASM callback cannot be masked by an independent healthy JS timer. */
+export function start_ui_health() {
+  if (uiHealthStarted) return;
+  uiHealthStarted = true;
+  window.addEventListener("error", () => { uiHealth.scriptErrors = boundedHealthCount(uiHealth.scriptErrors + 1); });
+  window.addEventListener("unhandledrejection", () => { uiHealth.unhandledRejections = boundedHealthCount(uiHealth.unhandledRejections + 1); });
+  if (typeof PerformanceObserver !== "undefined" && PerformanceObserver.supportedEntryTypes?.includes("longtask")) {
+    new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        uiHealth.longTasks = boundedHealthCount(uiHealth.longTasks + 1);
+        uiHealth.longestTaskMs = Math.max(uiHealth.longestTaskMs, boundedHealthCount(entry.duration));
+      }
+    }).observe({ type: "longtask" });
+  }
+  let lastTick = performance.now();
+  let inFlight = false;
+  const beat = async () => {
+    const now = performance.now();
+    const timerLagMs = document.visibilityState === "visible" ? boundedHealthCount(now - lastTick - 5000) : 0;
+    uiHealth.timerLagMs = Math.max(uiHealth.timerLagMs, timerLagMs);
+    lastTick = now;
+    if (inFlight || !tauriCore()) return;
+    inFlight = true;
+    let activeApps = 0;
+    let parkedApps = 0;
+    for (const instance of [...mcpAppInstances.values(), ...isolatedApps.values()]) {
+      if (instance.target?.isConnected) activeApps += 1;
+      else parkedApps += 1;
+    }
+    const snapshot = { ...uiHealth, activeApps, parkedApps,
+      mediaBlobUrls, mediaBlobBytes, mediaOwners: mediaOwners.size,
+      dragOverlays: document.querySelectorAll(".drag-overlay").length };
+    // Counters are cumulative and bounded: a once-per-minute backend log cannot
+    // miss a brief error or message burst between its sampled heartbeats.
+    try { await invoke_timeout("ui_heartbeat", { snapshot }, 4000); }
+    catch { /* A failed IPC must not create its own rejection storm. */ }
+    finally { inFlight = false; }
+  };
+  reportUiHealth = beat;
+  document.addEventListener("visibilitychange", () => { lastTick = performance.now(); });
+  window.addEventListener("focus", () => { lastTick = performance.now(); });
+  void beat();
 }
 
 export function is_windows() {
@@ -26,6 +81,20 @@ export async function window_control(action) {
   if (action === "minimize") return current.minimize();
   if (action === "toggle-maximize") return current.toggleMaximize();
   if (action === "close") return current.close();
+}
+
+/** Native window title (taskbar / Alt-Tab / macOS title bar) plus `document.title`. */
+export async function set_window_title(title) {
+  if (typeof document !== "undefined") {
+    document.title = title;
+  }
+  const current = window.__TAURI__?.window?.getCurrentWindow?.();
+  if (!current?.setTitle) return;
+  try {
+    await current.setTitle(title);
+  } catch {
+    // Browser mock or missing capability — `document.title` still updated.
+  }
 }
 
 /** Caption-style move so Windows Aero Snap / edge snap can engage. */
@@ -84,17 +153,37 @@ export async function invoke(cmd, args) {
     return null;
   }
   try {
-    return await core.invoke(cmd, args ?? {});
+    return await invoke_strict(cmd, args);
   } catch (err) {
     console.error(`Tauri command failed: ${cmd}`, err);
     return null;
   }
 }
 
+// The optimistic queue card can be clicked before enqueue_turn finishes its
+// backend validation. Preserve that action until this exact item exists;
+// unrelated sessions/items and ordinary invokes must remain independent.
+const pendingEnqueues = new Map();
+
 export async function invoke_strict(cmd, args) {
   const core = tauriCore();
   if (!core) {
     throw missingBridgeError(cmd);
+  }
+  if (cmd === "enqueue_turn" || cmd === "queued_turn_action") {
+    const arg = (key) => args instanceof Map ? args.get(key) : args?.[key];
+    const key = JSON.stringify([arg("sessionId"), arg("id")]);
+    if (cmd === "enqueue_turn") {
+      const pending = Promise.resolve().then(() => core.invoke(cmd, args ?? {}));
+      pendingEnqueues.set(key, pending);
+      try {
+        return await pending;
+      } finally {
+        if (pendingEnqueues.get(key) === pending) pendingEnqueues.delete(key);
+      }
+    }
+    const pending = pendingEnqueues.get(key);
+    if (pending) await pending;
   }
   return core.invoke(cmd, args ?? {});
 }
@@ -650,10 +739,256 @@ export async function copy_share_pack(text, pngBase64) {
   await navigator.clipboard.write([new ClipboardItem(record)]);
 }
 
+function shareCssTransparent(color) {
+  return !color || color === "transparent" || color === "rgba(0, 0, 0, 0)";
+}
+
+function shareComputedFont(style) {
+  if (style.font && style.font !== "0px") return style.font;
+  return `${style.fontStyle || "normal"} ${style.fontWeight || "400"} ${style.fontSize || "14px"} ${style.fontFamily || SHARE_SERIF}`;
+}
+
+/** Paint one element's background and border using already-resolved styles. */
+function paintShareBox(ctx, el, style, ox, oy) {
+  const rect = el.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return;
+  const x = rect.left - ox;
+  const y = rect.top - oy;
+  const w = rect.width;
+  const h = rect.height;
+  const radius = Math.min(
+    parseFloat(style.borderTopLeftRadius) || 0,
+    w / 2,
+    h / 2,
+  );
+  const bg = style.backgroundColor;
+  if (!shareCssTransparent(bg)) {
+    ctx.fillStyle = bg;
+    shareRoundRect(ctx, x, y, w, h, radius);
+    ctx.fill();
+  }
+  const sides = ["Top", "Right", "Bottom", "Left"];
+  const widths = sides.map((side) => parseFloat(style[`border${side}Width`]) || 0);
+  const styles = sides.map((side) => style[`border${side}Style`]);
+  const colors = sides.map((side) => style[`border${side}Color`]);
+  const painted = widths.some((width, i) => width > 0 && styles[i] !== "none");
+  if (!painted) return;
+  const uniform = widths.every((width) => width === widths[0])
+    && styles.every((value) => value === styles[0])
+    && colors.every((value) => value === colors[0]);
+  if (uniform) {
+    ctx.strokeStyle = colors[0];
+    ctx.lineWidth = widths[0];
+    shareRoundRect(
+      ctx,
+      x + widths[0] / 2,
+      y + widths[0] / 2,
+      Math.max(0, w - widths[0]),
+      Math.max(0, h - widths[0]),
+      Math.max(0, radius - widths[0] / 2),
+    );
+    ctx.stroke();
+    return;
+  }
+  const edges = [
+    [x, y + widths[0] / 2, x + w, y + widths[0] / 2, 0],
+    [x + w - widths[1] / 2, y, x + w - widths[1] / 2, y + h, 1],
+    [x, y + h - widths[2] / 2, x + w, y + h - widths[2] / 2, 2],
+    [x + widths[3] / 2, y, x + widths[3] / 2, y + h, 3],
+  ];
+  for (const [x1, y1, x2, y2, i] of edges) {
+    if (widths[i] <= 0 || styles[i] === "none") continue;
+    ctx.strokeStyle = colors[i];
+    ctx.lineWidth = widths[i];
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+  }
+}
+
+/** Draw a list marker to the left of the first line; ::marker is not in the DOM. */
+function paintShareListMarker(ctx, el, style, ox, oy) {
+  if (el.tagName !== "LI") return;
+  const type = style.listStyleType;
+  if (!type || type === "none") return;
+  const marker = getComputedStyle(el, "::marker");
+  const range = document.createRange();
+  let first = null;
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  while (walker.nextNode()) {
+    if (!walker.currentNode.nodeValue || !walker.currentNode.nodeValue.trim()) continue;
+    range.selectNodeContents(walker.currentNode);
+    first = range.getBoundingClientRect();
+    break;
+  }
+  if (!first || first.height <= 0) first = el.getBoundingClientRect();
+  ctx.fillStyle = marker.color || style.color;
+  if (type === "disc" || type === "circle") {
+    ctx.beginPath();
+    ctx.arc(el.getBoundingClientRect().left - ox - 10, first.top - oy + first.height * 0.45, 2.2, 0, Math.PI * 2);
+    if (type === "circle") {
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = ctx.fillStyle;
+      ctx.stroke();
+    } else {
+      ctx.fill();
+    }
+    return;
+  }
+  if (type !== "decimal") return;
+  const list = el.parentElement;
+  const items = list ? [...list.children].filter((child) => child.tagName === "LI") : [el];
+  const start = Number(list && list.start ? list.start : 1) || 1;
+  const index = items.indexOf(el);
+  ctx.font = shareComputedFont(marker.font ? marker : style);
+  ctx.textAlign = "right";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillText(
+    `${start + Math.max(0, index)}.`,
+    el.getBoundingClientRect().left - ox - 8,
+    first.top - oy + first.height * 0.78,
+  );
+  ctx.textAlign = "left";
+}
+
+/** Paint a text node using the browser's already-wrapped line boxes. */
+function paintShareTextNode(ctx, node, ox, oy) {
+  const text = node.nodeValue;
+  if (!text || !node.parentElement) return;
+  const style = getComputedStyle(node.parentElement);
+  if (style.visibility === "hidden" || parseFloat(style.opacity || "1") === 0) return;
+  ctx.fillStyle = style.color;
+  ctx.font = shareComputedFont(style);
+  ctx.textBaseline = "top";
+  ctx.textAlign = "left";
+  if (ctx.letterSpacing !== undefined) ctx.letterSpacing = style.letterSpacing || "0px";
+  const range = document.createRange();
+  let i = 0;
+  while (i < text.length) {
+    range.setStart(node, i);
+    range.setEnd(node, i + 1);
+    const first = range.getBoundingClientRect();
+    if (first.width === 0 && first.height === 0) {
+      i += 1;
+      continue;
+    }
+    let j = i + 1;
+    while (j < text.length) {
+      range.setEnd(node, j + 1);
+      const next = range.getBoundingClientRect();
+      if (Math.abs(next.top - first.top) > 0.6) break;
+      j += 1;
+    }
+    const slice = text.slice(i, j);
+    if (slice && slice !== "\n") {
+      ctx.fillText(slice, first.left - ox, first.top - oy);
+    }
+    i = j;
+  }
+  if (ctx.letterSpacing !== undefined) ctx.letterSpacing = "0px";
+}
+
+function paintShareDom(ctx, node, ox, oy, alpha) {
+  if (node.nodeType === Node.TEXT_NODE) {
+    ctx.globalAlpha = alpha;
+    paintShareTextNode(ctx, node, ox, oy);
+    return;
+  }
+  if (node.nodeType !== Node.ELEMENT_NODE) return;
+  const el = node;
+  const tag = el.tagName;
+  if (tag === "SCRIPT" || tag === "STYLE" || tag === "LINK" || tag === "NOSCRIPT") return;
+  const style = getComputedStyle(el);
+  if (style.display === "none" || style.visibility === "hidden") return;
+  const nextAlpha = alpha * (parseFloat(style.opacity || "1") || 1);
+  if (nextAlpha <= 0) return;
+  ctx.globalAlpha = nextAlpha;
+  paintShareBox(ctx, el, style, ox, oy);
+  paintShareListMarker(ctx, el, style, ox, oy);
+  if (tag === "IMG" && el.naturalWidth) {
+    const rect = el.getBoundingClientRect();
+    try {
+      ctx.drawImage(el, rect.left - ox, rect.top - oy, rect.width, rect.height);
+    } catch {
+      // Cross-origin or broken images stay empty.
+    }
+    return;
+  }
+  for (const child of el.childNodes) paintShareDom(ctx, child, ox, oy, nextAlpha);
+}
+
+/**
+ * Mount assistant HTML with the live `.md` stylesheet, typeset KaTeX the same
+ * way chat does, then paint the laid-out DOM onto a canvas.
+ */
+async function rasterizeShareHtml(html, width) {
+  const host = document.createElement("div");
+  host.className = "body md share-raster";
+  host.setAttribute("aria-hidden", "true");
+  host.style.cssText = [
+    "position:fixed",
+    "left:-10000px",
+    "top:0",
+    `width:${Math.max(1, Math.round(width))}px`,
+    "max-width:none",
+    "margin:0",
+    "padding:0",
+    "pointer-events:none",
+    "z-index:-1",
+    "overflow:visible",
+    "background:transparent",
+  ].join(";");
+  host.innerHTML = html;
+  document.body.appendChild(host);
+  host.querySelectorAll("table").forEach((table) => {
+    table.style.display = "table";
+    table.style.overflow = "visible";
+    table.style.width = "100%";
+  });
+  const tableCount = host.querySelectorAll("table").length;
+  const mathCount = host.querySelectorAll(".math").length;
+  try {
+    await highlight_root(host);
+  } catch {
+    // Highlight/KaTeX stay best-effort; the HTML is still painted.
+  }
+  if (document.fonts?.ready) {
+    try { await document.fonts.ready; } catch { /* ignore */ }
+  }
+  try {
+    await document.fonts.load("16px KaTeX_Main");
+  } catch {
+    // KaTeX fonts are optional until the stylesheet finishes loading.
+  }
+  await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  const rect = host.getBoundingClientRect();
+  const w = Math.max(1, Math.ceil(Math.max(host.scrollWidth, rect.width)));
+  const h = Math.max(1, Math.ceil(Math.max(host.scrollHeight, rect.height)));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.ceil(w * SHARE_SCALE);
+  canvas.height = Math.ceil(h * SHARE_SCALE);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    host.remove();
+    throw new Error("Canvas is not available");
+  }
+  ctx.scale(SHARE_SCALE, SHARE_SCALE);
+  paintShareDom(ctx, host, rect.left, rect.top, 1);
+  ctx.globalAlpha = 1;
+  const katexCount = host.querySelectorAll(".katex").length;
+  host.remove();
+  return { canvas, width: w, height: h, tableCount, mathCount, katexCount };
+}
+
+function recordShareRasterInfo(info) {
+  if (typeof window !== "undefined") window.__shareRasterInfo = info;
+}
+
 /**
  * Draw the selected conversation as one tall PNG using the live chat theme.
- * Assistant rows are full-width prose (no card). User rows are the warm
- * panel bubble. Thinking is a left-border italic note.
+ * Assistant rows reuse chat HTML (tables + KaTeX) so the image matches the
+ * thread. User rows are the warm panel bubble. Thinking is a left-border note.
  * @param {string} payloadJson
  */
 export async function render_share_png(payloadJson) {
@@ -676,7 +1011,48 @@ export async function render_share_png(payloadJson) {
   const thinkLh = Math.round(thinkSize * 1.55);
   const bubbleMaxText = Math.floor(proseWidth * 0.78) - SHARE_BUBBLE_PAD_X * 2;
 
-  const laid = messages.map((message) => {
+  const rasters = [];
+  let tableCount = 0;
+  let mathCount = 0;
+  let katexCount = 0;
+  let usedHtml = false;
+  let fallback = false;
+  for (const message of messages) {
+    if (message.kind === "assistant" && typeof message.html === "string" && message.html) {
+      try {
+        const raster = await rasterizeShareHtml(message.html, proseWidth);
+        rasters.push(raster);
+        usedHtml = true;
+        tableCount += raster.tableCount;
+        mathCount += raster.mathCount;
+        katexCount += raster.katexCount;
+      } catch {
+        rasters.push(null);
+        fallback = true;
+      }
+    } else {
+      rasters.push(null);
+    }
+  }
+  recordShareRasterInfo({ usedHtml, fallback, tableCount, mathCount, katexCount });
+
+  const laid = messages.map((message, index) => {
+    const raster = rasters[index];
+    if (raster) {
+      const drawWidth = Math.min(raster.width, proseWidth);
+      const drawHeight = raster.width > 0
+        ? raster.height * (drawWidth / raster.width)
+        : raster.height;
+      return {
+        ...message,
+        mode: "html",
+        raster,
+        drawWidth,
+        drawHeight,
+        width: proseWidth,
+        height: Math.max(drawHeight, userLh),
+      };
+    }
     if (message.kind === "assistant" && Array.isArray(message.blocks)) {
       const blocks = layoutShareBlocks(measure, message.blocks, proseWidth, SHARE_SERIF);
       const contentHeight = blocks.reduce(
@@ -761,7 +1137,15 @@ export async function render_share_png(payloadJson) {
     ctx.fillText(label, user ? shareWidth - SHARE_PAD - labelWidth : SHARE_PAD, y + 10);
     y += 18;
 
-    if (message.mode === "prose") {
+    if (message.mode === "html") {
+      ctx.drawImage(
+        message.raster.canvas,
+        x,
+        y,
+        message.drawWidth,
+        message.drawHeight,
+      );
+    } else if (message.mode === "prose") {
       drawShareBlocks(ctx, message.blocks, x, y, proseWidth);
     } else if (message.mode === "thinking") {
       ctx.fillStyle = SHARE_COLORS.borderStrong;
@@ -815,7 +1199,48 @@ function pastedImageName(file, index) {
   return `pasted_image_${stamp}_${index + 1}.${ext}`;
 }
 
+export function paste_has_files(event) {
+  if (event?.pasteSnapshot) return event.hasFiles;
+  const data = event?.clipboardData;
+  return Array.from(data?.types || []).includes("Files")
+    || /^file:\/\//m.test(data?.getData("text/uri-list") || "");
+}
+
+// Snapshot while the event's data store is readable, before waiting on IPC.
+export function clipboard_paste_snapshot(event) {
+  return {
+    pasteSnapshot: true,
+    hasFiles: paste_has_files(event),
+    fileUris: event?.clipboardData?.getData("text/uri-list") || "",
+    images: pastedImageFiles(event),
+  };
+}
+
+// Share the native read between keydown (WebView2 may emit no paste event for
+// CF_HDROP) and paste. Never retain clipboard paths beyond the current gesture.
+let clipboardRead = null;
+export async function clipboard_file_paths(event) {
+  const uris = event?.fileUris ?? event?.clipboardData?.getData("text/uri-list") ?? "";
+  if (!event || !clipboardRead) {
+    const read = tauriCore()?.invoke("read_clipboard_file_paths", {}) ?? Promise.resolve([]);
+    clipboardRead = read;
+    setTimeout(() => { if (clipboardRead === read) clipboardRead = null; }, 100);
+  }
+  const nativePaths = await clipboardRead;
+  if (Array.isArray(nativePaths) && nativePaths.length) return nativePaths;
+  return uris.split(/\r?\n/).filter(line => line.startsWith("file://")).flatMap(line => {
+    try {
+      const url = new URL(line);
+      let path = decodeURIComponent(url.pathname);
+      if (url.hostname && url.hostname !== "localhost") path = `//${url.hostname}${path}`;
+      else if (/^\/[a-z]:\//i.test(path)) path = path.slice(1);
+      return [path];
+    } catch { return []; }
+  });
+}
+
 function pastedImageFiles(event) {
+  if (event?.pasteSnapshot) return event.images;
   const data = event?.clipboardData;
   if (!data) return [];
   const items = Array.from(data.items || []);
@@ -1026,6 +1451,239 @@ function normalizeRawBytes(value) {
   if (Array.isArray(value)) return Uint8Array.from(value);
   throw new Error("Binary preview command returned an unsupported payload");
 }
+
+// Cache slots, in-flight conversions and mounted DOM owners each hold a
+// reference. Eviction releases its reference; only the last release revokes
+// the URL, so a visible video or a small thumbnail sharing its source survives.
+const mediaUrlCache = { entries: new Map(), bytes: 0, limit: 64, maxBytes: 64 * 1024 * 1024 };
+const thumbnailCache = { entries: new Map(), bytes: 0, limit: 128, maxBytes: 16 * 1024 * 1024 };
+const mediaJobs = new Map();
+const thumbnailJobs = new Map();
+const mediaOwners = new Map(); // Element -> Map<slot, entry>; actual DOM lifetime, not reactive owner lifetime
+let mediaOwnerObserver;
+let mediaSweepTimer;
+let mediaBlobUrls = 0;
+let mediaBlobBytes = 0;
+
+function createMediaEntry(blob) {
+  const entry = { url: URL.createObjectURL(blob), bytes: blob.size, refs: 1 };
+  mediaBlobUrls += 1;
+  mediaBlobBytes += entry.bytes;
+  return entry;
+}
+
+function retainMedia(entry) {
+  entry.refs += 1;
+  return entry;
+}
+
+function releaseMedia(entry) {
+  if (--entry.refs !== 0) return;
+  URL.revokeObjectURL(entry.url);
+  mediaBlobUrls -= 1;
+  mediaBlobBytes -= entry.bytes;
+}
+
+function cacheMedia(cache, key, entry) {
+  if (cache.entries.has(key)) cache.entries.delete(key);
+  else {
+    retainMedia(entry);
+    cache.bytes += entry.bytes;
+  }
+  cache.entries.set(key, entry);
+  while (cache.entries.size > cache.limit || cache.bytes > cache.maxBytes) {
+    const oldest = cache.entries.keys().next().value;
+    const removed = cache.entries.get(oldest);
+    cache.entries.delete(oldest);
+    cache.bytes -= removed.bytes;
+    releaseMedia(removed);
+  }
+}
+
+// Each caller receives one reference, including concurrent callers. The job
+// keeps its own reference until every waiter has acquired its result, even if
+// other loads evict that result from the cache in the meantime.
+async function acquireMedia(cache, jobs, key, produce) {
+  const cached = cache.entries.get(key);
+  if (cached) {
+    retainMedia(cached);
+    cacheMedia(cache, key, cached);
+    return cached;
+  }
+  let job = jobs.get(key);
+  if (!job) {
+    job = { promise: produce(), waiters: 0 };
+    jobs.set(key, job);
+  }
+  job.waiters += 1;
+  let entry;
+  try {
+    entry = await job.promise;
+    if (!entry) return null; // failures are retryable and occupy no cache slot
+    retainMedia(entry);
+    cacheMedia(cache, key, entry);
+    return entry;
+  } finally {
+    if (--job.waiters === 0) {
+      jobs.delete(key);
+      if (entry) releaseMedia(entry);
+    }
+  }
+}
+
+function sweepMediaOwners() {
+  mediaSweepTimer = undefined;
+  for (const [owner, entries] of mediaOwners) {
+    if (owner.isConnected) continue;
+    mediaOwners.delete(owner);
+    for (const entry of entries.values()) releaseMedia(entry);
+  }
+  if (!mediaOwners.size) {
+    mediaOwnerObserver?.disconnect();
+    mediaOwnerObserver = undefined;
+  }
+}
+
+async function ownedMediaUrl(path, ownerId, kind, acquire) {
+  // A CSR resource may start just before its view is inserted. Yield once;
+  // never keep loading for a card which has already left the document.
+  let owner = document.getElementById(ownerId);
+  if (!owner) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    owner = document.getElementById(ownerId);
+  }
+  if (!owner) return null;
+  const slot = `${kind}:${path}`;
+  const existing = mediaOwners.get(owner)?.get(slot);
+  if (existing) return existing.url;
+  let entry;
+  try { entry = await acquire(String(path || "")); }
+  catch { return null; }
+  if (!entry) return null;
+  if (!owner.isConnected) {
+    releaseMedia(entry);
+    return null;
+  }
+  let entries = mediaOwners.get(owner);
+  if (!entries) mediaOwners.set(owner, entries = new Map());
+  const previous = entries.get(slot);
+  if (previous) {
+    releaseMedia(entry);
+    return previous.url;
+  }
+  entries.set(slot, entry); // transfer the caller's reference to the DOM owner
+  if (!mediaOwnerObserver) {
+    mediaOwnerObserver = new MutationObserver((records) => {
+      if (mediaSweepTimer === undefined && records.some((record) => record.removedNodes.length)) {
+        // Coalesce streaming mutations; a node moved within the document keeps
+        // its lease. No full-document media scan or permanent polling timer.
+        mediaSweepTimer = setTimeout(sweepMediaOwners, 0);
+      }
+    });
+    mediaOwnerObserver.observe(document.documentElement, { childList: true, subtree: true });
+  }
+  return entry.url;
+}
+
+function mediaBytesCommand(path) {
+  // Mirrors `previewBytes`'s command selection for the four path spellings.
+  if (path.startsWith("artifact-version:")) {
+    return { command: "read_artifact_version_bytes", args: { versionId: path.slice("artifact-version:".length) } };
+  }
+  if (path.startsWith("artifact:")) {
+    return { command: "read_artifact_bytes", args: { id: path.slice("artifact:".length) } };
+  }
+  if (path.startsWith("remote:ssh:")) {
+    const withoutPrefix = path.slice("remote:ssh:".length);
+    const separator = withoutPrefix.indexOf(":");
+    if (separator <= 0 || separator === withoutPrefix.length - 1) {
+      throw new Error("Remote media path is invalid");
+    }
+    return {
+      command: "read_remote_file_bytes",
+      args: {
+        contextId: `ssh:${withoutPrefix.slice(0, separator)}`,
+        path: withoutPrefix.slice(separator + 1),
+      },
+    };
+  }
+  return { command: "read_file_bytes", args: { path } };
+}
+
+function acquireFullMedia(key) {
+  return acquireMedia(mediaUrlCache, mediaJobs, key, async () => {
+    if (!key || !tauriCore()) return null;
+    const { command, args } = mediaBytesCommand(key);
+    const bytes = normalizeRawBytes(await tauriCore().invoke(command, args));
+    return createMediaEntry(new Blob([bytes], { type: blobMime(bytes) }));
+  });
+}
+
+/** The unique owner element must remain mounted for the returned URL's use. */
+export function media_url(path, ownerId) {
+  return ownedMediaUrl(path, ownerId, "full", acquireFullMedia);
+}
+
+const THUMB_MAX_EDGE = 384;
+
+export function media_thumbnail_url(path, ownerId) {
+  return ownedMediaUrl(path, ownerId, "thumb", (key) => acquireMedia(thumbnailCache, thumbnailJobs, key, async () => {
+    const source = await acquireFullMedia(key);
+    if (!source) return null;
+    try {
+      const blob = await downscaleToPngBlob(source.url, THUMB_MAX_EDGE);
+      if (blob) return createMediaEntry(blob);
+      return retainMedia(source); // small images and decode failures share the source
+    } finally {
+      releaseMedia(source);
+    }
+  }));
+}
+
+function downscaleToPngBlob(url, maxEdge) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    const finish = (blob) => {
+      img.onload = null;
+      img.onerror = null;
+      img.removeAttribute("src");
+      resolve(blob);
+    };
+    img.onload = () => {
+      try {
+        const scale = Math.min(1, maxEdge / Math.max(img.naturalWidth, img.naturalHeight));
+        if (scale >= 1) { finish(null); return; }
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+        canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+        canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+        canvas.toBlob((blob) => {
+          canvas.width = 0;
+          canvas.height = 0;
+          finish(blob);
+        }, "image/png");
+      } catch { finish(null); }
+    };
+    img.onerror = () => finish(null);
+    img.src = url;
+  });
+}
+
+function blobMime(bytes) {
+  // The byte-returning commands omit the MIME; sniff the signatures that
+  // matter for chat media. Defaults to application/octet-stream, which still
+  // plays in <video> via extension-less blob sniffing in Chromium.
+  if (bytes.length >= 12 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+  if (bytes.length >= 4 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return "image/gif";
+  if (bytes.length >= 12 && bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70) return "video/mp4";
+  // "<?xml" or "<svg" plaintext: the SVG fixtures (and SVG artifacts) decode
+  // as images only when served with an image/* MIME.
+  const head = new TextDecoder().decode(bytes.slice(0, 256)).trimStart().toLowerCase();
+  if (head.startsWith("<?xml") || head.startsWith("<svg")) return "image/svg+xml";
+  return "application/octet-stream";
+}
+
 
 async function previewBytes(payload) {
   if (payload.bytes) return normalizeRawBytes(payload.bytes);
@@ -1426,7 +2084,29 @@ function pdfNavIcon(direction) {
  * there is no usable selection. Kept in JS because it walks the DOM + Selection
  * API, which is far terser here than through web-sys.
  */
-export function preview_selection() {
+export function preview_selection(fallbackX = 0, fallbackY = 0) {
+  // The editable source view is a textarea: its selection never appears in
+  // window.getSelection(), so read it directly. Coordinates come from the
+  // mouseup that raised the popup — a textarea selection has no client rects.
+  // A focused textarea without its own file selection (e.g. the composer)
+  // falls through to the ordinary DOM-selection path below.
+  const active = document.activeElement;
+  if (active && active.tagName?.toLowerCase?.() === "textarea") {
+    const container = active.closest?.("[data-file-path]");
+    const start = active.selectionStart ?? 0;
+    const end = active.selectionEnd ?? 0;
+    if (container && end > start) {
+      const text = active.value.slice(start, end).trim();
+      if (text) {
+        return JSON.stringify({
+          text,
+          path: container.getAttribute("data-file-path") || "",
+          x: Math.round(fallbackX),
+          y: Math.round(fallbackY),
+        });
+      }
+    }
+  }
   const sel = window.getSelection?.();
   if (!sel || sel.isCollapsed || sel.rangeCount === 0) return "";
   const text = sel.toString().trim();
@@ -1895,35 +2575,6 @@ let mcpAppParkingRoot = null;
 let wispAppVersion = "0.0.0";
 window.__TAURI__?.app?.getVersion?.().then((version) => { wispAppVersion = version; });
 
-function injectMcpAppCsp(html, resourceMeta) {
-  const csp = resourceMeta?.ui?.csp || resourceMeta?.csp || {};
-  const safeOrigins = (values, websocket = false) => (Array.isArray(values) ? values : [])
-    .filter((value) => typeof value === "string"
-      && new RegExp(`^(?:https${websocket ? "|wss" : ""}):\\/\\/(?:\\*\\.)?[a-z0-9.-]+(?::\\d+)?$`, "i").test(value));
-  const connect = safeOrigins(csp.connectDomains, true);
-  const resources = safeOrigins(csp.resourceDomains);
-  const frames = safeOrigins(csp.frameDomains);
-  const bases = safeOrigins(csp.baseUriDomains);
-  const policy = [
-    "default-src 'none'",
-    `script-src 'unsafe-inline' 'unsafe-eval' blob: ${resources.join(" ")}`.trim(),
-    `style-src 'unsafe-inline' ${resources.join(" ")}`.trim(),
-    `img-src data: blob: ${resources.join(" ")}`.trim(),
-    `font-src data: ${resources.join(" ")}`.trim(),
-    `media-src blob: ${resources.length ? resources.join(" ") : "'none'"}`,
-    `connect-src ${connect.length ? connect.join(" ") : "'none'"}`,
-    `frame-src ${frames.length ? frames.join(" ") : "'none'"}`,
-    `base-uri ${bases.length ? bases.join(" ") : "'self'"}`,
-    "object-src 'none'",
-    "form-action 'none'",
-  ].join("; ");
-  const tag = `<meta http-equiv="Content-Security-Policy" content="${escAttr(policy)}">`;
-  if (/<head(\s[^>]*)?>/i.test(html)) {
-    return html.replace(/<head(\s[^>]*)?>/i, (head) => `${head}${tag}`);
-  }
-  return `<!doctype html><html><head>${tag}</head><body>${html}</body></html>`;
-}
-
 function ensureMcpAppParkingRoot() {
   if (mcpAppParkingRoot?.isConnected) return mcpAppParkingRoot;
   const root = document.createElement("div");
@@ -1977,6 +2628,8 @@ function createMcpAppInstance(instanceId, payloadJson) {
     teardownTimer: null,
     resizeObserver: null,
     onMessage: null,
+    motifRequestId: 0,
+    motifRequests: new Map(),
   };
   const post = (message) => frame.contentWindow?.postMessage(message, "*");
   const clearModelContext = () => invoke("update_mcp_app_context", {
@@ -1992,8 +2645,8 @@ function createMcpAppInstance(instanceId, payloadJson) {
     locale: document.documentElement.lang || navigator.language || "en",
     timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     platform: "desktop",
-    userAgent: `wisp-science/${wispAppVersion}`,
-    toolInfo: { tool: payload.tool || {} },
+    userAgent: `wisp-depmap/${wispAppVersion}`,
+    toolInfo: { tool: instance.payload.tool || {} },
   });
   const sendHostContext = () => {
     if (!instance.initialized || !instance.target) return;
@@ -2005,8 +2658,8 @@ function createMcpAppInstance(instanceId, payloadJson) {
   };
   const sendData = () => {
     if (!instance.initialized) return;
-    post({ jsonrpc: "2.0", method: "ui/notifications/tool-input", params: { arguments: payload.arguments || {} } });
-    post({ jsonrpc: "2.0", method: "ui/notifications/tool-result", params: payload.result || { content: [] } });
+    post({ jsonrpc: "2.0", method: "ui/notifications/tool-input", params: { arguments: instance.payload.arguments || {} } });
+    post({ jsonrpc: "2.0", method: "ui/notifications/tool-result", params: instance.payload.result || { content: [] } });
   };
   const cleanup = () => {
     if (instance.teardownTimer != null) window.clearTimeout(instance.teardownTimer);
@@ -2037,10 +2690,32 @@ function createMcpAppInstance(instanceId, payloadJson) {
   };
   instance.onMessage = (event) => {
     if (event.source !== frame.contentWindow || !event.data || event.data.jsonrpc !== "2.0") return;
+    uiHealth.appMessages = boundedHealthCount(uiHealth.appMessages + 1);
     const message = event.data;
+    if (message.method?.startsWith("wisp/notifications/motif-")) {
+      if (message.method === "wisp/notifications/motif-bridge-ready") {
+        if (!instance.initialized) {
+          instance.initialized = true;
+          sendData();
+          sendHostContext();
+        }
+        return;
+      }
+      const requestId = message.params?.requestId;
+      const pending = instance.motifRequests.get(requestId);
+      if (pending) {
+        instance.motifRequests.delete(requestId);
+        if (message.method === "wisp/notifications/motif-bridge-error") {
+          pending.reject(new Error(message.params?.message || "Motif bridge failed."));
+        } else {
+          pending.resolve(message.params || {});
+        }
+      }
+      return;
+    }
     if (message.method === "ui/initialize" && message.id != null) {
       const hostCapabilities = {
-        sandbox: { csp: payload?.resource?._meta?.ui?.csp || payload?.resource?._meta?.csp || {} },
+        sandbox: { csp: instance.payload?.resource?._meta?.ui?.csp || instance.payload?.resource?._meta?.csp || {} },
         updateModelContext: { text: {} },
       };
       // Only advertise serverTools when this instance still has a live host
@@ -2055,7 +2730,7 @@ function createMcpAppInstance(instanceId, payloadJson) {
             result: {
               protocolVersion: message.params?.protocolVersion || "2026-01-26",
               hostCapabilities,
-              hostInfo: { name: "wisp-science", version: wispAppVersion },
+              hostInfo: { name: "wisp-depmap", version: wispAppVersion },
               hostContext: hostContext(),
             },
           });
@@ -2066,7 +2741,7 @@ function createMcpAppInstance(instanceId, payloadJson) {
           result: {
             protocolVersion: message.params?.protocolVersion || "2026-01-26",
             hostCapabilities,
-            hostInfo: { name: "wisp-science", version: wispAppVersion },
+            hostInfo: { name: "wisp-depmap", version: wispAppVersion },
             hostContext: hostContext(),
           },
         }),
@@ -2158,27 +2833,75 @@ function createMcpAppInstance(instanceId, payloadJson) {
   };
   instance.requestTeardown = requestTeardown;
   instance.sendHostContext = sendHostContext;
+  instance.sendData = sendData;
   window.addEventListener("message", instance.onMessage);
-  frame.srcdoc = injectMcpAppCsp(html, payload?.resource?._meta);
+  const bridgedHtml = payload?.tool?.name === "motif_open_workbench"
+    ? injectMotifWispBridge(html)
+    : html;
+  frame.srcdoc = injectMcpAppCsp(bridgedHtml, payload?.resource?._meta);
   mcpAppInstances.set(instanceId, instance);
   return instance;
+}
+
+function mcpAppDocumentKey(payload) {
+  const uri = String(payload?.resource?.uri || "").split(/[?#]/, 1)[0];
+  return `${uri}\n${payload?.resource?.text || ""}`;
 }
 
 /** Mount one MCP App inside a host-owned center pane. The app keeps an opaque
  * origin and scripts only; filesystem, forms, popups, top navigation,
  * downloads, and same-origin access remain unavailable. */
+const legacyMcpMounts = new Map();
 export function mount_mcp_app(instanceId, elId, payloadJson) {
+  if (useIsolatedHost()) return mountIsolatedApp(instanceId, elId, payloadJson);
+  const target = document.getElementById(elId);
+  if (!target) return false;
+  const incoming = typeof payloadJson === "string" ? JSON.parse(payloadJson) : payloadJson;
+  // Legacy records remain displayable without inventing a connector binding.
+  if (!incoming?._wispMcpBinding) return mountLegacyMcpApp(instanceId, elId, payloadJson);
+  const ticket = {}; legacyMcpMounts.set(instanceId, ticket);
+  // A reconnect may only bind a newly mounted frame, never an old guest callback.
+  const old = mcpAppInstances.get(instanceId);
+  if (old) {
+    mcpAppInstances.delete(instanceId);
+    window.removeEventListener("message", old.onMessage);
+    old.requestTeardown("primary workspace remount");
+  }
+  void invoke("prepare_mcp_app", {instanceId}).then((fresh) => {
+    if (legacyMcpMounts.get(instanceId) !== ticket || !target.isConnected) return;
+    mountLegacyMcpApp(instanceId, elId, fresh ? JSON.stringify(fresh) : payloadJson);
+  }).catch((error) => {
+    if (legacyMcpMounts.get(instanceId) === ticket && target.isConnected) target.textContent = String(error);
+  });
+  return true;
+}
+function mountLegacyMcpApp(instanceId, elId, payloadJson) {
   const target = document.getElementById(elId);
   if (!target) return false;
   let instance = mcpAppInstances.get(instanceId);
   if (instance && instance.payloadJson !== payloadJson) {
-    void invoke("update_mcp_app_context", {
-      instanceId,
-      appName: instance.appName,
-      context: {},
-    });
-    instance.requestTeardown("replaced by a newer MCP App presentation");
-    instance = null;
+    const nextPayload = typeof payloadJson === "string" ? JSON.parse(payloadJson) : payloadJson;
+    if (mcpAppDocumentKey(instance.payload) === mcpAppDocumentKey(nextPayload)) {
+      instance.payload = nextPayload;
+      instance.payloadJson = typeof payloadJson === "string" ? payloadJson : JSON.stringify(payloadJson);
+      instance.appName = mcpAppTitle(nextPayload);
+      instance.frame.title = instance.appName;
+      instance.sendData();
+      instance.sendHostContext();
+    } else {
+      void invoke("update_mcp_app_context", {
+        instanceId,
+        appName: instance.appName,
+        context: {},
+      });
+      // Detach first so the old iframe's cleanup does not revoke the host
+      // bridge the newer presentation just registered under this same id.
+      if (mcpAppInstances.get(instanceId) === instance) {
+        mcpAppInstances.delete(instanceId);
+      }
+      instance.requestTeardown("replaced by a newer MCP App presentation");
+      instance = null;
+    }
   }
   instance ||= createMcpAppInstance(instanceId, payloadJson);
   if (!instance) return false;
@@ -2194,15 +2917,352 @@ export function mount_mcp_app(instanceId, elId, payloadJson) {
 
 /** Keep a live iframe attached off-screen while another center tab is active. */
 export function park_mcp_app(instanceId) {
-  const instance = mcpAppInstances.get(instanceId);
+  legacyMcpMounts.delete(instanceId);
+  if (useIsolatedHost()) return suspendIsolatedApp(instanceId);
+  const instance = isolatedApps.get(instanceId) || mcpAppInstances.get(instanceId);
   if (!instance) return;
   instance.resizeObserver?.disconnect();
   instance.target = null;
   ensureMcpAppParkingRoot().appendChild(instance.frame);
 }
 
+/** Read one explicitly selected local sequence file and load it into the live
+ * Motif instance through the MCP connection that opened the workbench. */
+const SNAPGENE_FEATURE_TYPES = Object.freeze({
+  cds: "cds",
+  gene: "gene",
+  promoter: "promoter",
+  terminator: "terminator",
+  rbs: "rbs",
+  rep_origin: "origin",
+  origin: "origin",
+  primer_bind: "primer_bind",
+  protein_bind: "regulatory",
+  regulatory: "regulatory",
+  enhancer: "enhancer",
+  mrna: "mRNA",
+  rrna: "rRNA",
+  trna: "tRNA",
+  ncrna: "ncRNA",
+  repeat_region: "repeat_region",
+  sig_peptide: "sig_peptide",
+  mat_peptide: "mat_peptide",
+  transit_peptide: "transit_peptide",
+  intron: "intron",
+  exon: "exon",
+  polya_signal: "polyA_signal",
+  misc_feature: "misc_feature",
+});
+
+function snapGeneFeatureType(value) {
+  const key = String(value || "misc_feature").trim().toLowerCase();
+  return SNAPGENE_FEATURE_TYPES[key] || "custom";
+}
+
+function snapGenePlainText(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  if (!/[<&]/.test(text)) return text.slice(0, 16_384);
+  const document = new DOMParser().parseFromString(text, "text/html");
+  return (document.body?.textContent || text.replace(/<[^>]*>/g, " "))
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 16_384);
+}
+
+function snapGeneFeatureMetadata(feature, originalType) {
+  const metadata = Object.create(null);
+  if (originalType) metadata.snapGeneType = originalType;
+  for (const qualifier of feature.getElementsByTagName("Q")) {
+    const name = qualifier.getAttribute("name")?.trim();
+    if (!name || name === "__proto__" || name === "constructor" || name === "prototype") continue;
+    const values = [];
+    for (const value of qualifier.getElementsByTagName("V")) {
+      const raw = value.getAttribute("text")
+        ?? value.getAttribute("predef")
+        ?? value.getAttribute("int")
+        ?? value.getAttribute("real")
+        ?? value.getAttribute("bool")
+        ?? value.textContent;
+      const normalized = snapGenePlainText(raw);
+      if (normalized) values.push(normalized);
+    }
+    if (values.length > 0) metadata[name] = values.length === 1 ? values[0] : values;
+  }
+  return metadata;
+}
+
+function snapGeneSegment(range, sequenceLength, strand) {
+  const match = String(range || "").match(/^\s*(\d+)\s*-\s*(\d+)\s*$/);
+  if (!match) return [];
+  const oneBasedStart = Number(match[1]);
+  const oneBasedEnd = Number(match[2]);
+  if (!Number.isSafeInteger(oneBasedStart) || !Number.isSafeInteger(oneBasedEnd)
+      || oneBasedStart < 1 || oneBasedEnd < 1
+      || oneBasedStart > sequenceLength || oneBasedEnd > sequenceLength) return [];
+  if (oneBasedStart <= oneBasedEnd) {
+    return [{ start: oneBasedStart - 1, end: oneBasedEnd, strand }];
+  }
+  // Circular features may cross coordinate 1. Motif accepts split subranges.
+  return [
+    { start: oneBasedStart - 1, end: sequenceLength, strand },
+    { start: 0, end: oneBasedEnd, strand },
+  ];
+}
+
+function parseSnapGeneFeatureXml(packet, sequenceLength) {
+  let xml;
+  try { xml = new TextDecoder("utf-8", { fatal: true }).decode(packet).replace(/^\uFEFF/, "").trim(); }
+  catch { return null; }
+  // Compressed legacy packets are skipped when the file also carries the
+  // modern XML packet. Treating compressed bytes as XML would invent data.
+  if (!xml.startsWith("<")) return null;
+  const document = new DOMParser().parseFromString(xml, "application/xml");
+  if (document.querySelector("parsererror")) return null;
+  const annotations = [];
+  const features = document.getElementsByTagName("Feature");
+  for (let index = 0; index < features.length && index < 10_000; index += 1) {
+    const feature = features[index];
+    const directionality = feature.getAttribute("directionality");
+    const strand = directionality === "2" ? -1 : directionality === "1" ? 1 : 0;
+    const subRanges = [];
+    let color = null;
+    for (const segment of feature.getElementsByTagName("Segment")) {
+      subRanges.push(...snapGeneSegment(segment.getAttribute("range"), sequenceLength, strand));
+      color ||= segment.getAttribute("color")?.trim() || null;
+    }
+    if (subRanges.length === 0) continue;
+    const originalType = feature.getAttribute("type")?.trim() || "misc_feature";
+    annotations.push({
+      id: `snapgene-feature-${index + 1}`,
+      name: (feature.getAttribute("name")?.trim() || `Feature ${index + 1}`).slice(0, 512),
+      type: snapGeneFeatureType(originalType),
+      start: Math.min(...subRanges.map((segment) => segment.start)),
+      end: Math.max(...subRanges.map((segment) => segment.end)),
+      strand,
+      ...(color ? { color } : {}),
+      metadata: snapGeneFeatureMetadata(feature, originalType),
+      ...(subRanges.length > 1 ? { subRanges } : {}),
+    });
+  }
+  return annotations;
+}
+
+function parseSnapGeneDna(input, filename) {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const decoder = new TextDecoder("ascii", { fatal: true });
+  let offset = 0;
+  let sawCookie = false;
+  let sequence = null;
+  let circular = false;
+  const modernFeaturePackets = [];
+  const legacyFeaturePackets = [];
+  while (offset < bytes.length) {
+    if (bytes.length - offset < 5) throw new Error("The SnapGene .dna file has a truncated packet header.");
+    const type = bytes[offset];
+    const length = view.getUint32(offset + 1, false);
+    offset += 5;
+    if (length > bytes.length - offset) throw new Error("The SnapGene .dna file has a truncated packet.");
+    const packet = bytes.subarray(offset, offset + length);
+    offset += length;
+    if (type === 0x09) {
+      if (length < 14 || decoder.decode(packet.subarray(0, 8)) !== "SnapGene") {
+        throw new Error("The selected .dna file is not a valid SnapGene file.");
+      }
+      sawCookie = true;
+    } else if (type === 0x00) {
+      if (length < 2) throw new Error("The SnapGene .dna file has no sequence data.");
+      circular = (packet[0] & 0x01) !== 0;
+      const sequenceOffset = packet.length > 1 && packet[1] === 0x6e ? 2 : 1;
+      sequence = decoder.decode(packet.subarray(sequenceOffset)).toUpperCase();
+    } else if (type === 0x0a) {
+      modernFeaturePackets.push(packet);
+    } else if (type === 0x07) {
+      legacyFeaturePackets.push(packet);
+    }
+  }
+  if (!sawCookie || sequence == null) throw new Error("The selected .dna file has no SnapGene DNA sequence packet.");
+  if (!/^[ACGTRYSWKMBDHVNU]+$/.test(sequence)) {
+    throw new Error("The SnapGene sequence contains unsupported DNA symbols.");
+  }
+  if (sequence.length > 2_000_000) throw new Error("Motif DNA imports are limited to 2,000,000 bases.");
+  let annotations = null;
+  for (const packet of [...modernFeaturePackets, ...legacyFeaturePackets]) {
+    const parsed = parseSnapGeneFeatureXml(packet, sequence.length);
+    if (parsed !== null) {
+      annotations = parsed;
+      if (parsed.length > 0) break;
+    }
+  }
+  const name = filename.replace(/\.dna$/i, "").trim() || "SnapGene sequence";
+  return {
+    records: [{
+      name,
+      type: "dna",
+      topology: circular ? "circular" : "linear",
+      sequence,
+      annotations: annotations || [],
+    }],
+  };
+}
+
+function motifArgumentsForBytes(bytes, filename) {
+  if (/\.dna$/i.test(filename)) return { payload: parseSnapGeneDna(bytes, filename) };
+  if (bytes.byteLength > 2_000_000) throw new Error("Motif text imports are limited to 2,000,000 bytes.");
+  let content;
+  try { content = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+  catch { throw new Error("This is a binary file. Use SnapGene .dna or a supported text sequence format."); }
+  if (!content.trim()) throw new Error("The selected DNA file is empty.");
+  if (content.includes("\0")) throw new Error("This is a binary file. Use SnapGene .dna or a supported text sequence format.");
+  return { content, filename };
+}
+
+async function callMotifOpen(instance, motifArgs) {
+  const result = await invoke_strict("call_mcp_app_tool", {
+    instanceId: instance.id,
+    name: "motif_open_workbench",
+    arguments: motifArgs,
+  });
+  if (result?.isError) {
+    const message = result.content?.find((item) => item?.type === "text")?.text;
+    throw new Error(message || "Motif rejected the selected DNA file.");
+  }
+  return result;
+}
+
+function cloneJson(value) {
+  return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function motifRecords(result) {
+  const records = result?.structuredContent?.payload?.records;
+  return Array.isArray(records) ? records : [];
+}
+
+function motifSnapshotResult(instance, incoming, append) {
+  const added = motifRecords(incoming);
+  if (added.length === 0) throw new Error("Motif did not return any DNA records.");
+  let snapshot = cloneJson(incoming);
+  if (append) {
+    const existing = motifRecords(instance.payload?.result);
+    const combined = [...cloneJson(existing), ...cloneJson(added)];
+    snapshot = existing.length > 0 ? cloneJson(instance.payload.result) : snapshot;
+    snapshot.structuredContent ||= {};
+    snapshot.structuredContent.payload ||= {};
+    snapshot.structuredContent.payload.records = combined;
+    snapshot.structuredContent.recordCount = combined.length;
+    snapshot.structuredContent.residueCount = combined.reduce((total, record) => (
+      total + String(record?.sequence ?? record?.seq ?? "").length
+    ), 0);
+  }
+  instance.payload.result = snapshot;
+  return snapshot;
+}
+
+async function saveMotifSnapshot(instance, result) {
+  await invoke_strict("save_motif_workbench_snapshot", {
+    instanceId: instance.id,
+    result,
+  });
+}
+
+function motifBridgeRequest(instance, method, params = {}) {
+  if (instance.isolated) return isolatedAction(instance, method, params);
+  return new Promise((resolve, reject) => {
+    const requestId = ++instance.motifRequestId;
+    instance.motifRequests.set(requestId, { resolve, reject });
+    instance.frame.contentWindow?.postMessage({
+      jsonrpc: "2.0",
+      method,
+      params: { ...params, requestId },
+    }, "*");
+    window.setTimeout(() => {
+      if (instance.motifRequests.delete(requestId)) reject(new Error("Motif did not respond in time."));
+    }, 5000);
+  });
+}
+
+export async function import_motif_dna_file(instanceId) {
+  const instance = isolatedApps.get(instanceId) || mcpAppInstances.get(instanceId);
+  if (!instance?.initialized || (!instance.isolated && !instance.frame.contentWindow)) {
+    throw new Error("The Motif workbench is not ready.");
+  }
+  if (instance.payload?.tool?.name !== "motif_open_workbench") {
+    throw new Error("Local DNA import is only available in the Motif workbench.");
+  }
+
+  const file = await new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".dna,.fa,.fasta,.fna,.ffn,.faa,.frn,.gb,.gbk,.genbank,.txt,.seq,.json,text/plain,application/json";
+    input.style.display = "none";
+    const finish = (selected) => {
+      input.remove();
+      resolve(selected || null);
+    };
+    input.addEventListener("change", () => finish(input.files?.[0]), { once: true });
+    input.addEventListener("cancel", () => finish(null), { once: true });
+    document.body.appendChild(input);
+    input.click();
+  });
+  if (!file) return { imported: false, cancelled: true };
+  if (file.size > 32 * 1024 * 1024) throw new Error("The selected DNA file exceeds the 32 MiB import limit.");
+
+  const motifArgs = motifArgumentsForBytes(
+    new Uint8Array(await file.arrayBuffer()),
+    file.name,
+  );
+
+  const result = await callMotifOpen(instance, motifArgs);
+  if (instance.isolated) {
+    await isolatedAction(instance, "ui/notifications/tool-result", result || { content: [] });
+    instance.payload.result = result;
+  } else {
+    const snapshot = motifSnapshotResult(instance, result, false);
+    await saveMotifSnapshot(instance, snapshot);
+    instance.frame.contentWindow.postMessage({
+      jsonrpc: "2.0",
+      method: "ui/notifications/tool-result",
+      params: snapshot,
+    }, "*");
+  }
+  return {
+    imported: true,
+    filename: file.name,
+    recordCount: result?.structuredContent?.recordCount ?? 0,
+  };
+}
+
+/** Parse a project file with Motif's MCP tool, then append its records to the
+ * already-open workbench without replacing the current inventory. */
+export async function add_workspace_file_to_motif(instanceId, path) {
+  const instance = isolatedApps.get(instanceId) || mcpAppInstances.get(instanceId);
+  if (!instance?.initialized || instance.payload?.tool?.name !== "motif_open_workbench") {
+    throw new Error("Open Motif in the current conversation before adding a project file.");
+  }
+  const filename = String(path).split(/[\\/]/).pop() || "sequence";
+  const bytes = await previewBytes({ path, maxBytes: 32 * 1024 * 1024 });
+  const result = await callMotifOpen(instance, motifArgumentsForBytes(bytes, filename));
+  const records = motifRecords(result);
+  if (records.length === 0) throw new Error("Motif did not return any DNA records.");
+  await motifBridgeRequest(instance, "wisp/motif-add-records", { records });
+  const snapshot = motifSnapshotResult(instance, result, true);
+  await saveMotifSnapshot(instance, snapshot);
+  return { imported: true, filename, recordCount: records.length };
+}
+
+export async function request_motif_selection(instanceId) {
+  const instance = isolatedApps.get(instanceId) || mcpAppInstances.get(instanceId);
+  if (!instance?.initialized || instance.payload?.tool?.name !== "motif_open_workbench") {
+    throw new Error("The Motif workbench is not ready.");
+  }
+  return await motifBridgeRequest(instance, "wisp/motif-get-selection");
+}
+
 /** Close a center-tab MCP App and give it a bounded graceful teardown window. */
 export function close_mcp_app(instanceId) {
+  if (useIsolatedHost()) return closeIsolatedApp(instanceId);
   mcpAppInstances.get(instanceId)?.requestTeardown("user closed the app");
 }
 

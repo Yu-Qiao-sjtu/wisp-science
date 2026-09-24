@@ -2,7 +2,9 @@
 
 The Files panel can switch between the current local project and registered
 SSH execution contexts. In the local project, its toolbar can create an empty
-file, create a folder, and refresh the current directory. Right-click a local
+file, create a folder, refresh the current directory, and sort entries by
+name, size, or modification time. Sorting by size shows file sizes on the
+right; sorting by time shows each entry's update time there instead. Right-click a local
 file or folder to rename or delete it. These operations are constrained to the
 project root, reject path separators in names, and never overwrite an existing
 entry; deleting a non-empty folder requires an explicit confirmation.
@@ -14,7 +16,8 @@ Selecting an SSH context opens the remote user's home directory and supports:
 - entering an absolute path (or `~` / `~/...`) and pressing Enter;
 - moving to the parent directory;
 - opening child directories;
-- viewing non-hidden file names and sizes;
+- viewing non-hidden file names, sizes, and modification times;
+- sorting the current directory by name, size, or modification time;
 - uploading local files into the current remote folder with the **Upload**
   button or by dropping them onto the Files panel;
 - downloading a remote file through its right-click menu and a native save
@@ -43,6 +46,10 @@ Remote PDF, DOCX, XLSX, and PPTX previews use the same raw-byte IPC and bounded
 OOXML validation as local previews. The remote size check runs before transfer;
 Office archives are then checked locally for entry count, expanded size,
 compression ratio, unsafe paths, macros, ActiveX, and embedded OLE content.
+XLSX templates with external workbook references can be previewed using their
+stored cell values and formulas. Preview does not open the referenced files,
+fetch external workbooks, or recalculate formulas; cached values may be stale.
+External media and unsafe hyperlinks remain blocked.
 Other supported rich-document formats (legacy Word/PowerPoint/Excel,
 OpenDocument, RTF, and EPUB) are converted locally to Markdown with AnyDoc for
 preview and agent reading. Text-based PDFs are extractable by the agent; scanned
