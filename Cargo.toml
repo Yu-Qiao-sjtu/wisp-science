@@ -15,9 +15,23 @@ members = [
     "crates/wisp-paths",
     "crates/wisp-sync",
     "crates/wisp-dto",
+    "crates/wisp-app",
+    "crates/wisp-service",
     "src-tauri",
 ]
 default-members = ["crates/wisp-cli"]
+exclude = ["vendor/tauri-runtime-wry", "vendor/tao"]
+
+# Published runtime-wry still requires Tao ^0.35.0, which has the Windows
+# input reentrancy deadlock (#1265). Keep the rest of the runtime unchanged.
+# Provenance and removal criteria: vendor/tauri-runtime-wry/WISP-PATCH.md.
+#
+# Published Tao 0.37.0 still deadlocks on macOS when `handle_redraw` reenters
+# the callback mutex from a nested AppKit run loop (#1250).
+# Provenance and removal criteria: vendor/tao/WISP-PATCH.md.
+[patch.crates-io]
+tauri-runtime-wry = { path = "vendor/tauri-runtime-wry" }
+tao = { path = "vendor/tao" }
 
 [workspace.package]
 version = "0.13.0"
@@ -75,6 +89,7 @@ wisp-runs = { path = "crates/wisp-runs" }
 wisp-paths = { path = "crates/wisp-paths" }
 wisp-sync = { path = "crates/wisp-sync" }
 wisp-dto = { path = "crates/wisp-dto" }
+wisp-app = { path = "crates/wisp-app" }
 
 [profile.release]
 codegen-units = 1

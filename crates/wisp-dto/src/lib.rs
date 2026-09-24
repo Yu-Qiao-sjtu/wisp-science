@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+pub mod native_conversations;
+pub mod native_settings;
+pub mod project_browser;
+
 mod mcp_app_child;
 pub use mcp_app_child::*;
 
@@ -215,6 +219,10 @@ pub enum AgentEvent {
     User {
         frame_id: String,
         text: String,
+        /// Queue identity for a follow-up or queued cut-in. Ordinary user
+        /// messages and guidance sent directly from the composer omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queue_id: Option<u64>,
     },
     MessageBoundary {
         frame_id: String,
@@ -282,6 +290,15 @@ pub enum AgentEvent {
         before: usize,
         after: usize,
         strategy: String,
+        /// Context epoch the compacted working set was persisted as. `None`
+        /// while a mid-turn compaction has not been persisted yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        epoch: Option<u64>,
+    },
+    /// The head context epoch was rolled back to its parent.
+    CompactionUndone {
+        frame_id: String,
+        epoch: u64,
     },
     CompactionStarted {
         frame_id: String,
@@ -443,13 +460,20 @@ pub enum ChatItem {
         max_context: usize,
         context_usage: ContextUsage,
     },
-    /// Persistent timeline marker emitted whenever the model context is
-    /// rewritten. `strategy == "auto"` distinguishes the default 80%
-    /// threshold path from an explicit `/compact`.
+    /// Persistent timeline marker emitted whenever a context epoch opens.
+    /// `strategy == "auto"` distinguishes the default 80% threshold path
+    /// from an explicit `/compact`. `epoch` is the new head epoch once
+    /// persisted (`None` for a mid-turn flag that has not been linked yet).
     Compaction {
         before: usize,
         after: usize,
         strategy: String,
+        epoch: Option<u64>,
+        checkpoint: Option<String>,
+        kept_from_user_index: Option<usize>,
+        undone: bool,
+        can_undo: bool,
+        undo_reason: Option<String>,
     },
     /// A visible handoff between the main agent and the independent reviewer.
     ReviewTransition {
@@ -463,6 +487,56 @@ pub enum ChatItem {
     AppContextNotice(AppContextNotice),
     Plan(PlanCard),
     Question(QuestionCard),
+    /// Folded system prompt shown only in the model-context view.
+    System(String),
+    /// Compaction checkpoint user row shown only in the model-context view.
+    Checkpoint(String),
+}
+
+/// Prefix of archive-backed tool tombstones written into the model context.
+/// Keep in lockstep with `wisp_core::context::TOMBSTONE_PREFIX`.
+pub const CONTEXT_TOMBSTONE_PREFIX: &str = "[compacted;";
+
+/// Archive pointer inside a tool tombstone, when the standard compact wording
+/// is present.
+pub fn context_tombstone_archive_ref(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix(CONTEXT_TOMBSTONE_PREFIX)?;
+    let rest = rest
+        .trim_start()
+        .strip_prefix("full content archived at ")?;
+    rest.split(" — ")
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+impl ChatItem {
+    pub fn is_context_tombstone(&self) -> bool {
+        match self {
+            Self::Tool { output, .. } => output.starts_with(CONTEXT_TOMBSTONE_PREFIX),
+            Self::Assistant { text, .. } => text.starts_with(CONTEXT_TOMBSTONE_PREFIX),
+            _ => false,
+        }
+    }
+
+    pub fn compaction(
+        before: usize,
+        after: usize,
+        strategy: impl Into<String>,
+        epoch: Option<u64>,
+    ) -> Self {
+        Self::Compaction {
+            before,
+            after,
+            strategy: strategy.into(),
+            epoch,
+            checkpoint: None,
+            kept_from_user_index: None,
+            undone: false,
+            can_undo: false,
+            undo_reason: None,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
@@ -475,7 +549,7 @@ pub struct AppContextNotice {
     pub structured_preview: Option<String>,
 }
 
-#[derive(Deserialize, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SideChatEvidence {
     pub source_id: String,
@@ -490,9 +564,11 @@ pub struct SideChatEvidence {
     pub relevance: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SideChatResponse {
+    #[serde(default)]
+    pub session_id: Option<String>,
     pub answer: String,
     pub snapshot_version: i64,
     #[serde(default)]
@@ -665,7 +741,25 @@ impl ChatItem {
                 before,
                 after,
                 strategy,
-            } => (13u8, before, after, strategy).hash(&mut h),
+                epoch,
+                checkpoint,
+                kept_from_user_index,
+                undone,
+                can_undo,
+                undo_reason,
+            } => (
+                13u8,
+                before,
+                after,
+                strategy,
+                epoch,
+                checkpoint,
+                kept_from_user_index,
+                undone,
+                can_undo,
+                undo_reason,
+            )
+                .hash(&mut h),
             Self::ReviewTransition { phase, model } => (11u8, phase, model).hash(&mut h),
             Self::Review(report) => (5u8, report).hash(&mut h),
             Self::Plan(plan) => (7u8, plan).hash(&mut h),
@@ -679,6 +773,14 @@ impl ChatItem {
                 &notice.structured_preview,
             )
                 .hash(&mut h),
+            Self::System(s) => {
+                17u8.hash(&mut h);
+                hash_text_sampled(&mut h, s);
+            }
+            Self::Checkpoint(s) => {
+                18u8.hash(&mut h);
+                hash_text_sampled(&mut h, s);
+            }
         }
         h.finish()
     }
@@ -753,6 +855,26 @@ mod fingerprint_tests {
             ChatItem::User(a).fingerprint(),
             ChatItem::User(b).fingerprint()
         );
+    }
+
+    #[test]
+    fn context_tombstone_detects_archived_tool_bodies() {
+        let text = "[compacted; full content archived at wisp-history:abc — retrieve only narrow ranges with read/grep; do not load the whole archive back into context]";
+        assert_eq!(
+            context_tombstone_archive_ref(text),
+            Some("wisp-history:abc")
+        );
+        assert!(ChatItem::Tool {
+            name: "attempt_completion".into(),
+            ok: Some(true),
+            input: String::new(),
+            output: text.into(),
+            started_at_ms: None,
+            duration_ms: None,
+        }
+        .is_context_tombstone());
+        assert!(assistant(text.into()).is_context_tombstone());
+        assert!(!assistant("kept answer".into()).is_context_tombstone());
     }
 }
 
@@ -1349,7 +1471,7 @@ pub struct ArtifactInfo {
 
 /// Immutable item in the app-global library database. Source names are
 /// snapshots, so this remains useful after its project or session is deleted.
-#[derive(Deserialize, Clone, PartialEq)]
+#[derive(Deserialize, Serialize, Clone, PartialEq)]
 pub struct LibraryItem {
     pub id: String,
     pub kind: String,
@@ -1709,6 +1831,10 @@ pub struct Settings {
     #[serde(default = "default_auto_compact")]
     pub auto_compact: bool,
     #[serde(default)]
+    pub semantic_compact_on_model_switch: bool,
+    #[serde(default = "default_semantic_compact_idle_hours")]
+    pub semantic_compact_idle_hours: u64,
+    #[serde(default)]
     pub auto_continue: bool,
     #[serde(default = "default_auto_continue_limit")]
     pub auto_continue_limit: u64,
@@ -1891,6 +2017,10 @@ fn default_auto_compact() -> bool {
     true
 }
 
+fn default_semantic_compact_idle_hours() -> u64 {
+    24
+}
+
 fn default_auto_continue_limit() -> u64 {
     10
 }
@@ -1986,6 +2116,8 @@ impl Default for DeviceBridgeStatus {
 pub struct WeixinBindStart {
     pub qrcode: String,
     pub qr_image: String,
+    #[serde(default)]
+    pub qr_content: String,
 }
 
 /// Mirrors the opaque Feishu OAuth device-flow DTOs from `src-tauri`.
@@ -1993,6 +2125,8 @@ pub struct WeixinBindStart {
 pub struct FeishuBindStart {
     pub flow_id: String,
     pub qr_image: String,
+    #[serde(default)]
+    pub qr_content: String,
     pub expires_in_seconds: u64,
 }
 
@@ -2019,6 +2153,8 @@ impl Default for Settings {
             workspace_dir: String::new(),
             max_iter: default_max_iter(),
             auto_compact: true,
+            semantic_compact_on_model_switch: false,
+            semantic_compact_idle_hours: default_semantic_compact_idle_hours(),
             auto_continue: false,
             auto_continue_limit: default_auto_continue_limit(),
             follow_up_questions: true,
@@ -2134,6 +2270,17 @@ pub struct QueuedTurnActionArgs {
     pub action: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+/// Live lifecycle update for an optimistic queued follow-up. The frontend
+/// uses the id instead of matching user-visible text, which remains ambiguous
+/// when two messages share a body but carry different attachments.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedTurnStateEvent {
+    pub session_id: String,
+    pub id: u64,
+    pub state: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -2506,6 +2653,8 @@ pub struct PendingToolApproval {
 
 #[derive(Deserialize)]
 pub struct LoadedSessionPage {
+    #[serde(default)]
+    pub archived: bool,
     pub items: Vec<LoadedItem>,
     pub next_before_seq: Option<i64>,
     pub user_offset: usize,
@@ -2519,9 +2668,75 @@ pub struct LoadedSessionPage {
     pub branch_state: Option<String>,
     #[serde(default)]
     pub pending_approvals: Vec<PendingToolApproval>,
+    #[serde(default)]
+    pub context_epochs: Vec<ContextEpochDto>,
+    #[serde(default)]
+    pub head_epoch: u64,
+    /// Visual user index where the head-epoch retained tail starts.
+    /// `None` when the session has no compaction or `first_kept_seq` is unknown.
+    #[serde(default)]
+    pub in_context_from_user_index: Option<usize>,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+/// Current compaction metadata, refreshed without loading or replacing history.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SessionContextState {
+    pub head_epoch: u64,
+    pub context_epochs: Vec<ContextEpochDto>,
+    pub in_context_from_user_index: Option<usize>,
+    pub compactions: Vec<ContextCompactionDto>,
+    pub undone_epochs: Vec<u64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ContextCompactionDto {
+    pub epoch: u64,
+    pub before: usize,
+    pub after: usize,
+    pub strategy: String,
+    pub checkpoint: Option<String>,
+    pub kept_from_user_index: Option<usize>,
+    pub can_undo: bool,
+    pub undo_reason: Option<String>,
+}
+
+impl ContextCompactionDto {
+    pub fn into_chat(self) -> ChatItem {
+        ChatItem::Compaction {
+            before: self.before,
+            after: self.after,
+            strategy: self.strategy,
+            epoch: Some(self.epoch),
+            checkpoint: self.checkpoint,
+            kept_from_user_index: self.kept_from_user_index,
+            undone: false,
+            can_undo: self.can_undo,
+            undo_reason: self.undo_reason,
+        }
+    }
+}
+
+/// One persisted context epoch, as returned by `load_session`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ContextEpochDto {
+    pub epoch: u64,
+    pub parent_epoch: u64,
+    pub strategy: String,
+    pub kind: String,
+    pub before_tokens: u64,
+    pub after_tokens: u64,
+    pub initial_head_seq: i64,
+    #[serde(default)]
+    pub first_kept_seq: Option<i64>,
+    #[serde(default)]
+    pub checkpoint_seq: Option<i64>,
+    #[serde(default)]
+    pub ui_event_seq: Option<i64>,
+    #[serde(default)]
+    pub has_new_turns: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SessionOutlineItem {
     pub user_index: usize,
     #[serde(default)]
@@ -2553,7 +2768,10 @@ pub struct TranscriptPageState {
 impl LoadedItem {
     pub fn into_chat(self) -> ChatItem {
         match self.role.as_str() {
+            "user" if self.kind.as_deref() == Some("checkpoint") => ChatItem::Checkpoint(self.text),
             "user" => ChatItem::User(self.text),
+            "system" => ChatItem::System(self.text),
+            "checkpoint" => ChatItem::Checkpoint(self.text),
             "branch_merge" => ChatItem::BranchMerge {
                 text: self.text,
                 branch_id: self.input,
@@ -2638,6 +2856,27 @@ impl LoadedItem {
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("manual")
                         .to_string(),
+                    epoch: value.get("epoch").and_then(serde_json::Value::as_u64),
+                    checkpoint: value
+                        .get("checkpoint")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    kept_from_user_index: value
+                        .get("kept_from_user_index")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|index| index as usize),
+                    undone: value
+                        .get("undone")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    can_undo: value
+                        .get("can_undo")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    undo_reason: value
+                        .get("undo_reason")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
                 }
             }
             _ => ChatItem::Assistant {
@@ -3021,7 +3260,7 @@ pub struct ReviewerBackendTestResult {
     pub summary: String,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RecentSession {
     pub id: String,
     pub project_id: String,
@@ -4054,7 +4293,7 @@ pub struct QuickActionRun {
     pub started: bool,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AgentWorkflowSnapshot {
     pub workflow: AgentWorkflow,
     pub delegation_enabled: bool,
@@ -4165,7 +4404,7 @@ pub struct RunActivityProposal {
     pub max_cost_microunits: u64,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RunActivitySpec {
     pub activity: String,
     pub context_id: String,
@@ -4273,20 +4512,20 @@ pub struct WorkflowConversionProgress {
     pub stage: WorkflowConversionStage,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AgentExecutorSummary {
     pub kind: String,
     pub profile_id: Option<String>,
     pub model_id: Option<String>,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AgentApprovalReasonSummary {
     pub task_id: String,
     pub message: String,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ResearchProgressSnapshot {
     pub schema_version: u32,
     pub phase: String,
@@ -4312,7 +4551,7 @@ pub struct ResearchProgressSnapshot {
     pub updated_at: i64,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AgentResultSummary {
     pub status: String,
     pub summary: Option<String>,
@@ -4333,7 +4572,7 @@ pub struct AgentResultSummary {
     pub full_result_available: bool,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedAgentTaskSummary {
     pub id: String,
     pub stored_step_id: String,
@@ -4364,7 +4603,7 @@ pub struct ResolvedAgentTaskSummary {
     pub result: Option<AgentResultSummary>,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AgentSkillBinding {
     pub id: String,
     pub name: String,
@@ -4377,7 +4616,7 @@ pub struct AgentSkillBinding {
     pub package_source: Option<String>,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct DynamicAgentWorkflowSummary {
     pub schema_version: u32,
     pub approval_policy: AgentApprovalPolicy,
@@ -4386,7 +4625,7 @@ pub struct DynamicAgentWorkflowSummary {
     pub approval_reasons: Vec<AgentApprovalReasonSummary>,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AgentWorkflowResultDetail {
     pub workflow_id: String,
     pub step_id: String,
@@ -4395,7 +4634,7 @@ pub struct AgentWorkflowResultDetail {
     pub response: serde_json::Value,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AgentWorkflow {
     pub id: String,
     #[serde(default)]
@@ -4416,7 +4655,7 @@ pub struct AgentWorkflow {
     pub updated_at: i64,
 }
 
-#[derive(Deserialize, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionContext {
     pub id: String,
     pub kind: String,
@@ -4615,7 +4854,7 @@ pub struct TerminalSessionSummary {
     pub running: bool,
 }
 
-#[derive(Deserialize, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeKeyDto {
     pub project_id: String,
@@ -4627,7 +4866,7 @@ pub struct RuntimeKeyDto {
     pub session_id: String,
 }
 
-#[derive(Deserialize, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeInfo {
     pub runtime_id: String,
@@ -4643,7 +4882,7 @@ pub struct RuntimeInfo {
     pub last_error: Option<String>,
 }
 
-#[derive(Deserialize, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeObject {
     pub name: String,
@@ -4652,7 +4891,7 @@ pub struct RuntimeObject {
     pub size_bytes: Option<u64>,
 }
 
-#[derive(Deserialize, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeObjectList {
     pub objects: Vec<RuntimeObject>,
@@ -4668,7 +4907,7 @@ pub struct RuntimeObjectState {
 
 /// One user-driven `execute_runtime` result: console text as the agent tools
 /// would render it, plus the plots the cell produced as base64-encoded PNGs.
-#[derive(Deserialize, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeExecutionSummary {
     pub text: String,
@@ -4692,7 +4931,7 @@ pub struct RuntimeSlot {
 /// the always-NULL `script_path`). No blanket `allow(dead_code)`: an unread
 /// field here means the UI is dropping data again, and the warning is the
 /// whole point.
-#[derive(Deserialize, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct RunRecord {
     pub id: String,
     pub frame_id: Option<String>,
@@ -4724,7 +4963,7 @@ pub struct RunRecord {
     pub cleanup_error: Option<String>,
 }
 
-#[derive(Deserialize, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct RunSummary {
     pub id: String,
     pub frame_id: Option<String>,
@@ -5230,6 +5469,8 @@ pub struct NetworkSettings {
 
 mod research_journey;
 pub use research_journey::*;
+mod research_archive;
+pub use research_archive::*;
 /// Host-authored logical binding. Never accepts an iframe-supplied connector.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpAppBinding {

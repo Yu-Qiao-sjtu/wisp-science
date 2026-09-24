@@ -252,6 +252,12 @@ pub(crate) mod tauri_args {
     pub fn rewind_session(session_id: &Option<String>, user_index: usize) -> Value {
         json!({ "sessionId": session_id, "userIndex": user_index })
     }
+    pub fn undo_compaction(session_id: &Option<String>) -> Value {
+        json!({ "sessionId": session_id })
+    }
+    pub fn load_session_context_view(session_id: &str) -> Value {
+        json!({ "sessionId": session_id })
+    }
     pub fn turn_undo(session_id: &str, user_index: usize) -> Value {
         json!({ "sessionId": session_id, "userIndex": user_index })
     }
@@ -339,6 +345,14 @@ mod tauri_args_tests {
         assert_eq!(v["sessionId"], "frame-1");
         assert_eq!(v["userIndex"], 3);
         assert!(v.get("user_index").is_none());
+
+        let v = tauri_args::undo_compaction(&sid);
+        assert_eq!(v["sessionId"], "frame-1");
+        assert!(v.get("session_id").is_none());
+
+        let v = tauri_args::load_session_context_view("frame-1");
+        assert_eq!(v["sessionId"], "frame-1");
+        assert!(v.get("session_id").is_none());
 
         let v = tauri_args::turn_undo("frame-1", 4);
         assert_eq!(v["sessionId"], "frame-1");
@@ -998,7 +1012,10 @@ pub(crate) const SETTINGS_NAV_GROUPS: &[(&str, &[(&str, &str)])] = &[
                 "general",
                 "notifications updates language network proxy 通知 更新 语言 网络 代理",
             ),
-            ("session", "context tokens conversation 上下文 对话"),
+            (
+                "session",
+                "context tokens conversation compact semantic 语义压缩 上下文 对话",
+            ),
             ("appearance", "theme font 主题 字体"),
             ("pet", "companion 桌宠"),
         ],

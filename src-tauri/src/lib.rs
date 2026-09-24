@@ -47,6 +47,8 @@ mod device_bridge;
 mod device_hub;
 mod dynamic_workflow;
 mod exploration_commands;
+mod native_conversations;
+mod native_settings;
 pub(crate) use wisp_runs::exploration_isolation;
 mod exploration_promotion;
 mod exploration_workspace;
@@ -83,6 +85,7 @@ mod publication_commands;
 mod publication_freeze;
 mod publication_reproduction;
 mod quick_actions;
+mod research_archive;
 mod research_graph;
 mod research_progress;
 mod resource_leases;
@@ -91,6 +94,9 @@ mod review;
 mod workflow_approval;
 mod workflow_artifacts;
 pub(crate) use wisp_runs as run_context;
+mod native_panels;
+mod native_share;
+mod native_terminals;
 mod network;
 mod runtime_commands;
 mod runtime_config_tool;
@@ -152,6 +158,8 @@ enum AgentEvent {
     User {
         frame_id: String,
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queue_id: Option<u64>,
     },
     MessageBoundary {
         frame_id: String,
@@ -236,6 +244,14 @@ enum AgentEvent {
         before: usize,
         after: usize,
         strategy: String,
+        /// Context epoch the compacted working set was persisted as. `None`
+        /// while a mid-turn compaction has not been persisted yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        epoch: Option<u64>,
+    },
+    CompactionUndone {
+        frame_id: String,
+        epoch: u64,
     },
     CompactionStarted {
         frame_id: String,
@@ -318,6 +334,7 @@ impl AgentEvent {
             | Self::AppContextUpdate { frame_id, .. }
             | Self::Usage { frame_id, .. }
             | Self::Compaction { frame_id, .. }
+            | Self::CompactionUndone { frame_id, .. }
             | Self::CompactionStarted { frame_id, .. }
             | Self::ContextWarning { frame_id, .. }
             | Self::Diff { frame_id, .. }
@@ -659,7 +676,7 @@ struct SessionSearchInfo {
     status: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ComposerReferenceArg {
     Artifact {
@@ -1038,6 +1055,7 @@ struct SessionPage {
 
 #[derive(Serialize)]
 struct SessionTranscriptPage {
+    archived: bool,
     items: Vec<UiItem>,
     next_before_seq: Option<i64>,
     user_offset: usize,
@@ -1047,17 +1065,15 @@ struct SessionTranscriptPage {
     #[serde(skip_serializing_if = "Option::is_none")]
     branch_state: Option<String>,
     pending_approvals: Vec<wisp_dto::PendingToolApproval>,
+    #[serde(default)]
+    context_epochs: Vec<wisp_dto::ContextEpochDto>,
+    #[serde(default)]
+    head_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    in_context_from_user_index: Option<usize>,
 }
 
-#[derive(Serialize)]
-struct SessionOutlineItem {
-    user_index: usize,
-    seq: i64,
-    text: String,
-    sent_at: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_at: Option<i64>,
-}
+use wisp_dto::SessionOutlineItem;
 
 #[derive(Serialize)]
 struct SessionPresentation {
@@ -1072,6 +1088,7 @@ struct FolderInfo {
     name: String,
 }
 
+use wisp_app::projects::project_status_counts;
 use wisp_dto::ProjectSummary;
 
 async fn build_project_summary(state: &AppState, id: &str) -> ProjectSummary {
@@ -1164,29 +1181,6 @@ async fn mark_seen_if_viewed(state: &AppState, frame_id: &str) {
     }
 }
 
-async fn project_status_counts(
-    store: &wisp_store::Store,
-    project_id: &str,
-    running: &HashSet<String>,
-    awaiting: &HashSet<String>,
-) -> (i64, i64) {
-    let Ok(rows) = store.list_session_last_roles(project_id).await else {
-        return (0, 0);
-    };
-    let mut running_count = 0i64;
-    let mut needs_you_count = 0i64;
-    for (id, role, unseen) in rows {
-        if awaiting.contains(&id) {
-            needs_you_count += 1;
-        } else if running.contains(&id) {
-            running_count += 1;
-        } else if last_role_needs_you(role.as_deref()) && unseen {
-            needs_you_count += 1;
-        }
-    }
-    (running_count, needs_you_count)
-}
-
 /// A reloaded transcript row for the UI to render (role in
 /// user|assistant|reasoning|tool).
 #[derive(Serialize, Clone)]
@@ -1214,6 +1208,7 @@ struct UiItem {
 }
 
 /// Index in `msgs` where the `user_index`‑th user turn starts (0-based user count).
+/// Legacy fallback only: rewind/branch resolve visual User events first.
 fn user_message_start(msgs: &[wisp_llm::Message], user_index: usize) -> usize {
     let mut seen = 0usize;
     for (i, m) in msgs.iter().enumerate() {
@@ -1230,9 +1225,24 @@ fn user_message_start(msgs: &[wisp_llm::Message], user_index: usize) -> usize {
     msgs.len()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MessagesToItemsMode {
+    Transcript,
+    ContextView,
+}
+
 /// Flatten persisted messages into UI transcript items (skips system turns,
 /// splits assistant reasoning into its own row).
 fn messages_to_items(msgs: &[wisp_llm::Message]) -> Vec<UiItem> {
+    messages_to_items_with(msgs, MessagesToItemsMode::Transcript)
+}
+
+/// Head-epoch rows the model actually sees: system, checkpoint, and tail.
+fn messages_to_context_view_items(msgs: &[wisp_llm::Message]) -> Vec<UiItem> {
+    messages_to_items_with(msgs, MessagesToItemsMode::ContextView)
+}
+
+fn messages_to_items_with(msgs: &[wisp_llm::Message], mode: MessagesToItemsMode) -> Vec<UiItem> {
     let tool_inputs: HashMap<&str, String> = msgs
         .iter()
         .flat_map(|message| message.tool_calls.iter())
@@ -1269,20 +1279,39 @@ fn messages_to_items(msgs: &[wisp_llm::Message]) -> Vec<UiItem> {
                         resources: Vec::new(),
                     });
                 } else if !t.trim().is_empty() {
-                    out.push(UiItem {
-                        role: "user".into(),
-                        text: t,
-                        tool_name: None,
-                        ok: None,
-                        duration_ms: None,
-                        input: None,
-                        model_name: None,
-                        call_id: None,
-                        kind: None,
-                        status: None,
-                        locations: None,
-                        resources: Vec::new(),
-                    });
+                    if wisp_store::is_compaction_checkpoint(&t) {
+                        if mode == MessagesToItemsMode::ContextView {
+                            out.push(UiItem {
+                                role: "checkpoint".into(),
+                                text: t,
+                                tool_name: None,
+                                ok: None,
+                                duration_ms: None,
+                                input: None,
+                                model_name: None,
+                                call_id: None,
+                                kind: Some("checkpoint".into()),
+                                status: None,
+                                locations: None,
+                                resources: Vec::new(),
+                            });
+                        }
+                    } else {
+                        out.push(UiItem {
+                            role: "user".into(),
+                            text: t,
+                            tool_name: None,
+                            ok: None,
+                            duration_ms: None,
+                            input: None,
+                            model_name: None,
+                            call_id: None,
+                            kind: None,
+                            status: None,
+                            locations: None,
+                            resources: Vec::new(),
+                        });
+                    }
                 }
             }
             wisp_llm::Role::Assistant => {
@@ -1324,7 +1353,15 @@ fn messages_to_items(msgs: &[wisp_llm::Message]) -> Vec<UiItem> {
             }
             wisp_llm::Role::Tool => {
                 let text = m.content.as_text();
-                if m.tool_name.as_deref() == Some("attempt_completion") {
+                let tombstone = text.starts_with(wisp_core::context::TOMBSTONE_PREFIX);
+                // The live transcript promotes a completion result to the
+                // visible answer. Model view must not: after prune, that body
+                // is an archive tombstone, and promoting it forges a fake
+                // assistant bubble. Keep the tool row so the UI can render a
+                // compact archived marker instead.
+                if m.tool_name.as_deref() == Some("attempt_completion")
+                    && !(mode == MessagesToItemsMode::ContextView && tombstone)
+                {
                     if !text.trim().is_empty() {
                         out.push(UiItem {
                             role: "assistant".into(),
@@ -1398,7 +1435,11 @@ fn messages_to_items(msgs: &[wisp_llm::Message]) -> Vec<UiItem> {
                 } else {
                     out.push(UiItem {
                         role: "tool".into(),
-                        text: bounded_ui_tool_result(m.tool_name.as_deref().unwrap_or(""), &text),
+                        text: if tombstone {
+                            text
+                        } else {
+                            bounded_ui_tool_result(m.tool_name.as_deref().unwrap_or(""), &text)
+                        },
                         tool_name: m.tool_name.clone(),
                         ok: Some(true),
                         duration_ms: None,
@@ -1409,14 +1450,34 @@ fn messages_to_items(msgs: &[wisp_llm::Message]) -> Vec<UiItem> {
                             .cloned(),
                         model_name: None,
                         call_id: None,
-                        kind: None,
+                        kind: tombstone.then(|| "tombstone".into()),
                         status: None,
                         locations: None,
                         resources: Vec::new(),
                     });
                 }
             }
-            wisp_llm::Role::System => {}
+            wisp_llm::Role::System => {
+                if mode == MessagesToItemsMode::ContextView {
+                    let t = m.content.as_text();
+                    if !t.trim().is_empty() {
+                        out.push(UiItem {
+                            role: "system".into(),
+                            text: t,
+                            tool_name: None,
+                            ok: None,
+                            duration_ms: None,
+                            input: None,
+                            model_name: None,
+                            call_id: None,
+                            kind: Some("system".into()),
+                            status: None,
+                            locations: None,
+                            resources: Vec::new(),
+                        });
+                    }
+                }
+            }
         }
     }
     out
@@ -1525,9 +1586,14 @@ fn events_to_items(events: &[AgentEvent]) -> (Vec<UiItem>, HashMap<i64, usize>) 
     // same shape the live UI produces via `upsert_turn_usage`. Flushed when the
     // next user turn starts and again at the end of the stream.
     let mut turn_usage: Option<(u64, u64, u64, u64, usize, usize, wisp_core::ContextUsage)> = None;
+    let mut compaction_before = HashMap::new();
+    // Automatic flags precede epoch persistence and therefore have no epoch
+    // number. Several flags in one turn become one undoable epoch.
+    let mut automatic_compaction_before = None;
     for event in events {
         match event {
             AgentEvent::User { text, .. } => {
+                automatic_compaction_before = None;
                 if let Some((i, o, r, c, used, max, context)) = turn_usage.take() {
                     items.push(usage_item(i, o, r, c, used, max, context));
                 }
@@ -1577,26 +1643,60 @@ fn events_to_items(events: &[AgentEvent]) -> (Vec<UiItem>, HashMap<i64, usize>) 
                 before,
                 after,
                 strategy,
+                epoch,
                 ..
-            } => items.push(UiItem {
-                role: "compaction".into(),
-                text: serde_json::json!({
-                    "before": before,
-                    "after": after,
-                    "strategy": strategy,
-                })
-                .to_string(),
-                tool_name: None,
-                ok: None,
-                duration_ms: None,
-                input: None,
-                model_name: None,
-                call_id: None,
-                kind: None,
-                status: None,
-                locations: None,
-                resources: Vec::new(),
-            }),
+            } => {
+                // Usage is floated to the end of the turn. Preserve the
+                // compaction's newer context estimate when replaying older
+                // sessions that have no subsequent Usage event.
+                if strategy != "auto_continue" {
+                    if let Some(epoch) = epoch {
+                        compaction_before.insert(*epoch, *before);
+                    } else {
+                        automatic_compaction_before.get_or_insert(*before);
+                    }
+                    if let Some(usage) = turn_usage.as_mut() {
+                        usage.4 = *after;
+                        usage.6 = wisp_core::ContextUsage {
+                            conversation: *after,
+                            ..Default::default()
+                        };
+                    }
+                }
+                items.push(UiItem {
+                    role: "compaction".into(),
+                    text: serde_json::json!({
+                        "before": before,
+                        "after": after,
+                        "strategy": strategy,
+                        "epoch": epoch,
+                    })
+                    .to_string(),
+                    tool_name: None,
+                    ok: None,
+                    duration_ms: None,
+                    input: None,
+                    model_name: None,
+                    call_id: None,
+                    kind: None,
+                    status: None,
+                    locations: None,
+                    resources: Vec::new(),
+                });
+            }
+            AgentEvent::CompactionUndone { epoch, .. } => {
+                let before = compaction_before
+                    .get(epoch)
+                    .copied()
+                    .or_else(|| automatic_compaction_before.take());
+                if let (Some(before), Some(usage)) = (before, turn_usage.as_mut()) {
+                    usage.4 = before;
+                    usage.6 = wisp_core::ContextUsage {
+                        conversation: before,
+                        ..Default::default()
+                    };
+                }
+            }
             AgentEvent::Error { message, .. } => items.push(UiItem {
                 role: "assistant".into(),
                 text: format!("Error: {message}"),
@@ -1891,7 +1991,7 @@ async fn append_ui_event(store: &Store, frame_id: &str, seq: &mut i64, event: Ag
 /// context updates are UI/model-context events, not user messages and not
 /// tool calls; keeping this path explicit prevents them from accidentally
 /// starting a turn or entering external channel output.
-async fn persist_and_emit_app_context_update(
+pub(crate) async fn persist_and_emit_app_context_update(
     state: &AppState,
     app: &AppHandle,
     frame_id: &str,
@@ -2068,6 +2168,12 @@ struct Settings {
     /// configured context budget. ACP agents own their remote context.
     #[serde(default = "default_auto_compact")]
     auto_compact: bool,
+    /// After a user switches the session model, run semantic compaction.
+    #[serde(default)]
+    semantic_compact_on_model_switch: bool,
+    /// Prompt for semantic compaction after this many idle hours. 0 disables.
+    #[serde(default = "default_semantic_compact_idle_hours")]
+    semantic_compact_idle_hours: u64,
     /// Retry native-model responses that stop at their output-token ceiling.
     #[serde(default)]
     auto_continue: bool,
@@ -2138,6 +2244,10 @@ const fn default_send_user_agent_setting() -> bool {
 
 const fn default_auto_compact() -> bool {
     true
+}
+
+const fn default_semantic_compact_idle_hours() -> u64 {
+    24
 }
 
 const fn default_auto_continue_limit() -> u64 {
@@ -3082,6 +3192,9 @@ fn ensure_writable(dir: PathBuf, app_data: &std::path::Path) -> PathBuf {
 struct TauriOutput {
     app: AppHandle,
     frame_id: String,
+    /// Identifies a queued follow-up when its User event reaches the UI.
+    queue_id: StdMutex<Option<u64>>,
+    queue_runtime: Arc<SessionRuntime>,
     model: String,
     project_id: String,
     project_root: PathBuf,
@@ -3134,6 +3247,10 @@ struct TauriOutput {
     /// auto-approval so an unattended Feishu/WeChat message cannot write/shell.
     force_ask_mutations: bool,
     agent_trace: wisp_core::AgentTrace,
+    /// Strategy label of the last compaction the agent loop reported during
+    /// this turn (`auto` / `overflow`); read when the turn's context epoch is
+    /// persisted.
+    last_compaction_strategy: StdMutex<Option<String>>,
 }
 
 fn live_agent_event(mut event: AgentEvent) -> AgentEvent {
@@ -3149,6 +3266,10 @@ fn live_agent_event(mut event: AgentEvent) -> AgentEvent {
 }
 
 impl TauriOutput {
+    fn take_last_compaction_strategy(&self) -> Option<String> {
+        self.last_compaction_strategy.lock().unwrap().take()
+    }
+
     fn full_permission(&self) -> bool {
         self.full_permission_sessions
             .read()
@@ -3299,6 +3420,7 @@ fn should_persist_ui_event(event: &AgentEvent) -> bool {
             | AgentEvent::Stdout { .. }
             | AgentEvent::Usage { .. }
             | AgentEvent::Compaction { .. }
+            | AgentEvent::CompactionUndone { .. }
             | AgentEvent::Done { .. }
             | AgentEvent::Error { .. }
     )
@@ -3421,11 +3543,19 @@ impl Output for TauriOutput {
         });
     }
     fn compaction(&self, before: usize, after: usize, strategy: &str) {
+        // Mid-turn: the epoch is opened at the end of the turn, after the
+        // incremental persist task has flushed; `context_epochs.ui_event_seq`
+        // links the two afterwards. `auto_continue` reuses this event for
+        // truncated-output continuation and is not a context rewrite.
+        if strategy != "auto_continue" {
+            *self.last_compaction_strategy.lock().unwrap() = Some(strategy.to_string());
+        }
         self.emit(AgentEvent::Compaction {
             frame_id: self.frame_id.clone(),
             before,
             after,
             strategy: strategy.into(),
+            epoch: None,
         });
     }
     fn compaction_started(&self, strategy: &str) {
@@ -3574,6 +3704,7 @@ impl Output for TauriOutput {
             self.emit(AgentEvent::User {
                 frame_id: self.frame_id.clone(),
                 text: msg.content.as_text(),
+                queue_id: self.queue_id.lock().unwrap().take(),
             });
         }
         if let Some(tx) = &self.persist {
@@ -3584,6 +3715,17 @@ impl Output for TauriOutput {
             frame_id: self.frame_id.clone(),
             seq,
         });
+    }
+    fn on_guidance_message(&self, id: u64, msg: &Message) {
+        let queue_id = {
+            let mut cutins = self.queue_runtime.queued_cutins.lock().unwrap();
+            cutins
+                .iter()
+                .position(|(guidance_id, _)| *guidance_id == id)
+                .map(|index| cutins.remove(index).1.id)
+        };
+        *self.queue_id.lock().unwrap() = queue_id;
+        self.on_message(msg);
     }
     fn provenance(&self, rec: &wisp_core::ProvenanceRecord) {
         for path in provenance_ui_file_changes(rec) {
@@ -4848,9 +4990,16 @@ async fn save_memory_enabled(store: &Store, on: bool) -> Result<(), String> {
         .map_err(|e| format!("{e}"))
 }
 
-async fn load_auto_review_enabled(store: &Store) -> bool {
+/// Default for sessions that never touched the composer toggle. The settings
+/// pane writes this one; a session that has its own flag ignores it.
+/// Not the old `auto_review_enabled` key: before #1293 the composer toggle
+/// wrote that one, so reading it would turn review on in every new session
+/// for anyone who ever tried the toggle.
+const DEFAULT_AUTO_REVIEW_KEY: &str = "auto_review_default_enabled";
+
+async fn load_default_auto_review_enabled(store: &Store) -> bool {
     store
-        .get_setting("auto_review_enabled")
+        .get_setting(DEFAULT_AUTO_REVIEW_KEY)
         .await
         .ok()
         .flatten()
@@ -4858,9 +5007,40 @@ async fn load_auto_review_enabled(store: &Store) -> bool {
         .unwrap_or(false)
 }
 
-async fn save_auto_review_enabled(store: &Store, enabled: bool) -> Result<(), String> {
+async fn save_default_auto_review_enabled(store: &Store, enabled: bool) -> Result<(), String> {
     store
-        .set_setting("auto_review_enabled", &enabled.to_string())
+        .set_setting(DEFAULT_AUTO_REVIEW_KEY, &enabled.to_string())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+fn auto_review_setting_key(frame_id: &str) -> String {
+    format!("frame_auto_review:{frame_id}")
+}
+
+/// Auto-review is per conversation: turning it on in one session must not turn
+/// it on in the next one (#1292). Rides the `settings` kv keyed by frame, like
+/// `frame_plan_mode` — a per-session boolean does not deserve a migration.
+async fn load_auto_review_enabled(store: &Store, frame_id: &str) -> bool {
+    match store
+        .get_setting(&auto_review_setting_key(frame_id))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<bool>().ok())
+    {
+        Some(enabled) => enabled,
+        None => load_default_auto_review_enabled(store).await,
+    }
+}
+
+async fn save_auto_review_enabled(
+    store: &Store,
+    frame_id: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    store
+        .set_setting(&auto_review_setting_key(frame_id), &enabled.to_string())
         .await
         .map_err(|e| e.to_string())
 }
@@ -4901,6 +5081,25 @@ async fn load_auto_compact_enabled(store: &Store) -> bool {
         .flatten()
         .map(|value| value != "false")
         .unwrap_or(true)
+}
+
+async fn load_semantic_compact_on_model_switch(store: &Store) -> bool {
+    store
+        .get_setting("semantic_compact_on_model_switch")
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|value| value == "true")
+}
+
+async fn load_semantic_compact_idle_hours(store: &Store) -> u64 {
+    store
+        .get_setting("semantic_compact_idle_hours")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default_semantic_compact_idle_hours())
 }
 
 async fn load_auto_continue_settings(store: &Store) -> (bool, usize) {
@@ -6804,8 +7003,9 @@ async fn side_chat(
     // ACP side chat: one-shot, read-only answer from the selected ACP Agent,
     // running in the active project root. Never touches the main thread.
     let answer = if let Some(agent_id) = acp_agent_id.as_deref().filter(|id| !id.is_empty()) {
-        let cwd = state.require_active(window.label())?.root;
-        acp::acp_side_chat_once(&state, &cwd, agent_id, &prompt).await?
+        let (project, _) =
+            exploration_commands::working_project_for_frame(&state, frame_id).await?;
+        acp::acp_side_chat_once(&state, &project.root, agent_id, &prompt).await?
     } else {
         http_llm?
             .complete(
@@ -7254,7 +7454,11 @@ fn spawn_deferred_startup(
         // "main" window is built in `run()` so it can carry an `on_navigation`
         // guard; these are the extra per-project ones. A project that was
         // since deleted simply fails to spawn.
-        for (label, id) in project_commands::restored_window_projects(&store).await {
+        for (label, id) in if native_settings::requested(std::env::args()) {
+            Vec::new()
+        } else {
+            project_commands::restored_window_projects(&store).await
+        } {
             let state = app.state::<AppState>();
             let _ = project_commands::spawn_project_window_with_label(
                 &app,
@@ -7327,8 +7531,10 @@ pub fn run() {
         .manage(mcp_app_children::McpAppChildren::default())
         // Keep this first so a repeated launch is intercepted before other plugins
         // and application state are initialized in a second process.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            desktop_lifecycle::activate_workspace(app);
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if native_settings::requested(args) {
+                if let Err(error) = native_settings::start(app) { tracing::error!("Native settings host: {error}"); }
+            } else { desktop_lifecycle::activate_workspace(app); }
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
@@ -7385,9 +7591,10 @@ pub fn run() {
             let main_builder = tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
-                tauri::WebviewUrl::App("index.html".into()),
+                tauri::WebviewUrl::App(if native_settings::requested(std::env::args()) { "native-host.html" } else { "index.html" }.into()),
             )
             .title(project_commands::APP_WINDOW_TITLE)
+            .visible(!native_settings::requested(std::env::args()))
             .inner_size(1100.0, 760.0)
             .resizable(true)
             .disable_drag_drop_handler()
@@ -7395,7 +7602,7 @@ pub fn run() {
             #[cfg(target_os = "windows")]
             let main_builder = main_builder.decorations(false).shadow(true);
             main_builder.build().expect("create main window");
-            tauri::async_runtime::spawn(ui_health::run_watchdog(app.handle().clone()));
+            if !native_settings::requested(std::env::args()) { tauri::async_runtime::spawn(ui_health::run_watchdog(app.handle().clone())); }
             let mut startup = StartupTimeline::default();
             if let Ok(res) = app.path().resource_dir() {
                 wisp_paths::set_resource_root(res);
@@ -7627,8 +7834,11 @@ pub fn run() {
             // Dev runs the bare debug binary, which does not grab focus on macOS.
             // release launches from the .app bundle and activates normally.
             #[cfg(debug_assertions)]
-            if let Some(w) = app.workspace_surface("main") {
-                let _ = w.set_focus();
+            if !native_settings::requested(std::env::args()) {
+                if let Some(w) = app.workspace_surface("main") { let _ = w.set_focus(); }
+            }
+            if native_settings::requested(std::env::args()) {
+                native_settings::start(app.handle()).map_err(std::io::Error::other)?;
             }
             startup.finish();
             Ok(())
@@ -7854,9 +8064,17 @@ pub fn run() {
             publication_freeze::freeze_publication_revision,
             publication_freeze::check_publication_revision,
             session_commands::load_session,
+            session_commands::load_session_context_view,
+            session_commands::load_session_context_state,
+            research_archive::get_research_archive,
+            research_archive::prepare_research_archive,
+            research_archive::confirm_research_archive,
+            research_archive::retry_research_archive_cleanup,
+            research_archive::continue_research_archive,
             session_commands::load_session_trajectory,
             trajectory_export::export_session_trajectory,
             session_commands::rewind_session,
+            session_commands::undo_compaction,
             turn_undo::preview_turn_undo,
             turn_undo::undo_turn,
             skill_store::list_community_skills,

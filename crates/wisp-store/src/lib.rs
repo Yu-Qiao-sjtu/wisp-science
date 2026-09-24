@@ -13,6 +13,7 @@ mod ask_user_requests;
 mod bridge_checkpoints;
 mod claim_records;
 mod codex_imports;
+mod context_epochs;
 mod execution_contexts;
 mod explorations;
 mod external_session_cache;
@@ -34,6 +35,7 @@ mod publication_sources;
 mod publications;
 mod remote_staging;
 mod research;
+mod research_archives;
 mod research_journey;
 mod resources;
 mod runs;
@@ -59,6 +61,7 @@ pub use artifacts::{logical_artifact_id, scoped_logical_artifact_id};
 pub use ask_user_requests::AskUserPoll;
 pub use bridge_checkpoints::BridgeCheckpointRecord;
 pub use claim_records::ClaimRecordRow;
+pub use context_epochs::{ContextEpochRecord, OpenContextEpoch};
 pub use execution_contexts::FRAME_DEFAULT_EXECUTION_CONTEXT_PREFIX;
 pub use explorations::{
     ArtifactHead, ContextArchiveRecord, Exploration, ExplorationBaselineArtifactHead,
@@ -89,10 +92,10 @@ pub use schedules::{next_slot_after, ScheduleRecord, ScheduleRunRecord};
 pub use scientific_evidence::{NewScientificEvidence, ScientificEvidenceRecord};
 pub use session_imports::RecoveredWorkspaceSession;
 pub use sessions::{
-    ModelTokenUsage, ProjectTokenUsage, SessionBranchDeltaMessage, SessionBranchLink,
-    SessionBranchMerge, SessionBranchMergeCard, SessionBranchMergePreview, SessionTokenUsage,
-    SessionTokenUsagePage, SessionTranscriptPage, SessionUiEventRecord, SessionUiEventSnapshot,
-    TokenUsageDay, ToolCallUsage,
+    is_compaction_checkpoint, ModelTokenUsage, ProjectTokenUsage, SessionBranchDeltaMessage,
+    SessionBranchLink, SessionBranchMerge, SessionBranchMergeCard, SessionBranchMergePreview,
+    SessionTokenUsage, SessionTokenUsagePage, SessionTranscriptPage, SessionUiEventRecord,
+    SessionUiEventSnapshot, TokenUsageDay, ToolCallUsage,
 };
 pub use storage_prefs::{
     validate_local_results_dir, validate_remote_data_root, validate_remote_workdir_root,
@@ -200,6 +203,11 @@ const BRIDGE_CHECKPOINTS_MIGRATION_SQL: &str =
     include_str!("../migrations/0059_bridge_checkpoints.sql");
 const CLAIM_RECORDS_MIGRATION: &str = "0060_claim_records";
 const CLAIM_RECORDS_MIGRATION_SQL: &str = include_str!("../migrations/0060_claim_records.sql");
+// Upstream v1.14.0 numbered these 0057–0059. Those ids are already claimed
+// by the fork, so record them after 0060. The SQL filenames stay upstream's.
+const RESEARCH_ARCHIVES_MIGRATION: &str = "0061_research_archives";
+const CONTEXT_EPOCHS_MIGRATION: &str = "0062_context_epochs";
+const CONTEXT_EPOCH_IDENTITY_MIGRATION: &str = "0063_context_epoch_identity";
 
 #[derive(Clone)]
 pub struct Store {
@@ -207,6 +215,34 @@ pub struct Store {
 }
 
 impl Store {
+    /// Open an existing database for queries without creating it or running
+    /// migrations. Native previews use this while the desktop owns the store.
+    pub async fn open_read_only(path: &Path) -> Result<Self> {
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .read_only(true)
+            .busy_timeout(std::time::Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await?;
+        Ok(Self { pool })
+    }
+
+    /// Open an existing database for explicit native commands. Never creates,
+    /// migrates, or changes journal mode; the desktop still owns schema upgrades.
+    pub async fn open_existing_for_commands(path: &Path) -> Result<Self> {
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(false)
+            .busy_timeout(std::time::Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
+        Ok(Self { pool })
+    }
+
     /// Open (or create) the SQLite database at `path` and run migrations.
     pub async fn open(path: &Path) -> Result<Self> {
         Self::open_with_journal(path, true).await
@@ -804,6 +840,20 @@ impl Store {
     /// Idempotent repair for schema objects that numbered migrations can miss
     /// after a large version skip. Only CREATE IF NOT EXISTS / ADD COLUMN.
     async fn ensure_schema_compat(pool: &SqlitePool) -> Result<()> {
+        // Partial legacy stores may contain only run tables. Install the
+        // notebook triggers only when their target tables exist; retry this
+        // additive migration on every open until the notebook schema exists.
+        let notebook_tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('frames','messages','session_ui_events')",
+        )
+        .fetch_one(pool)
+        .await?;
+        if notebook_tables == 3 {
+            sqlx::raw_sql(include_str!("../migrations/0057_research_archives.sql"))
+                .execute(pool)
+                .await?;
+            Self::record_migration(pool, RESEARCH_ARCHIVES_MIGRATION).await?;
+        }
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS folders (\
              id TEXT PRIMARY KEY, \
@@ -926,6 +976,46 @@ impl Store {
         .await?;
         Self::add_columns_if_missing(pool, "session_ui_events", &[("created_at", "INTEGER")])
             .await?;
+        Self::apply_context_epochs(pool).await?;
+        Ok(())
+    }
+
+    /// Context epochs (compaction snapshots inside one frame). Existing rows
+    /// stay in epoch 0 and every frame's head stays at 0, so a database that
+    /// predates epochs reads back exactly as before. Additive only; safe to
+    /// re-run on every open.
+    async fn apply_context_epochs(pool: &SqlitePool) -> Result<()> {
+        let tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('frames','messages')",
+        )
+        .fetch_one(pool)
+        .await?;
+        if tables != 2 {
+            return Ok(());
+        }
+        Self::add_columns_if_missing(pool, "messages", &[("epoch", "INTEGER NOT NULL DEFAULT 0")])
+            .await?;
+        Self::add_columns_if_missing(
+            pool,
+            "frames",
+            &[
+                ("head_epoch", "INTEGER NOT NULL DEFAULT 0"),
+                ("context_epoch_high_water", "INTEGER NOT NULL DEFAULT 0"),
+            ],
+        )
+        .await?;
+        sqlx::raw_sql(include_str!("../migrations/0058_context_epochs.sql"))
+            .execute(pool)
+            .await?;
+        Self::record_migration(pool, CONTEXT_EPOCHS_MIGRATION).await?;
+        if !Self::migration_applied(pool, CONTEXT_EPOCH_IDENTITY_MIGRATION).await? {
+            sqlx::raw_sql(include_str!(
+                "../migrations/0059_context_epoch_identity.sql"
+            ))
+            .execute(pool)
+            .await?;
+            Self::record_migration(pool, CONTEXT_EPOCH_IDENTITY_MIGRATION).await?;
+        }
         Ok(())
     }
 

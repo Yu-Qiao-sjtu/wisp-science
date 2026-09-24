@@ -181,6 +181,7 @@ impl DeviceHub {
             | AgentEvent::AppContextUpdate { .. }
             | AgentEvent::Usage { .. }
             | AgentEvent::Compaction { .. }
+            | AgentEvent::CompactionUndone { .. }
             | AgentEvent::ContextWarning { .. }
             | AgentEvent::Diff { .. }
             | AgentEvent::FileChanged { .. } => return,
@@ -294,6 +295,7 @@ mod tests {
             AgentEvent::User {
                 frame_id: "a".into(),
                 text: "prompt".into(),
+                queue_id: None,
             },
             text("a"),
             AgentEvent::Reasoning {

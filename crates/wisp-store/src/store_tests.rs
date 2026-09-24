@@ -1921,6 +1921,104 @@ async fn branched_from_survives_listing() {
 }
 
 #[tokio::test]
+async fn moving_session_moves_persisted_branch_subtree() {
+    let tmp =
+        std::env::temp_dir().join(format!("wisp_move_family_{}.sqlite", uuid::Uuid::new_v4()));
+    let store = Store::open(&tmp).await.unwrap();
+    for project in ["p", "other-project"] {
+        store.create_project(project, project, "").await.unwrap();
+    }
+    for folder in ["d1", "d2"] {
+        store.create_folder(folder, "p", folder).await.unwrap();
+    }
+    for (id, project, source) in [
+        ("main", "p", None),
+        ("branch", "p", Some("main")),
+        ("nested", "p", Some("branch")),
+        ("sibling", "p", Some("main")),
+        ("unrelated", "p", None),
+        ("foreign", "other-project", Some("main")),
+    ] {
+        store
+            .create_frame(id, project, "OPERON", "m")
+            .await
+            .unwrap();
+        store.rename_session(id, project, id).await.unwrap();
+        if let Some(source) = source {
+            store.set_session_branched_from(id, source).await.unwrap();
+        }
+    }
+    store
+        .set_session_pinned("sibling", "p", true)
+        .await
+        .unwrap();
+    // Moving a branch affects its descendants, but not its parent or siblings.
+    store
+        .move_session_to_folder("branch", "p", Some("d2"))
+        .await
+        .unwrap();
+    for row in store.list_sessions("p").await.unwrap() {
+        let expected = matches!(row.0.as_str(), "branch" | "nested").then_some("d2");
+        assert_eq!(row.3.as_deref(), expected, "{}", row.0);
+    }
+    // Mainline moves reunite all descendants, including previously moved branches.
+    for folder in [Some("d1"), Some("d2"), None] {
+        store
+            .move_session_to_folder("main", "p", folder)
+            .await
+            .unwrap();
+        let reopened = Store::open(&tmp).await.unwrap();
+        for row in reopened.list_sessions("p").await.unwrap() {
+            let expected = if row.0 == "unrelated" { None } else { folder };
+            assert_eq!(row.3.as_deref(), expected, "{}", row.0);
+        }
+        assert_eq!(
+            reopened.list_pinned_sessions("p").await.unwrap()[0]
+                .3
+                .as_deref(),
+            folder
+        );
+        assert!(reopened.list_sessions("other-project").await.unwrap()[0]
+            .3
+            .is_none());
+        reopened.pool.close().await;
+    }
+    assert!(store
+        .move_session_to_folder("main", "p", Some("missing"))
+        .await
+        .is_err());
+    assert!(store
+        .move_session_to_folder("missing", "p", None)
+        .await
+        .is_err());
+    assert!(store
+        .move_session_to_folder("main", "other-project", None)
+        .await
+        .is_err());
+    // Malformed legacy cycles must not hang recursive traversal.
+    store
+        .set_session_branched_from("main", "nested")
+        .await
+        .unwrap();
+    store
+        .move_session_to_folder("main", "p", Some("d1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .list_sessions("p")
+            .await
+            .unwrap()
+            .iter()
+            .filter(|row| row.3.as_deref() == Some("d1"))
+            .count(),
+        4
+    );
+    store.pool.close().await;
+    let _ = std::fs::remove_file(tmp);
+}
+
+#[tokio::test]
 async fn conversation_branches_inherit_source_folder_at_creation() {
     let tmp = std::env::temp_dir().join(format!(
         "wisp_branch_folder_{}.sqlite",
@@ -2602,6 +2700,73 @@ async fn transcript_pages_keep_complete_user_turns_and_matching_events() {
         .iter()
         .all(|(_, _, sent_at, response_at)| *sent_at > 0 && response_at.is_some()));
     let _ = std::fs::remove_file(tmp);
+}
+
+#[tokio::test]
+async fn outline_keeps_legacy_prefix_and_uses_each_repeated_questions_event_time() {
+    let tmp = std::env::temp_dir().join(format!("wisp_outline_{}.sqlite", uuid::Uuid::new_v4()));
+    let store = Store::open(&tmp).await.unwrap();
+    store.create_project("p", "proj", "").await.unwrap();
+    store.create_frame("f", "p", "OPERON", "m").await.unwrap();
+    for (seq, message) in [
+        Message::user("legacy"),
+        Message::assistant("old answer"),
+        Message::user("again"),
+        Message::assistant("answer"),
+        Message::user("again"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        store
+            .append_message("f", seq as i64 + 1, message)
+            .await
+            .unwrap();
+    }
+    for (seq, json) in [
+        r#"{"kind":"User","frame_id":"f","text":"again"}"#,
+        r#"{"kind":"MessageBoundary","frame_id":"f","seq":3}"#,
+        r#"{"kind":"Text","frame_id":"f","delta":"answer"}"#,
+        r#"{"kind":"MessageBoundary","frame_id":"f","seq":4}"#,
+        r#"{"kind":"User","frame_id":"f","text":"again"}"#,
+        r#"{"kind":"MessageBoundary","frame_id":"f","seq":5}"#,
+    ]
+    .iter()
+    .enumerate()
+    {
+        store
+            .append_session_ui_event("f", seq as i64 + 1, json)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE session_ui_events SET created_at=(1000+seq)*1000 WHERE frame_id='f'")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let outline = store.load_session_outline("f").await.unwrap();
+    assert_eq!(
+        outline
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<Vec<_>>(),
+        ["legacy", "again", "again"]
+    );
+    assert_eq!(outline[1].sent_at, Some(1001));
+    assert_eq!(outline[1].response_at, Some(1003));
+    assert_eq!(outline[2].sent_at, Some(1005));
+    assert_eq!(outline[2].response_at, None);
+    let latest = store
+        .load_session_transcript_page("f", None, 1)
+        .await
+        .unwrap();
+    assert_eq!(latest.user_offset, 2);
+    assert_eq!(latest.event_message_prefix_len, Some(0));
+    let full = store
+        .load_session_transcript_page("f", None, 20)
+        .await
+        .unwrap();
+    assert_eq!(full.user_offset, 0);
+    assert_eq!(full.event_message_prefix_len, Some(2));
 }
 
 #[tokio::test]
@@ -3307,13 +3472,24 @@ async fn side_chat_snapshot_survives_compaction_and_stops_at_completed_boundary(
         .append_message("f", 1, &Message::user("old decision"))
         .await
         .unwrap();
+    let compacted = [
+        Message::system("compacted checkpoint"),
+        Message::user("recent tail"),
+    ];
     store
-        .replace_messages(
+        .open_context_epoch(
             "f",
-            &[
-                Message::system("compacted checkpoint"),
-                Message::user("recent tail"),
-            ],
+            OpenContextEpoch {
+                messages: &compacted,
+                strategy: "manual",
+                kind: "semantic",
+                before_tokens: 10,
+                after_tokens: 4,
+                checkpoint_index: None,
+                first_kept_seq: None,
+                archive_ref: None,
+                ui_event_seq: None,
+            },
         )
         .await
         .unwrap();
@@ -4738,6 +4914,9 @@ async fn store_open_records_migrations_and_seeds_local_context() {
             PROJECT_STARS_MIGRATION.to_string(),
             BRIDGE_CHECKPOINTS_MIGRATION.to_string(),
             CLAIM_RECORDS_MIGRATION.to_string(),
+            RESEARCH_ARCHIVES_MIGRATION.to_string(),
+            CONTEXT_EPOCHS_MIGRATION.to_string(),
+            CONTEXT_EPOCH_IDENTITY_MIGRATION.to_string(),
         ]
     );
     let first_open_migrations = store.schema_migrations().await.unwrap();

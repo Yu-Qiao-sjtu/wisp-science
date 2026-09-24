@@ -1617,7 +1617,7 @@ test("plan entries render full Markdown without breaking status layout", async (
   await expect(page.getByTestId("plan-card").last().getByRole("img", { name: "High priority" })).toBeVisible();
 });
 
-test("built-in ask_user renders a question card whose option click sends the answer", async ({ page }) => {
+test("built-in ask_user option click fills an editable answer draft", async ({ page }) => {
   await openMockPlanSession(page, "native");
 
   // The built-in question tool streams through the ordinary tool events; its
@@ -1649,10 +1649,22 @@ test("built-in ask_user renders a question card whose option click sends the ans
   // wry's window.prompt is a no-op, so the freeform answer must be in-app.
   await expect(card.locator(".plan-question-freeform input")).toBeVisible();
 
+  const sendCount = await invokeCount(page, "send_message");
   await card.getByRole("button", { name: "STAR" }).click();
+  await expect.poll(() => invokeCount(page, "send_message")).toBe(sendCount);
+  await expect(composer(page)).toHaveValue("STAR\n\nDescription: splice-aware, needs more RAM");
+  await expect(card).toHaveAttribute("data-state", "pending");
+
+  await card.getByRole("button", { name: "HISAT2" }).click();
+  await expect(composer(page)).toHaveValue("HISAT2\n\nDescription: lighter");
+  await card.getByRole("button", { name: "STAR" }).click();
+  await expect(composer(page)).toHaveValue("STAR\n\nDescription: splice-aware, needs more RAM");
+  await expect.poll(() => invokeCount(page, "send_message")).toBe(sendCount);
+  await composer(page).fill("STAR\n\nDescription: splice-aware, needs more RAM\n\n第 4 步先跳过");
+  await page.getByRole("button", { name: "Send" }).click();
   // ?mock=1 send_message does not update the thread, so assert at the invoke layer.
   await expect.poll(() => lastInvokeArgs(page, "send_message")).toMatchObject({
-    sessionId: "s1", message: "STAR",
+    sessionId: "s1", message: "STAR\n\nDescription: splice-aware, needs more RAM\n\n第 4 步先跳过",
   });
   await expect(card).toHaveAttribute("data-state", "answered");
   await expect(card).toContainText("Answer sent to the agent");
@@ -3123,10 +3135,14 @@ test("danger context usage panel offers compact and a new session (#931)", async
   await expect(nudge).toContainText("Window is almost full");
   await nudge.getByRole("button", { name: "Compact" }).click();
   await expect(panel).toHaveCount(0);
+  await expect(page.getByTestId("compact-modal")).toBeVisible();
+  await expect(page.getByTestId("compact-mode-regular")).toHaveAttribute("aria-pressed", "true");
+  await page.getByTestId("compact-start").click();
   await expect.poll(() => lastInvokeArgs(page, "send_message")).toMatchObject({
     message: "/compact",
     resume: false,
   });
+  await expect(page.getByTestId("compact-modal")).toHaveCount(0);
 
   await page.locator("#composer-input").fill("CONTEXTUSAGEDANGER");
   await page.getByRole("button", { name: "Send", exact: true }).click();
@@ -3702,6 +3718,31 @@ test("rename session modal autofocuses so Ctrl+A selects the title", async ({ pa
   await expect.poll(async () => input.evaluate((el: HTMLInputElement) =>
     el.selectionStart === 0 && el.selectionEnd === el.value.length
   )).toBe(true);
+});
+
+test("double-clicking the conversation tab renames the session", async ({ page }) => {
+  await page.addInitScript(parallelMock);
+  await page.goto("/");
+  await page.locator(".proj-card-main").first().click();
+  await expect(newSessionButton(page)).toBeVisible();
+
+  await composer(page).fill("tab-rename-me");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(assistantReplyQuoting(page, "tab-rename-me")).toBeVisible({ timeout: 10_000 });
+
+  const tab = page.locator(".center-tab").first();
+  await tab.dblclick();
+  const input = page.locator("#rename-session-input");
+  await expect(input).toBeVisible();
+  await expect(input).toHaveValue("tab-rename-me");
+  await page.keyboard.press("Escape");
+  await expect(input).toHaveCount(0);
+
+  await tab.dblclick();
+  await input.fill("Renamed from tab");
+  await input.press("Enter");
+  await expect(tab).toContainText("Renamed from tab");
+  await expect(page.locator(".side-item.ses", { hasText: "Renamed from tab" })).toBeVisible();
 });
 
 test("renaming a fresh session takes effect before its first message (#888)", async ({ page }) => {
@@ -4923,6 +4964,14 @@ test("Generated artifacts survive follow-up tool commentary and ignore mentioned
   await expect(reply.locator('.message-artifact-card[data-artifact-name="old.csv"]')).toHaveCount(0);
   await expect(reply.locator('.message-artifact-card[data-artifact-name="old.png"]')).toHaveCount(0);
   await expect(reply.locator('.message-artifact-card[data-artifact-name="old-report.md"]')).toHaveCount(0);
+  // Suggested/mentioned filenames are not workspace files unless they exist.
+  // Deleted temp paths stay as code even when they look like project files.
+  await expect(reply.locator('a.workspace-path-link[href="old.csv"]')).toHaveCount(0);
+  await expect(reply.locator("code").filter({ hasText: "old.csv" })).toHaveText("old.csv");
+  await expect(reply.locator('a.workspace-path-link[href=".cache/Figure-style-rbq.png"]')).toHaveCount(0);
+  await expect(reply.locator("code").filter({ hasText: ".cache/Figure-style-rbq.png" })).toHaveText(
+    ".cache/Figure-style-rbq.png",
+  );
   const pathLink = reply.locator('a.workspace-path-link[href="notes/FIGURE_LEGEND.md"]');
   await expect(pathLink).toHaveText("notes/FIGURE_LEGEND.md");
   await expect.poll(async () => pathLink.evaluate((el) => {
@@ -6525,6 +6574,28 @@ test("environment probe shows progress and classifies password authentication fa
   await expect(server.getByRole("status")).toHaveCount(0);
 });
 
+test("environment probe classifies an old local OpenSSH client", async ({ page }) => {
+  await enterApp(page);
+  await openSettingsSection(page, "Environments");
+  await page.evaluate(() => {
+    const context = (window as any).__mockExecutionContexts.find(
+      (item: any) => item.id === "ssh:gpu-server",
+    );
+    context.last_probe_status = "error";
+    context.last_probe_error =
+      "Local OpenSSH is too old for Wisp (found OpenSSH 8.1, need 8.4 or later). Password authentication uses SSH_ASKPASS_REQUIRE, which OpenSSH added in 8.4. (while using `ssh:gpu-server`)";
+  });
+
+  const server = page.locator('.environment-settings-row[data-context-id="ssh:gpu-server"]');
+  await server.getByRole("button", { name: "Probe context" }).click();
+
+  const modal = page.getByTestId("ssh-connectivity-modal");
+  await expect(modal).toBeVisible();
+  await expect(modal).toContainText("Local OpenSSH is too old");
+  await expect(modal).toContainText("Run `ssh -V` in a terminal");
+  await expect(modal).toContainText("Windows inbox OpenSSH 8.1");
+});
+
 test("missing optional uname output does not fail an otherwise usable SSH probe", async ({ page }) => {
   await enterApp(page);
   await openSettingsSection(page, "Environments");
@@ -6653,8 +6724,11 @@ test("agent menu updates review, reviewer model, and memory preferences", async 
     .toMatchObject({ policy: "inline", autoResume: false });
   await expect(autoResume).toHaveCount(0);
 
-  await menu.locator("label.agent-menu-row", { hasText: "Auto-review" }).click();
-  await expect.poll(() => lastInvokeArgs(page, "set_auto_review_enabled")).toMatchObject({ enabled: true });
+  const autoReview = menu.locator("label.agent-menu-row", { hasText: "Auto-review" });
+  await autoReview.click();
+  await expect.poll(() => lastInvokeArgs(page, "set_auto_review_enabled"))
+    .toMatchObject({ sessionId: expect.stringMatching(/^s-/), enabled: true });
+  await expect(autoReview.locator('input[type="checkbox"]')).toBeChecked();
 
   await menu.getByRole("button", { name: /^Reviewer model/ }).click();
   await page.getByRole("menu", { name: "Reviewer model" })
@@ -6703,6 +6777,20 @@ test("agent menu updates review, reviewer model, and memory preferences", async 
   menu = await openAgentMenu(page);
   await menu.getByRole("button", { name: /^Reviewer model/ }).click();
   await expect(page.getByRole("menu", { name: "Reviewer model" })).toBeVisible();
+});
+
+test("auto-review stays with the session that enabled it", async ({ page }) => {
+  await enterApp(page);
+  await enableDelegation(page);
+  let menu = await openAgentMenu(page);
+  await menu.locator("label.agent-menu-row", { hasText: "Auto-review" }).click();
+  await expect.poll(() => lastInvokeArgs(page, "set_auto_review_enabled")).toMatchObject({ enabled: true });
+  await page.keyboard.press("Escape");
+
+  await newSessionButton(page).click();
+  menu = await openAgentMenu(page);
+  await expect(menu.locator("label.agent-menu-row", { hasText: "Auto-review" })
+    .locator('input[type="checkbox"]')).not.toBeChecked();
 });
 
 test("research relationships remain available inside the daily journey", async ({ page }) => {
@@ -11205,6 +11293,138 @@ test("large image approval warns before resizing and cannot be remembered", asyn
   });
 });
 
+test("composer plan stays visible through folded tools, live updates and session switches", async ({ page }, testInfo) => {
+  await enterApp(page, "/?mockSessionModels=1");
+  await page.locator('[data-session-id="s-model-a"]').click();
+  await composer(page).fill("PLANPROGRESS");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => typeof (window as any).__finishPlanProgress)).toBe("function");
+  const strip = page.getByTestId("composer-plan-progress");
+  const update = async (content: string, ok = true) => {
+    await emitTauriEvent(page, "agent", { kind: "ToolCall", frame_id: "s-model-a", name: "update_plan", preview: "Plan update" });
+    await emitTauriEvent(page, "agent", { kind: "ToolResult", frame_id: "s-model-a", name: "update_plan", ok, content });
+  };
+  await expect(strip).toHaveCount(0);
+  await update("[x] Inspect data\n[~] Check barcode alignment\n[ ] Verify results");
+  await expect(strip).toBeVisible();
+  await expect(strip).toContainText("1 / 3 completed");
+  await expect(strip.locator(".composer-plan-current")).toHaveText("Check barcode alignment");
+  await expect(strip).toHaveClass(/is-running/);
+  const stepsHead = page.locator(".steps-head").last();
+  if (await stepsHead.getAttribute("aria-expanded") === "true") await stepsHead.click();
+  await expect(stepsHead).toHaveAttribute("aria-expanded", "false");
+  await expect(strip).toBeVisible();
+  await expect(strip.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "1");
+  const marker = strip.locator(".composer-plan-mark");
+  await expect(marker).toHaveCSS("animation-name", "composer-plan-orbit");
+  await strip.evaluate(el => { (window as any).__planStripNode = el; });
+  await emitTauriEvent(page, "agent", { kind: "Reasoning", frame_id: "s-model-a", delta: "Inspecting more evidence" });
+  expect(await strip.evaluate(el => el === (window as any).__planStripNode)).toBe(true);
+  // Rejected revisions cannot create false completion.
+  await update("[x] Everything done", false);
+  await expect(strip).toContainText("1 / 3 completed");
+  await update("[x] Inspect data\n[x] Check barcode alignment\n[~] Verify results");
+  await expect(strip).toContainText("2 / 3 completed");
+  await expect(strip.locator(".composer-plan-current")).toHaveText("Verify results");
+  await expect(strip.locator(".composer-plan-track > span")).toHaveAttribute("style", /66\.66/);
+  await page.locator("#chat-scroller").evaluate(el => { el.scrollTop = 0; });
+  await expect(strip).toBeInViewport();
+  const stripBox = (await strip.boundingBox())!;
+  const composerBox = (await composer(page).boundingBox())!;
+  expect(stripBox.y + stripBox.height).toBeLessThanOrEqual(composerBox.y);
+  const inputBox = (await page.locator(".composer-inner").boundingBox())!;
+  expect(Math.abs(stripBox.x - inputBox.x)).toBeLessThan(1);
+  expect(Math.abs(stripBox.width - inputBox.width)).toBeLessThan(1);
+  await expect(strip.locator(".composer-plan-current")).toHaveCSS("opacity", "1");
+  await page.screenshot({ path: testInfo.outputPath("composer-plan-running.png") });
+  await page.locator(".composer").screenshot({ path: testInfo.outputPath("composer-plan-detail.png") });
+  await page.locator('[data-session-id="s-model-b"]').click();
+  await expect(strip).toHaveCount(0);
+  await page.locator('[data-session-id="s-model-a"]').click();
+  await expect(strip).toContainText("2 / 3 completed");
+  await expect(strip).toHaveClass(/is-running/);
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await expect(marker).toHaveCSS("animation-name", "none");
+  await expect(strip.locator(".composer-plan-track > span")).toHaveCSS("transition-duration", "0s");
+  await page.evaluate(() => (window as any).__finishPlanProgress());
+  await expect(strip).not.toHaveClass(/is-running/);
+  await expect(strip).toContainText("not running");
+  await update("[x] Inspect data\n[x] Check barcode alignment\n[x] Verify results");
+  await expect(strip).toContainText("Plan completed");
+  await expect(strip).toContainText("3 / 3 completed");
+  await expect(strip.locator(".composer-plan-current")).toHaveCount(0);
+  await expect(strip.getByTestId("composer-plan-dismiss")).toBeVisible();
+  await expect(strip.getByTestId("composer-plan-steps")).toHaveCount(0);
+  await emitTauriEvent(page, "agent", { kind: "User", frame_id: "s-model-a", text: "A new task" });
+  await expect(strip).toHaveCount(0);
+});
+
+test("composer plan supports Chinese, cancelled steps and narrow light/dark layouts", async ({ page }, testInfo) => {
+  await page.goto("/?mockSessionModels=1&mockLocale=zh");
+  await page.locator(".proj-card-main").first().click();
+  await page.locator('[data-session-id="s-model-a"]').click();
+  await emitTauriEvent(page, "agent", { kind: "ToolResult", frame_id: "s-model-a", name: "update_plan", ok: true,
+    content: "[x] 检查输入数据\n[~] 检查训练输出数据中 barcode 与 species 的对应关系并回溯数据拼接逻辑\n[-] 可选对照分析" });
+  const strip = page.getByTestId("composer-plan-progress");
+  await expect(strip).toContainText("1 / 3 已完成");
+  for (const theme of ["light", "dark"]) {
+    await page.evaluate(theme => document.documentElement.setAttribute("data-theme", theme), theme);
+    await strip.evaluate(el => { (el as HTMLElement).style.width = "280px"; });
+    expect(await strip.evaluate(el => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
+    await expect(strip.locator(".composer-plan-current")).toHaveAttribute("title", /barcode 与 species/);
+    await expect(strip.locator(".composer-plan-current")).toHaveCSS("opacity", "1");
+    await strip.screenshot({ path: testInfo.outputPath(`composer-plan-${theme}-narrow.png`) });
+  }
+  await emitTauriEvent(page, "agent", { kind: "ToolResult", frame_id: "s-model-a", name: "update_plan", ok: true,
+    content: "[x] 检查输入数据\n[-] 停止分析\n[-] 可选对照分析" });
+  await expect(strip).toContainText("计划已结束");
+  await expect(strip).not.toHaveClass(/is-complete/);
+  await expect(strip.getByTestId("composer-plan-dismiss")).toHaveCount(0);
+});
+
+test("composer plan expands the checklist and dismisses a completed plan", async ({ page }) => {
+  await enterApp(page, "/?mockSessionModels=1");
+  await page.locator('[data-session-id="s-model-a"]').click();
+  await composer(page).fill("PLANPROGRESS");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => typeof (window as any).__finishPlanProgress)).toBe("function");
+  const strip = page.getByTestId("composer-plan-progress");
+  const update = async (content: string) => {
+    await emitTauriEvent(page, "agent", { kind: "ToolCall", frame_id: "s-model-a", name: "update_plan", preview: "Plan update" });
+    await emitTauriEvent(page, "agent", { kind: "ToolResult", frame_id: "s-model-a", name: "update_plan", ok: true, content });
+  };
+  await update("[x] Inspect data\n[~] Check barcode alignment\n[ ] Verify results");
+  await expect(strip.getByTestId("composer-plan-dismiss")).toHaveCount(0);
+  await expect(strip.getByTestId("composer-plan-toggle")).toHaveAttribute("aria-expanded", "false");
+  await strip.getByTestId("composer-plan-toggle").click();
+  const steps = strip.getByTestId("composer-plan-steps");
+  await expect(steps).toBeVisible();
+  await expect(strip.getByTestId("composer-plan-toggle")).toHaveAttribute("aria-expanded", "true");
+  await expect(steps.locator("li")).toHaveCount(3);
+  await expect(steps.locator("li").nth(1)).toHaveAttribute("data-status", "running");
+  await expect(steps.locator("li").nth(1)).toContainText("Check barcode alignment");
+  await expect(strip.locator(".composer-plan-current")).toHaveCount(0);
+  await strip.getByTestId("composer-plan-toggle").click();
+  await expect(steps).toHaveCount(0);
+  await expect(strip).toBeVisible();
+  await expect(strip.getByTestId("composer-plan-toggle")).toHaveAttribute("aria-expanded", "false");
+  await strip.getByTestId("composer-plan-toggle").click();
+  await expect(steps.locator("li")).toHaveCount(3);
+  await update("[x] Inspect data\n[x] Check barcode alignment\n[x] Verify results");
+  await expect(strip).toContainText("Plan completed");
+  await expect(steps.locator("li")).toHaveCount(3);
+  await expect(steps.locator("li").last()).toHaveAttribute("data-status", "done");
+  const dismiss = strip.getByTestId("composer-plan-dismiss");
+  await expect(dismiss).toBeVisible();
+  await dismiss.click();
+  await expect(strip).toHaveCount(0);
+  await update("[x] Inspect data\n[x] Check barcode alignment\n[x] Verify results\n[~] Write summary");
+  await expect(strip).toBeVisible();
+  await expect(strip).toContainText("3 / 4 completed");
+  await expect(strip.getByTestId("composer-plan-dismiss")).toHaveCount(0);
+  await expect(strip.getByTestId("composer-plan-steps")).toHaveCount(0);
+});
+
 test("execution plan shows real steps and keeps tool metadata in details", async ({ page }) => {
   await enterApp(page, "/?mockSessionModels=1");
   await page.locator('[data-session-id="s-model-a"]').click();
@@ -14482,6 +14702,20 @@ test("session settings enable automatic context compaction by default", async ({
   });
 });
 
+test("session settings include model-switch semantic compact and idle hours", async ({ page }) => {
+  await page.goto("/");
+  await openSettingsSection(page, "Session");
+  const toggle = page.getByTestId("semantic-compact-on-model-switch");
+  await expect(toggle).not.toBeChecked();
+  await expect(page.getByTestId("semantic-compact-idle-hours")).toHaveValue("24");
+  await toggle.locator("..").click();
+  await page.getByTestId("semantic-compact-idle-hours").fill("12");
+  await page.locator(".settings-footer").getByRole("button", { name: "Save" }).click();
+  await expect.poll(() => lastInvokeArgs(page, "set_settings")).toMatchObject({
+    settings: { semantic_compact_on_model_switch: true, semantic_compact_idle_hours: 12 },
+  });
+});
+
 test("session settings configure truncated-output auto-continue", async ({ page }) => {
   await page.goto("/");
   await openSettingsSection(page, "Session");
@@ -14840,9 +15074,16 @@ test("context-limit recovery offers three actions and owns the first Escape", as
 
   await emitTauriEvent(page, "agent", overflow);
   await page.getByTestId("context-recovery-compact").click();
+  // Overflow recovery uses the guided compaction flow. The interrupted turn
+  // still resumes after the new epoch is durable.
+  await expect(modal).toHaveCount(0);
+  await expect(page.getByTestId("compact-modal")).toBeVisible();
+  await expect(page.getByTestId("compact-mode-semantic")).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByTestId("compact-instruction")).toHaveValue("");
+  await page.getByTestId("compact-start").click();
   await expect.poll(async () => {
     const calls = await invokeArgsList(page, "send_message");
-    return calls.some((args) => args.message === "/compact")
+    return calls.some((args) => args.message === "/compact --semantic")
       && calls.some((args) => args.resume === true);
   }).toBe(true);
 });
@@ -16495,6 +16736,15 @@ test("Ctrl+P imports Codex conversations from local, WSL, or SSH without rescann
     .toBe(scansBeforeRefresh + 1);
   await expect.poll(() => lastInvokeArgs(page, "list_codex_sessions"))
     .toMatchObject({ contextId: "local", refresh: true });
+
+  const search = modal.getByRole("searchbox", { name: "Search conversations" });
+  await search.fill("renderer");
+  await expect(modal.locator(".codex-import-row")).toHaveCount(1);
+  await expect(modal.locator(".codex-import-title")).toHaveText("Fix the renderer crash");
+  await search.fill("does-not-exist");
+  await expect(modal.locator(".codex-import-row")).toHaveCount(0);
+  await expect(modal).toContainText("No conversations match this search");
+  await search.fill("");
 
   // The already-imported rollout renders disabled; the new one is actionable.
   await expect(modal.locator(".codex-import-row.imported").getByRole("button", { name: "Imported" })).toBeDisabled();

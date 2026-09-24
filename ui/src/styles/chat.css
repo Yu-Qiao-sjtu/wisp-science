@@ -308,14 +308,18 @@
   background: color-mix(in srgb, var(--clay) 7%, var(--bg-app));
 }
 .context-compaction-mark svg { width: 18px; height: 18px; }
-.context-compaction-copy { display: grid; gap: 4px; min-width: 0; }
+.context-compaction-copy {
+  display: grid; flex: 1 1 auto; gap: 4px; min-width: 0;
+}
 .context-compaction-copy strong { font-size: 12px; font-weight: 500; line-height: 1.4; }
 .context-compaction-detail {
   display: flex; flex-wrap: wrap; align-items: baseline; column-gap: 10px; row-gap: 4px;
-  color: var(--text-muted); font-size: 11px; line-height: 1.4;
+  min-width: 0; color: var(--text-muted); font-size: 11px; line-height: 1.4;
 }
-.context-compaction-count { font-variant-numeric: tabular-nums; }
-.context-compaction-reduction { color: var(--clay-strong); font-variant-numeric: tabular-nums; }
+.context-compaction-count, .context-compaction-reduction {
+  min-width: 0; white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.context-compaction-reduction { color: var(--clay-strong); }
 .context-compaction-rule {
   flex: 1; min-width: 16px; height: 1px; margin-left: 4px;
   background: linear-gradient(90deg, var(--border), transparent);
@@ -326,7 +330,48 @@
 .context-compaction-live .context-compaction-mark svg path:last-child {
   animation: context-gather-bottom 2s ease-in-out infinite;
 }
-.context-compaction-complete { animation: context-settle .28s ease-out both; }
+.context-compaction-complete {
+  flex-direction: column; align-items: stretch; width: 100%;
+  animation: context-settle .28s ease-out both;
+}
+.context-compaction-complete.undone { opacity: .55; }
+.context-compaction-complete.undone .context-compaction-copy strong { text-decoration: line-through; }
+.context-compaction-toggle {
+  display: flex; align-items: center; gap: 12px; min-width: 0; width: 100%;
+  margin: 0; padding: 0; border: 0; background: none; color: inherit;
+  font: inherit; text-align: left; cursor: pointer;
+}
+.context-compaction-toggle:focus-visible { outline: 2px solid var(--clay); outline-offset: 2px; }
+.context-compaction-chevron { display: grid; place-items: center; flex: 0 0 auto; color: var(--text-faint); }
+.context-compaction-row svg { width: 16px; height: 16px; }
+.context-compaction-mark svg { width: 18px; height: 18px; }
+.context-compaction-actions svg { width: 16px; height: 16px; }
+.context-compaction-details {
+  display: grid; gap: 10px; width: 100%; box-sizing: border-box;
+  padding: 0 0 12px 44px;
+}
+.context-compaction-meta {
+  display: flex; flex-wrap: wrap; gap: 8px 14px;
+  color: var(--text-muted); font-size: 11px; line-height: 1.4;
+}
+.context-compaction-checkpoint { min-width: 0; }
+.context-compaction-checkpoint-label {
+  display: block; margin-bottom: 4px;
+  color: var(--text-faint); font-size: 11px;
+}
+.context-compaction-checkpoint .md { font-size: 13px; line-height: 1.5; }
+.context-compaction-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.context-compaction-actions .tool-btn { display: inline-flex; align-items: center; gap: 6px; }
+@container (max-width: 620px) {
+  .context-compaction-status { align-items: flex-start; gap: 8px; padding: 9px 0; }
+  .context-compaction-complete { align-items: stretch; }
+  .context-compaction-mark { flex-basis: 28px; width: 28px; height: 28px; border-radius: 8px; }
+  .context-compaction-toggle { gap: 8px; align-items: flex-start; }
+  .context-compaction-chevron { margin-top: 5px; }
+  .context-compaction-rule { display: none; }
+  .context-compaction-details { padding-left: 36px; }
+  .context-compaction-meta { gap: 5px 10px; }
+}
 @keyframes context-gather-top { 50% { transform: translateY(4px); opacity: .4; } }
 @keyframes context-gather-bottom { 50% { transform: translateY(-4px); opacity: .4; } }
 @keyframes context-settle { from { opacity: 0; transform: translateY(3px); } }
@@ -335,6 +380,77 @@
   .context-compaction-live .context-compaction-mark svg path:last-child,
   .context-compaction-complete { animation: none; }
 }
+.msg[data-in-context="false"],
+.tool-wrap[data-in-context="false"],
+.usage-row[data-in-context="false"] {
+  opacity: .45;
+}
+.transcript-view-toggle {
+  position: relative; isolation: isolate; display: inline-grid;
+  grid-template-columns: repeat(2, 1fr); gap: 2px; padding: 3px; flex: 0 0 auto;
+  border: 1px solid var(--border); border-radius: 999px;
+  background: var(--bg-sunken);
+}
+.transcript-view-toggle::before {
+  content: ""; position: absolute; z-index: -1; top: 3px; bottom: 3px; left: 3px;
+  width: calc(50% - 4px); border-radius: 999px; pointer-events: none;
+  background: color-mix(in srgb, var(--clay) 14%, var(--bg-elev));
+  box-shadow: 0 1px 3px color-mix(in srgb, var(--text) 10%, transparent);
+  transition: transform .18s ease;
+}
+.transcript-view-toggle.model-view::before {
+  transform: translateX(calc(100% + 2px));
+}
+.transcript-view-toggle button {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  min-width: 30px; height: 28px; box-sizing: border-box;
+  margin: 0; padding: 0 10px; border: 0; border-radius: 999px;
+  background: transparent; color: var(--text-muted); font: inherit; font-size: 12px;
+  white-space: nowrap; cursor: pointer; transition: color .18s ease;
+}
+.transcript-view-toggle button.active { color: var(--clay-strong); }
+.transcript-view-toggle button:hover { color: var(--text); }
+.transcript-view-toggle button:focus-visible {
+  outline: 2px solid var(--clay); outline-offset: 2px;
+}
+.transcript-view-toggle svg { width: 14px; height: 14px; flex: 0 0 auto; }
+/* Respond to the conversation pane, including space taken by side panels. */
+@container (max-width: 900px) {
+  .topbar .transcript-view-label { display: none; }
+  .topbar .transcript-view-toggle button { width: 30px; padding: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .transcript-view-toggle::before, .transcript-view-toggle button { transition: none; }
+}
+.context-system-row, .context-checkpoint-row, .context-tombstone-row {
+  min-width: 0; color: var(--text-muted); font-size: 13px; line-height: 1.45;
+}
+.context-system-row summary { cursor: pointer; color: var(--text-faint); font-size: 12px; }
+.context-system-body {
+  margin: 8px 0 0; padding: 8px 10px; border-radius: var(--radius-xs);
+  background: var(--bg-elev); color: var(--text); white-space: pre-wrap;
+  font-size: 12px; line-height: 1.45;
+}
+.context-checkpoint-label { color: var(--text-faint); font-size: 11px; margin-bottom: 4px; }
+.context-tombstone-row summary {
+  display: flex; align-items: center; gap: 6px; cursor: pointer;
+  color: var(--text-faint); font-size: 12px; line-height: 1.4;
+}
+.context-tombstone-row summary svg { width: 12px; height: 12px; flex: 0 0 auto; }
+.context-tombstone-name { color: var(--text-muted); }
+.context-tombstone-ref {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 11px; color: var(--text-faint);
+}
+.context-tombstone-body {
+  margin: 8px 0 0; padding: 8px 10px; border-radius: var(--radius-xs);
+  background: var(--bg-elev); color: var(--text-muted); white-space: pre-wrap;
+  font-size: 12px; line-height: 1.45;
+}
+.context-usage-epoch {
+  margin-top: 10px; color: var(--text-muted); font-size: 12px; line-height: 1.4;
+}
+.context-usage-view-toggle { margin-top: 10px; }
 .review-live {
   display: flex; align-items: center; gap: 9px; flex: 0 1 280px; min-width: 0;
   color: var(--text-muted);
@@ -786,6 +902,10 @@ button.tool-btn.card-copy { margin-left: auto; flex: 0 0 auto; padding: 2px 8px;
   display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;
   font-size: calc(var(--ui-font-size, 14px) - 0.5px); line-height: 1.45;
 }
+.composer-queue .queue-state {
+  flex: 0 0 auto; align-self: center; color: var(--text-muted); font-size: 11px;
+  white-space: nowrap;
+}
 .composer-queue .queue-actions {
   display: flex; align-items: center; gap: 2px; flex: 0 0 auto; margin: 0;
 }
@@ -800,6 +920,11 @@ button.tool-btn.card-copy { margin-left: auto; flex: 0 0 auto; padding: 2px 8px;
 .composer-queue .queue-cut-in:hover { background: var(--clay); color: var(--on-clay); }
 .composer-queue .queue-cut-in svg { width: 14px; height: 14px; }
 .composer-queue .queue-remove:hover { color: var(--err); }
+/* Row overflow menu: reuses the composer send-mode menu chrome, anchored
+   to the row button and opening upward over the queue card. */
+.queue-menu-wrap { position: relative; display: inline-flex; }
+.queue-mode-menu { width: 200px; bottom: calc(100% + 6px); }
+.queue-mode-menu .send-mode-item { min-height: 36px; font-size: 13px; gap: 10px; }
 .tool-input, .tool-output { color: var(--text-muted); white-space: pre-wrap; max-height: 260px; overflow: auto; font-family: var(--font-mono); font-size: 12px; line-height: 1.5; margin: 0 0 8px; padding: 8px 10px; background: var(--bg-app); border: 1px solid var(--border); border-radius: var(--radius-xs); }
 .tool-output { margin-bottom: 0; }
 .tool .content { color: var(--text-muted); margin-top: 8px; white-space: pre-wrap; max-height: 260px; overflow: auto; font-family: var(--font-mono); font-size: 12px; line-height: 1.5; }
@@ -871,6 +996,38 @@ button.tool-btn.card-copy { margin-left: auto; flex: 0 0 auto; padding: 2px 8px;
 }
 /* .primary fill comes from shared button primitives in base.css */
 .approval-actions button:hover { filter: brightness(0.97); }
+
+/* The current plan stays visible outside the scrolling/folded transcript. */
+.composer-plan-progress { position: relative; display: flex; flex-direction: column; align-items: stretch; gap: 0; flex: 0 0 auto; min-width: 0; max-width: var(--chat-col-max); width: 100%; box-sizing: border-box; margin: 0 auto 8px; padding: 9px 12px 12px; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-elev); color: var(--text); }
+.composer-plan-head { display: flex; align-items: stretch; gap: 4px; min-width: 0; }
+.composer-plan-toggle { display: flex; align-items: center; gap: 10px; flex: 1 1 auto; min-width: 0; margin: 0; padding: 0; border: 0; border-radius: var(--radius-xs); background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.composer-plan-toggle:hover { background: var(--surface-hover); }
+.composer-plan-mark { display: flex; flex: 0 0 auto; color: var(--clay-strong); }
+.composer-plan-progress svg { width: 18px; height: 18px; }
+.composer-plan-copy { flex: 1; min-width: 0; }
+.composer-plan-summary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 12px; font-size: 11px; color: var(--text-muted); }
+.composer-plan-label { font-weight: 600; }
+.composer-plan-count { margin-left: auto; font-variant-numeric: tabular-nums; }
+.composer-plan-current { margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; line-height: 1.5; animation: composer-plan-step-in 220ms ease-out; }
+.composer-plan-toggle .execution-plan-chevron { flex: 0 0 auto; color: var(--text-faint); }
+.composer-plan-dismiss { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 28px; height: 28px; margin: 0; padding: 0; border: 0; border-radius: var(--radius-xs); background: transparent; color: var(--text-muted); cursor: pointer; }
+.composer-plan-dismiss:hover { background: var(--surface-hover); color: var(--text); }
+.composer-plan-dismiss svg { width: 14px; height: 14px; }
+.composer-plan-progress .composer-plan-steps { margin-top: 10px; max-height: min(40vh, 280px); overflow-y: auto; overscroll-behavior: contain; }
+.composer-plan-track { position: absolute; bottom: 0; left: 0; right: 0; height: 3px; background: var(--border); }
+.composer-plan-track > span { display: block; height: 100%; background: var(--clay); transition: width 360ms ease-out; }
+.composer-plan-progress.is-running .composer-plan-mark { animation: composer-plan-orbit 2.4s linear infinite; }
+.composer-plan-progress.is-complete .composer-plan-mark { animation: composer-plan-step-in 220ms ease-out; }
+@keyframes composer-plan-orbit { to { transform: rotate(360deg); } }
+@keyframes composer-plan-step-in { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) {
+  .composer-plan-progress .composer-plan-mark, .composer-plan-current { animation: none !important; }
+  .composer-plan-track > span { transition: none; }
+}
+@media (pointer: coarse) {
+  .composer-plan-toggle, .composer-plan-dismiss { min-height: 44px; }
+  .composer-plan-dismiss { width: 44px; }
+}
 
 /* Execution plan snapshots: one checklist, with raw tool data behind disclosure. */
 .execution-plan { min-width: 0; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-elev); color: var(--text); }
@@ -1598,6 +1755,16 @@ details.tool:not([open]) > summary.head .run-dot { animation: tool-pulse 1.1s ea
 }
 .context-usage-head h2 { margin: 0; font-size: 18px; line-height: 1.3; font-weight: 500; letter-spacing: -.015em; }
 .context-usage-head-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 2px; }
+.context-usage-compact {
+  display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 9px;
+  border: 1px solid color-mix(in srgb, var(--clay) 34%, var(--border));
+  border-radius: 999px; background: color-mix(in srgb, var(--clay) 7%, transparent);
+  color: var(--clay-strong); font: inherit; font-size: 11.5px; cursor: pointer;
+}
+.context-usage-compact:hover:not(:disabled) { background: color-mix(in srgb, var(--clay) 14%, transparent); color: var(--text); }
+.context-usage-compact:focus-visible { outline: 2px solid var(--clay); outline-offset: 2px; }
+.context-usage-compact:disabled { opacity: .5; cursor: wait; }
+.context-usage-compact svg { width: 14px; height: 14px; }
 .context-usage-close, .context-usage-dock {
   display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0;
   border: 0; border-radius: var(--radius-xs); background: transparent; color: var(--text-muted); cursor: pointer;

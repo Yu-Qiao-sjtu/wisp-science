@@ -42,12 +42,31 @@
   even when its optimistic card is already visible. An enqueue failure prevents
   the waiting action from being sent; action failures are shown in the status
   area instead of silently succeeding.
+- Queue rows reconcile by their backend id and receive lifecycle updates. A
+  queued row with a duplicate body but different attachments remains a distinct
+  intent. `Interrupt and replace` marks parked intents with identical text,
+  attachments, and references superseded so they cannot be drained again.
+  Replacement reserves priority before cancelling the current workflow, so
+  waiting queue turns cannot slip in between cancellation and replacement.
+- After a cut-in is requested, the row stays visible as “Sent · waiting for the
+  current step” until the running loop consumes it. This reflects the safe
+  boundary contract; it does not claim to cancel an already running tool.
 - A final text response cannot finish a loop while guidance is already pending.
   If the turn has ended, errors, or reaches an explicit stop/iteration limit,
   unconsumed cut-ins take priority over ordinary queued turns. Each message is
   either injected once or handed off once. In-loop guidance uses the queued
   text; fallback turns retain the original attachments and references as well.
   ACP conversations continue to use ordinary queued follow-ups.
+
+## Native question cards
+
+- Selecting an option in a native `ask_user` card fills the composer and leaves
+  the card pending. The user can edit the answer, change the selection, or add
+  conditions before sending.
+- The generated draft contains the option label and, when present, an explicit
+  `说明：` line so the option description is not lost from the submitted turn.
+- ACP `ask_user` cards continue to resolve through their protocol response path;
+  they do not use the native composer-draft behavior.
 
 ## Composer attachments and references
 
@@ -65,6 +84,7 @@
 ## Transcript rendering
 
 - `update_plan` renders an execution checklist with a single completed/total count, segmented progress, and labeled pending, running, completed, and cancelled steps. An accepted update is distinct from completion of the work. Pending or running plans expand by default; only a successful result with every step completed defaults to a compact header. Explicit disclosure choices survive transcript refreshes.
+- A compact plan strip above the composer runtime row follows the latest accepted `update_plan` in the current user turn, even when tool history is folded or scrolled away. It shows the current running (or next pending) step and completed/total count. Clicking the strip expands the full checklist in place; a second click collapses it. After every step completes, a dismiss control removes the strip until a later plan appears. Progress advances only from reported step completion; animation indicates activity, never estimated progress. Stopping the turn stops the activity animation, completion remains visible until dismissed or the next user turn, and switching sessions uses that session's transcript. Failed/pending updates retain the last accepted snapshot. Motion respects the reduced-motion preference; full checklists remain in transcript cards.
 - Before the tool result arrives, its count-only preview displays an updating notice; step titles come from the actual result. Older results without a checklist show an unavailable notice instead of invented steps. Failed or rejected updates show their error. Tool name, duration (zero milliseconds shown as `< 1 ms`), and raw input/output live in a separate, initially collapsed details section. Each call remains a historical snapshot; existing activity-group folding still applies.
 - A live assistant message keeps a throttled Markdown prefix plus an immediate, whitespace-preserving plain-text tail. The Markdown budget adapts from 50 ms for short answers to 150 ms above 8,000 bytes and 300 ms above 32,000 bytes; once the turn settles, the remaining tail is rendered once as full Markdown.
 - Turn-boundary affordances such as Undo update inside the existing message row; they must not remount or reparse an unchanged historical answer.
